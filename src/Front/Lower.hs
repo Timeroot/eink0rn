@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 -- | Lowering an export into the core, and checking it.
 --
 -- This is where the \"normalise aggressively up front\" half of the project
@@ -62,35 +63,42 @@ defaultConfig = Config AccelCanonical True
 checkExport :: Config -> [ExDecl] -> Either String Env
 checkExport cfg = verdict . checkExportTrace cfg
   where
-    verdict (Failed err : _) = Left err
-    verdict (Done env   : _) = Right env
-    verdict (Checked _  : r) = verdict r
-    verdict []               = Left "internal error: export trace ended"
+    verdict (Failed err  : _) = Left err
+    verdict (Done env    : _) = Right env
+    verdict (Starting _  : r) = verdict r
+    verdict (Checked _   : r) = verdict r
+    verdict []                = Left "internal error: export trace ended"
 
--- | What checking a declaration produced.  A trace is one 'Checked' per
--- declaration accepted, in file order, ending in exactly one 'Done' or 'Failed'.
+-- | What checking a declaration produced.  A trace is a 'Starting' and a
+-- 'Checked' per declaration accepted, in file order, ending in exactly one
+-- 'Done' or 'Failed'.
 data Progress
-  = Checked !(Maybe Name)  -- ^ this declaration went in; 'Nothing' for an empty block
+  = Starting !(Maybe Name) -- ^ this declaration is about to be checked
+  | Checked !(Maybe Name)  -- ^ this declaration went in; 'Nothing' for an empty block
   | Done Env               -- ^ every declaration went in, and the file passed
   | Failed String          -- ^ this is why it did not
 
 -- | 'checkExport', reporting as it goes.
 --
--- The list is produced lazily and each 'Checked' is forced by the time it is
--- emitted, so a consumer that reads the trace in 'IO' and looks at the clock
--- between elements is timing that declaration and nothing else.  That is the
--- entire reason this exists: on a large export the interesting question stops
--- being /does it pass/ and becomes /which declaration is taking all afternoon/,
--- and a trace answers it in one run instead of a bisection over prefixes.
+-- The list is produced lazily, and a 'Starting' is emitted -- with the
+-- declaration's name already forced, so its line is parsed -- before any of that
+-- declaration's checking is demanded.  A consumer reading the trace in 'IO' and
+-- looking at the clock is therefore timing that declaration and nothing else,
+-- and can say which one it is waiting on rather than only which one it waited
+-- on.  That is the entire reason this exists: on a large export the interesting
+-- question stops being /does it pass/ and becomes /which declaration is taking
+-- all afternoon/, and a trace answers it in one run instead of a bisection over
+-- prefixes.
 checkExportTrace :: Config -> [ExDecl] -> [Progress]
 checkExportTrace cfg =
   go (LS emptyEnv { envAccel = cfgAccel cfg } (cfgSealProofs cfg)
         Nothing Nothing [] [])
   where
     go st [] = [either Failed Done (finish st)]
-    go st (d : ds) = case step st d of
-      Left err  -> [Failed err]
-      Right st' -> Checked (declName d) : go st' ds
+    go st (d : ds) = case declName d of
+      !nm -> Starting nm : case step st d of
+        Left err  -> [Failed err]
+        Right st' -> Checked nm : go st' ds
 
     finish st = do
       checkQuotPackage (reverse (lsQuots st))

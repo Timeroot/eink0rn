@@ -2,9 +2,11 @@
 -- environment.
 module Main (main) where
 
-import           Control.Monad         (when)
+import           Control.Concurrent    (forkIO, killThread, threadDelay)
+import           Control.Monad         (forever, when)
 import qualified Data.ByteString.Char8 as B
-import           Data.IORef            (modifyIORef', newIORef, readIORef)
+import           Data.IORef            (modifyIORef', newIORef, readIORef,
+                                        writeIORef)
 import           Data.List             (isPrefixOf)
 import           Front.Export          (parseExport)
 import           Front.Lower           (Config (..), Progress (..),
@@ -155,38 +157,55 @@ walk :: Options -> [Progress] -> IO (Either String Env)
 walk o ps0 = case optProgress o of
     Nothing  -> pure (quiet ps0)
     Just cut -> do
-      t0 <- getMonotonicTime
-      n  <- newIORef (0 :: Int)
+      t0  <- getMonotonicTime
+      n   <- newIORef (0 :: Int)
+      cur <- newIORef (Nothing, t0)
       let tally t = do
-            k <- readIORef n
-            note (show k ++ " declarations, " ++ secs (t - t0) ++ " elapsed")
-          loud prev beat (Checked mn : ps) = do
+            k       <- readIORef n
+            (mn, s) <- readIORef cur
+            note (show k ++ " declarations, " ++ secs (t - t0) ++ " elapsed"
+                  ++ if t - s < cut then ""
+                       else ", " ++ secs (t - s) ++ " in " ++ nameOf mn)
+      -- A file with a few tens of thousands of declarations and one that has
+      -- millions both want to be heard from about as often, so the heartbeat is
+      -- on the clock rather than on the count -- and on a thread rather than on
+      -- the loop, because the run one most wants to hear from is the one stuck
+      -- inside a single declaration, which is exactly the run whose loop has
+      -- stopped coming round.
+      beat <- forkIO . forever $ do
+                threadDelay (round (heartbeat * 1e6))
+                getMonotonicTime >>= tally
+      let loud (Starting mn : ps) = do
             t <- getMonotonicTime
+            writeIORef cur (mn, t)
+            loud ps
+          loud (Checked mn : ps) = do
+            t       <- getMonotonicTime
+            (_, s)  <- readIORef cur
             modifyIORef' n (+ 1)
-            let dt = t - prev
-            when (dt >= cut) $
-              note (secs dt ++ "  " ++ maybe "<block>" showName mn)
-            -- A file with a few tens of thousands of declarations and one that
-            -- has millions both want to be heard from about as often, so the
-            -- heartbeat is on the clock rather than on the count.
-            beat' <- if t - beat < heartbeat then pure beat
-                       else tally t >> pure t
-            loud t beat' ps
-          loud t _ (Failed err : _) = do
+            when (t - s >= cut) $ note (secs (t - s) ++ "  " ++ nameOf mn)
+            loud ps
+          loud (Failed err : _) = do
             note "stopped:"
-            tally t
+            getMonotonicTime >>= tally
             pure (Left err)
-          loud t _ (Done env : _) = tally t >> pure (Right env)
-          loud _ _ [] = pure (Left "internal error: export trace ended")
-      loud t0 t0 ps0
+          loud (Done env : _) = do
+            getMonotonicTime >>= tally
+            pure (Right env)
+          loud [] = pure (Left "internal error: export trace ended")
+      r <- loud ps0
+      killThread beat
+      pure r
   where
-    quiet (Failed err : _) = Left err
-    quiet (Done env   : _) = Right env
-    quiet (Checked _  : r) = quiet r
-    quiet []               = Left "internal error: export trace ended"
+    quiet (Failed err  : _) = Left err
+    quiet (Done env    : _) = Right env
+    quiet (Starting _  : r) = quiet r
+    quiet (Checked _   : r) = quiet r
+    quiet []                = Left "internal error: export trace ended"
 
     note s = hPutStrLn stderr ("[ " ++ s ++ " ]")
     secs t = showFFloat (Just 2) t "s"
+    nameOf = maybe "<block>" showName
 
     heartbeat :: Double
     heartbeat = 60
