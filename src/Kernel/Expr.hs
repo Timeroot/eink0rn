@@ -137,20 +137,96 @@ exprHash e = case e of
 instance Eq Expr where
   a == b = ptrEq a b || (exprHash a == exprHash b && eqE a b)
 
+-- | Equality below the root, for two terms whose hashes already agree.
+--
+-- Same shape as 'instN', and for the same reason. The plain recursion compares a
+-- shared pair of subterms once per /path/ that reaches it, and a term produced
+-- by unfolding a @brecOn@ has exponentially more paths than nodes; two such
+-- terms that really are equal are then the worst case, because nothing
+-- short-circuits. So the plain recursion runs under a visit budget and a
+-- memoised traversal takes over when that runs out. The budget is the detector:
+-- below it there is no sharing worth a table, and a comparison that exceeds it
+-- has nothing else that could be taking the time.
+--
+-- Only equal pairs are remembered, which is all that is needed: a @False@
+-- anywhere propagates through the conjunctions to the root, so no pair is ever
+-- asked about twice after answering @False@.
 eqE :: Expr -> Expr -> Bool
-eqE (XBVar i)             (XBVar j)             = i == j
-eqE (XFVar i)             (XFVar j)             = i == j
-eqE (XSort _ l)           (XSort _ m)           = l == m
-eqE (XConst _ n ls)       (XConst _ m ms)       = n == m && ls == ms
-eqE (XApp _ _ f a)        (XApp _ _ g b)        = f == g && a == b
-eqE (XLam _ _ n t b)      (XLam _ _ n' t' b')   = n == n' && t == t' && b == b'
-eqE (XPi  _ _ n t b)      (XPi  _ _ n' t' b')   = n == n' && t == t' && b == b'
-eqE (XLet _ _ n t v b)    (XLet _ _ n' t' v' b') =
-  n == n' && t == t' && v == v' && b == b'
-eqE (XProj _ _ s i b)     (XProj _ _ s' i' b')  = i == i' && s == s' && b == b'
-eqE (XNatLit _ x)         (XNatLit _ y)         = x == y
-eqE (XStrLit _ x)         (XStrLit _ y)         = x == y
-eqE _                     _                     = False
+eqE a0 b0 = case plain eqBudget a0 b0 of
+    (r, k) | k >= 0 -> r
+    _               -> runST (newSTRef IM.empty >>= \ref -> go ref a0 b0)
+  where
+    plain :: Int -> Expr -> Expr -> (Bool, Int)
+    plain !k x y
+      | k < 0                    = (False, k)
+      | ptrEq x y                = (True, k)
+      | exprHash x /= exprHash y = (False, k)
+      | otherwise = case (x, y) of
+          (XApp _ _ f a, XApp _ _ g b) -> two (k - 1) f g a b
+          (XLam _ _ n t b, XLam _ _ n' t' b')
+            | n == n'   -> two (k - 1) t t' b b'
+          (XPi _ _ n t b, XPi _ _ n' t' b')
+            | n == n'   -> two (k - 1) t t' b b'
+          (XLet _ _ n t v b, XLet _ _ n' t' v' b')
+            | n == n'   -> case two (k - 1) t t' v v' of
+                (True, k1) -> plain k1 b b'
+                r          -> r
+          (XProj _ _ s i b, XProj _ _ s' i' b')
+            | i == i', s == s' -> plain (k - 1) b b'
+          _ -> (eqLeaf x y, k - 1)
+
+    two !k f g a b = case plain k f g of
+      (True, k1) -> plain k1 a b
+      r          -> r
+
+    go :: STRef s (IntMap [(Expr, Expr)]) -> Expr -> Expr -> ST s Bool
+    go ref x y
+      | ptrEq x y                = pure True
+      | exprHash x /= exprHash y = pure False
+      | otherwise = do
+          m <- readSTRef ref
+          if seen (IM.findWithDefault [] (exprHash x) m) then pure True else do
+            r <- kids ref x y
+            if not r then pure False else do
+              modifySTRef' ref (IM.insertWith (++) (exprHash x) [(x, y)])
+              pure True
+      where
+        seen ((p, q) : rest) = (ptrEq p x && ptrEq q y) || seen rest
+        seen []              = False
+
+    kids ref x y = case (x, y) of
+      (XApp _ _ f a, XApp _ _ g b) -> andM (go ref f g) (go ref a b)
+      (XLam _ _ n t b, XLam _ _ n' t' b')
+        | n == n' -> andM (go ref t t') (go ref b b')
+      (XPi _ _ n t b, XPi _ _ n' t' b')
+        | n == n' -> andM (go ref t t') (go ref b b')
+      (XLet _ _ n t v b, XLet _ _ n' t' v' b')
+        | n == n' -> andM (go ref t t') (andM (go ref v v') (go ref b b'))
+      (XProj _ _ s i b, XProj _ _ s' i' b')
+        | i == i', s == s' -> go ref b b'
+      _ -> pure (eqLeaf x y)
+
+    andM p q = p >>= \r -> if r then q else pure False
+
+-- | The cases with no subterms to recur into.  Reached from 'eqE' only, where
+-- the two hashes are known to agree.
+eqLeaf :: Expr -> Expr -> Bool
+eqLeaf (XBVar i)     (XBVar j)     = i == j
+eqLeaf (XFVar i)     (XFVar j)     = i == j
+eqLeaf (XSort _ l)   (XSort _ m)   = l == m
+eqLeaf (XConst _ n ls) (XConst _ m ms) = n == m && ls == ms
+eqLeaf (XNatLit _ x) (XNatLit _ y) = x == y
+eqLeaf (XStrLit _ x) (XStrLit _ y) = x == y
+eqLeaf _             _             = False
+
+-- | How many pairs of nodes 'eqE' may compare before it is worth a memo table.
+--
+-- Larger than 'instBudget' because equality, unlike substitution, is asked about
+-- whole declared types and stored bodies as often as it is asked about the small
+-- open terms conversion produces, and because the work thrown away on a miss is
+-- a walk that allocates nothing.
+eqBudget :: Int
+eqBudget = 1024
 
 -- | Some total order agreeing with '=='.  Not alphabetical, not structural:
 -- hash first, which is fine because nothing reads an ordering on terms for
