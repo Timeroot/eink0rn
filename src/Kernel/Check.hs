@@ -411,7 +411,17 @@ speculate (TC act) = TC $ \s ->
       allow = if fuel0 == unmetered then tcWaste s else min fuel0 (tcWaste s)
   in if allow <= 0 then bumpCounter (tcStarve s) >> pure (Right (False, s)) else
      act s { tcFuel = allow } >>= \case
-       Left e        -> pure (Left e)
+       -- An error raised in here is not the file's error, it is this
+       -- comparison's.  With the budget gone, reduction has stopped where it
+       -- stands, so a type read off the term it left behind can be anything at
+       -- all -- @(fun x => A -> B) c@ is not a function type until someone
+       -- affords the beta step -- and the rules that read types off terms have
+       -- to be able to say "no opinion" rather than "this file is wrong".  The
+       -- caller reads the @False@ as "not this way" and asks again the honest
+       -- way.  Nothing is swallowed: every term compared here is a subterm of
+       -- something the declaration's own inference visits unmetered, and by
+       -- §7.3 a @False@ can only ever decline.
+       Left _        -> pure (Right (False, s))
        Right (b, s') ->
          let used  = allow - tcFuel s'
              fuel' | fuel0 == unmetered = unmetered
@@ -818,12 +828,14 @@ toCtorWhenK r _ls major = withFuel $ do
 
 -- | Structure eta on the major premise: for a structure-like @T@ every element
 -- is convertible to @T.mk s.0 .. s.(n-1)@.
+--
+-- Only for a /non-recursive/ structure: see 'isEtaReducible'.
 toCtorWhenStruct :: RecInfo -> Expr -> TC (Maybe Expr)
 toCtorWhenStruct r major = withFuel $ do
   env <- getEnv
   case lookupConst env (recInduct r) of
     Just (CInd ind)
-      | isStructureLike env (indName ind)
+      | isEtaReducible env (indName ind)
       , [cn] <- indCtors ind
       , Just (CCtor ci) <- lookupConst env cn -> do
           majorTy <- inferOnly major >>= whnf

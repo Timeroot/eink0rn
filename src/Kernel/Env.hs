@@ -26,6 +26,7 @@ module Kernel.Env
   , constType
   , defPriority
   , isStructureLike
+  , isEtaReducible
   , ctorOfStructure
   ) where
 
@@ -240,20 +241,37 @@ addConst env ci
       { envConsts = IM.insertWith (++) (nameHash n) [ci] (envConsts env) }
   where n = constName ci
 
--- | Eligible for eta and for @Expr.proj@: exactly one constructor, no indices,
--- and not recursive.  (A recursive single-constructor type would make eta
--- expansion diverge.)
+-- | Eligible for @Expr.proj@ and for eta: exactly one constructor and no
+-- indices.
+--
+-- That is the whole content of the eta principle -- an element of such a type
+-- /is/ its constructor applied to its fields -- and it is all a projection
+-- needs.  Whether the type is recursive has nothing to do with it: recursion is
+-- a statement about what the fields may mention, and eta is a statement about
+-- the outermost constructor.
 isStructureLike :: Env -> Name -> Bool
 isStructureLike env n = case lookupConst env n of
   Just (CInd i) -> length (indCtors i) == 1
                 && indNumIndices i == 0
-                && not (indIsRecursive i)
   _ -> False
+
+-- | Structure-like, and safe to eta-expand /during reduction/: also not
+-- recursive.
+--
+-- The extra clause is about termination and nothing else.  Rewriting a stuck
+-- major premise @s@ to @mk s.0 ... s.(n-1)@ lets iota fire; but if a field is
+-- recursive, the rule it fires produces the recursor applied to @s.j@ -- stuck
+-- again, and eta-expanded again, forever.  Conversion's own eta rule (§7.2) has
+-- no such problem, because it only fires against a side that already /is/ a
+-- constructor application and descends into it.
+isEtaReducible :: Env -> Name -> Bool
+isEtaReducible env n = isStructureLike env n && case lookupConst env n of
+  Just (CInd i) -> not (indIsRecursive i)
+  _             -> False
 
 ctorOfStructure :: Env -> Name -> Maybe CtorInfo
 ctorOfStructure env n = case lookupConst env n of
   Just (CInd i) | [c] <- indCtors i
                 , indNumIndices i == 0
-                , not (indIsRecursive i)
                 , Just (CCtor ci) <- lookupConst env c -> Just ci
   _ -> Nothing

@@ -266,8 +266,16 @@ device, and the kernel treats it as one everywhere.
    Γ ⊢ s.[T, i] : Fᵢ'
 ```
 
-"Structure-like" means: exactly one constructor, no indices, and not recursive.
-(The last clause is what stops eta expansion from diverging; see §7.4.)
+"Structure-like" means: exactly one constructor and no indices. That is the whole
+content of the eta principle — an element of such a type *is* its constructor
+applied to its fields — and it is all a projection needs. Whether the type is
+recursive is beside the point here: recursion constrains what the *fields* may
+mention, and this rule is about the *outermost* constructor. Lean's own libraries
+project out of recursive structures (`Lean.Meta.Grind.AC.DiseqCnstr.lhs`, whose
+type is one half of a mutual block), and there is nothing wrong with it.
+
+One consumer does need the extra clause, and it is a reduction rule rather than a
+typing rule: §6.3's eta expansion of a *stuck major premise*. See there.
 
 **The side condition.** If `T p̄` is a proposition then all of its inhabitants are
 convertible by proof irrelevance, so `(mk true).[T,0]` and `(mk false).[T,0]`
@@ -360,6 +368,15 @@ reduce at `Eq a b` for non-convertible `a` and `b`.
 **Structure eta on the major premise.** For a structure-like `T`, every element is
 convertible to `T.mk s.[T,0] … s.[T,n-1]`, so a neutral major premise of structure
 type still reduces.
+
+This rule, alone among the ones that appeal to §5.3's structure-likeness, also
+requires `T` to be **not recursive**, and the reason is termination rather than
+soundness. Rewriting a stuck `s` to `T.mk s.[T,0] … ` lets iota fire; but if a
+field is recursive then the rule it fires produces the recursor applied to
+`s.[T,j]`, which is stuck again, and gets eta-expanded again, forever. The rule
+would be sound; it would simply never stop. §7.2's eta is not exposed to this,
+because it only fires against a side that already *is* a constructor application,
+and descends into that side.
 
 ### 6.4 Iota for `Quot`
 
@@ -676,6 +693,11 @@ weighed against the priorities.
 - **Unit-like eta**: a structure with *no* fields has exactly one element up to
   conversion, so any two terms of that type are equal.
 
+Both terminate on a recursive structure as well as on a flat one, unlike §6.3's
+eta on a major premise. The rule only fires when one side is already a
+constructor application, and it recurses into the fields *of that side*, which is
+a finite term that gets strictly smaller.
+
 ### 7.3 The one-sided invariant
 
 **Every call to `isDefEq` in the kernel is in a positive position.** A `False`
@@ -740,6 +762,16 @@ Two consequences are handled explicitly:
 - `DStarved` is returned when the budget ran out before *anything* could be
   unfolded. It is not a statement about the terms — it says the round made no
   progress, so the loop must stop rather than ask the same question forever.
+- An **error** raised inside a speculation is caught and read as `False`, and the
+  state is rolled back. With the budget gone, reduction has stopped where it
+  stands, so a type read off what it left behind can be anything at all —
+  `(fun x => A → B) c` is not a function type until someone can afford the beta
+  step — and a rule that reads types off terms must be able to answer "no
+  opinion" rather than "this file is wrong". Nothing is hidden by this: every
+  term a speculation compares is a subterm of something the declaration's own
+  *unmetered* inference visits, and by §7.3 a `False` can only ever decline. A
+  real error is therefore reported by the pass whose job it is, not by a
+  shortcut that ran out of money.
 
 The budget is therefore a completeness knob with no soundness content. Raising it
 can only turn rejections into acceptances of things that were already provable;
