@@ -1893,7 +1893,7 @@ declare `isRec = true`, and likewise for `isReflexive`. Nesting auxiliaries coun
 towards the block's answer, but they have no `isRec` field of their own to check.
 
 Agreement was confirmed on every inductive declaration in the arena corpus,
-including the 370,939-declaration `cslib` export.
+including the 654,504-declaration `mathlib` export.
 
 **Divergence.** Official Lean recomputes these fields and overwrites them rather
 than comparing, so a file whose bookkeeping is wrong is accepted there and
