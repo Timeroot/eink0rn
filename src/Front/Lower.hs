@@ -34,7 +34,7 @@ module Front.Lower
 
 import           Control.Monad  (foldM, forM, forM_, unless, when)
 import qualified Data.ByteString.Char8 as B
-import           Data.List      (find, nub, sort, zip4)
+import           Data.List      (find, nub, sort)
 import           Data.Maybe     (isJust)
 import qualified Data.Set       as S
 import           Front.Export
@@ -92,7 +92,7 @@ data Progress
 checkExportTrace :: Config -> [ExDecl] -> [Progress]
 checkExportTrace cfg =
   go (LS emptyEnv { envAccel = cfgAccel cfg } (cfgSealProofs cfg)
-        Nothing Nothing [] [])
+        Nothing Nothing [] [] [])
   where
     go st [] = [either Failed Done (finish st)]
     go st (d : ds) = case declName d of
@@ -101,6 +101,13 @@ checkExportTrace cfg =
         Right st' -> Checked nm : go st' ds
 
     finish st = do
+      -- A quotient primitive still held back at the end of the file never had
+      -- the rest of its package, or never fitted it; either way, say why.  It
+      -- is /not/ retried here: the package is admitted where its last line is,
+      -- so anything it borrows from outside itself -- @Quot.lift@ borrows @Eq@
+      -- -- has to have been declared before that point, as for any other
+      -- declaration.
+      mapM_ (Left . qdWhy) (lsQuotPend st)
       checkQuotPackage (reverse (lsQuots st))
       mapM_ (checkQuarantined (lsEnv st)) (reverse (lsUnsafe st))
       pure (lsEnv st)
@@ -118,7 +125,10 @@ data LS = LS
   , lsSeal    :: !Bool                 -- ^ 'cfgSealProofs'
   , lsQuotTy  :: !(Maybe Name)
   , lsQuotMk  :: !(Maybe Name)
-  , lsQuots   :: ![(QuotKind, Name)]   -- ^ reverse order of declaration
+  , lsQuots   :: ![(QuotKind, Name)]   -- ^ reverse order of admission
+  , lsQuotPend :: ![QuotD]
+    -- ^ quotient primitives read but not yet admitted, in file order; see
+    -- 'quotFlush'.
   , lsUnsafe  :: ![(Name, [Name], Expr, Expr)]
     -- ^ @(name, universe parameters, type, value)@ of each unsafe declaration
     -- that has a value, in reverse order of declaration.  Held back until the
@@ -168,20 +178,14 @@ checkDecl st d = case d of
     | u         -> quarantine st n lps ty (Just val)
     | otherwise -> defLike st n lps ty val HOpaque Seal
 
+  -- Queued rather than admitted on the spot: the package is one extension to
+  -- the theory (SPEC.md §12.3) and the file's order within it carries no
+  -- meaning, so a primitive whose siblings have not arrived yet waits for them
+  -- instead of being rejected.
   ExQuot n lps ty kind -> do
     checkLevelParams lps
-    run lps (inferSortOf ty)
-    when (kind == QLift) $ checkEqShape (lsEnv st)
-    expected <- expectedQuot st kind n lps
-    run lps $ do
-      ok <- isDefEq ty expected
-      unless ok $ throwTC ("quotient primitive has the wrong type\n  declared "
-                           ++ showExpr ty ++ "\n  expected " ++ showExpr expected)
-    env' <- addConst (lsEnv st) (CQuot n lps ty kind)
-    pure st { lsEnv  = env' { envQuotInit = True }
-            , lsQuotTy = if kind == QType then Just n else lsQuotTy st
-            , lsQuotMk = if kind == QCtor then Just n else lsQuotMk st
-            , lsQuots  = (kind, n) : lsQuots st }
+    pure (quotFlush st { lsQuotPend = lsQuotPend st
+                                        ++ [QuotD kind n lps ty "not checked"] })
 
   ExInduct types ctors recs -> do
     u <- blockSafety types ctors recs
@@ -431,10 +435,11 @@ checkInductive env types ctors recs = do
               ++ ", expected " ++ show (map showName (sort ourRecNames)))
 
       ab <- admitBlock env CoreBlock
-        { cbLevels    = lvls
-        , cbNumParams = nps
-        , cbMembers   = declMembers ++ auxMembers
-        , cbElimHint  = elimHint (map exrLevels recs) lvls
+        { cbLevels      = lvls
+        , cbNumParams   = nps
+        , cbMembers     = declMembers ++ auxMembers
+        , cbNumDeclared = nDecl
+        , cbElimHint    = elimHint (map exrLevels recs) lvls
         }
 
       -- Drop the auxiliary members and put the real containers back.
@@ -454,14 +459,12 @@ checkInductive env types ctors recs = do
       -- The export's own bookkeeping must agree with what we derived.
       let blockRec  = any indIsRecursive (abInds ab)
           blockRefl = or (abReflexive ab)
-      forM_ (zip4 types inds (take nDecl (abReflexive ab)) ourCs) $ \(iv, ind, refl, ourG) -> do
+      forM_ (zip3 types inds ourCs) $ \(iv, ind, ourG) -> do
         unless (exiNumIndices iv == indNumIndices ind) $
           Left (showName (exiName iv) ++ " declares " ++ show (exiNumIndices iv)
                 ++ " indices, but its type has " ++ show (indNumIndices ind))
-        derivedFlag "isRec" (exiName iv) (exiIsRec iv)
-                    (indIsRecursive ind) blockRec
-        derivedFlag "isReflexive" (exiName iv) (exiIsReflexive iv)
-                    refl blockRefl
+        derivedFlag "isRec" (exiName iv) (exiIsRec iv) blockRec
+        derivedFlag "isReflexive" (exiName iv) (exiIsReflexive iv) blockRefl
         forM_ (zip3 [0 ..] (exiCtors iv) ourG) $ \(k, cn, ourC) -> do
           c <- findCtor cn
           unless (excInduct c == exiName iv) $ Left "constructor of the wrong type"
@@ -511,18 +514,17 @@ checkInductive env types ctors recs = do
 -- place where a file can say one thing and mean another, and the cost of
 -- closing it is one comparison.
 --
--- The two bounds are what makes this safe on a mutual block.  @lo@ is what this
--- member's own constructors force the flag to be; @hi@ is what the block as a
--- whole permits.  For a single-member block they coincide and the check is
--- exact.  For a mutual block they can differ -- a member with no recursive
--- field of its own inside a block that has one -- and the format does not say
--- whether the flag describes the member or its block.  Rather than guess, a
--- value is rejected only when it is wrong under /both/ readings.
-derivedFlag :: String -> Name -> Bool -> Bool -> Bool -> Either String ()
-derivedFlag what n declared lo hi
-  | declared, not hi = bad "false"
-  | not declared, lo = bad "true"
-  | otherwise        = Right ()
+-- Both flags are read as describing the /block/, not the member: a mutual
+-- block is one declaration, and a member with no recursive field of its own
+-- still has a recursor that recurses, because the block's recursors call each
+-- other.  So @and@-ing the members' own answers would leave the flag saying
+-- something no rule of the theory means, and a member of a recursive block is
+-- reported recursive.
+derivedFlag :: String -> Name -> Bool -> Bool -> Either String ()
+derivedFlag what n declared derived
+  | declared == derived = Right ()
+  | declared            = bad "false"
+  | otherwise           = bad "true"
   where
     bad want = Left (showName n ++ " is declared with " ++ what ++ " = "
                      ++ lc declared ++ ", but the kernel derives " ++ want)
@@ -570,10 +572,16 @@ checkRecursorMatches env allInds rv r = do
       throwTC ("the declared recursor type is not the one this inductive type\
                \ justifies\n  declared " ++ showExpr (theirs (exrType rv))
                ++ "\n  derived  " ++ showExpr d)
-    forM_ (exrRules rv) $ \ru -> case find ((== exuCtor ru) . rrCtor) (recRules r) of
-      Nothing -> throwTC ("reduction rule for unknown constructor "
-                          ++ showName (exuCtor ru))
-      Just our -> do
+    -- Positionally: the rules of a recursor are in constructor order, which is
+    -- the order the constructors were declared in.  Matching them by name
+    -- instead would let a file permute them, and a permuted list is a file
+    -- saying one thing and meaning another (SPEC.md §12.9) -- and, with a
+    -- repeated name, a list that leaves some constructor with no rule at all
+    -- while still having the right length.
+    forM_ (zip (exrRules rv) (recRules r)) $ \(ru, our) -> do
+        unless (exuCtor ru == rrCtor our) $
+          throwTC ("the reduction rules are for " ++ showName (exuCtor ru)
+                   ++ " where constructor order puts " ++ showName (rrCtor our))
         unless (exuNumFields ru == rrNumFields our) $
           throwTC ("reduction rule for " ++ showName (exuCtor ru) ++ " declares "
                    ++ show (exuNumFields ru) ++ " fields, expected "
@@ -820,6 +828,59 @@ unAux ns n = head ([ nsHead x | x <- ns, nsAux x == n ]
 -- derived recursor it demands a proof that the function respects the relation.
 -- That extra argument is exactly what keeps @Quot.sound@ consistent, so the
 -- four types are pinned down here rather than taken on trust.
+
+-- | A @quot@ line, read but not yet admitted.
+-- | A @quot@ line, read but not yet admitted, and why it is still waiting.
+data QuotD = QuotD !QuotKind !Name ![Name] !Expr String
+
+-- | Why a queued primitive did not go through the last time it was tried.
+qdWhy :: QuotD -> String
+qdWhy (QuotD _ n _ _ why) = showName n ++ ": " ++ why
+
+-- | Admit every queued quotient primitive that will now go through, repeating
+-- while any of them does.
+--
+-- Each primitive's expected type is stated in terms of the others -- @Quot.mk@
+-- lands in the quotient type, @Quot.ind@ quantifies over the class map -- so a
+-- file that declares them out of order has, at the moment a line is read,
+-- nothing to state that line's expected type against.  Rather than fix an
+-- order the format does not fix, a line that cannot be stated yet is held and
+-- retried when the next one arrives.  Nothing is weakened: every primitive is
+-- checked against the same expected type in the end, and 'checkQuotPackage'
+-- still requires the package to be complete.
+--
+-- The retry loop terminates because each round either admits at least one
+-- primitive or stops, and a file has finitely many.
+quotFlush :: LS -> LS
+quotFlush st = case onePass (lsQuotPend st) st { lsQuotPend = [] } of
+    (st', True)  -> quotFlush st'
+    (st', False) -> st'
+  where
+    onePass [] acc = (acc, False)
+    onePass (q@(QuotD kind n lps ty _) : qs) acc = case admitQuot acc q of
+      Right acc' -> (fst (onePass qs acc'), True)
+      Left why   -> onePass qs acc { lsQuotPend = lsQuotPend acc
+                                                    ++ [QuotD kind n lps ty why] }
+
+-- | Check one quotient primitive against the type its kind demands, and enter
+-- it.  The error is what 'quotFlush' reads as \"not yet\", and what the end of
+-- the file reports if it never becomes \"yes\".
+admitQuot :: LS -> QuotD -> Either String LS
+admitQuot st (QuotD kind n lps ty _) = do
+  run (inferSortOf ty)
+  when (kind == QLift) $ checkEqShape (lsEnv st)
+  expected <- expectedQuot st kind n lps
+  run $ do
+    ok <- isDefEq ty expected
+    unless ok $ throwTC ("quotient primitive has the wrong type\n  declared "
+                         ++ showExpr ty ++ "\n  expected " ++ showExpr expected)
+  env' <- addConst (lsEnv st) (CQuot n lps ty kind)
+  pure st { lsEnv    = env' { envQuotInit = True }
+          , lsQuotTy = if kind == QType then Just n else lsQuotTy st
+          , lsQuotMk = if kind == QCtor then Just n else lsQuotMk st
+          , lsQuots  = (kind, n) : lsQuots st }
+  where
+    run act = either Left (const (Right ())) (runTC (lsEnv st) lps act)
 
 -- | The quotient package is one extension to the theory, not four independent
 -- constants, and it is admitted whole or not at all.

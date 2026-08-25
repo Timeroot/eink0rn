@@ -29,8 +29,8 @@ module Kernel.Inductive
   , admitBlock
   ) where
 
-import           Control.Monad (forM, forM_, unless)
-import           Data.List     (elemIndex, nub)
+import           Control.Monad (forM, forM_, unless, when)
+import           Data.List     (elemIndex, intercalate, nub)
 import           Kernel.Check
 import           Kernel.Env
 import           Kernel.Expr
@@ -50,6 +50,11 @@ data CoreBlock = CoreBlock
   { cbLevels    :: ![Name]
   , cbNumParams :: !Int
   , cbMembers   :: ![CoreMember]   -- ^ non-empty
+  , cbNumDeclared :: !Int
+    -- ^ how many of 'cbMembers' the file actually declared.  The rest are the
+    -- specialised containers the nesting compilation added (SPEC.md §9), which
+    -- are exempt from the uniform-universe rule of §8.3: they stand for types
+    -- admitted elsewhere, at whatever universe those have.
   , cbElimHint  :: !Name
     -- ^ preferred name for the fresh elimination universe; purely cosmetic, but
     -- reusing the exported one makes the derived recursors compare syntactically.
@@ -140,12 +145,22 @@ admit cb = do
         analyzeCtor names selfL ps lvl nps j cn cty
     pure (ps, ars, shs)
 
-  -- 3. Derived attributes.  Large elimination and the @k@ flag are properties of
-  --    the block as a whole: one set of motives is shared by every member, so
-  --    the weakest member decides.
+  -- 3. Every type the file declared in this block must land in the /same/ sort.
+  --    A block is one definition with one set of motives, and its members are
+  --    read as one family indexed by the member; letting the members sit at
+  --    different universes would make that reading false.  (SPEC.md §8.3.)
   let indLvls   = map fst arities
       idxTeles  = map snd arities
-      largeElim = decideLargeElim (zip indLvls shapess)
+      declLvls  = take (cbNumDeclared cb) indLvls
+  unless (and (zipWith levelEquiv declLvls (drop 1 declLvls))) $
+    throwTC (ctxt ++ "the types of a mutual block must all land in the same \
+                     \universe, but they land in "
+             ++ intercalate ", " (map showLevel declLvls))
+
+  -- 4. Derived attributes.  Large elimination and the @k@ flag are properties of
+  --    the block as a whole: one set of motives is shared by every member, so
+  --    the weakest member decides.
+  let largeElim = decideLargeElim (zip indLvls shapess)
       kLike     = case (ms, indLvls, shapess) of
         ([_], [l], [[sh]]) -> isDefinitelyZero l && csNumFields sh == 0
         _                  -> False
@@ -299,18 +314,29 @@ analyzeCtor names selfL ps indLvl nps owner cn cty0 = do
     -- none in @idx@.  Anything else -- a negative occurrence, or a member under
     -- another type constructor -- is rejected.  Nested inductives never reach
     -- here: "Front.Lower" has already turned them into extra members.
-    classifyField dom
-      | not (occursSelf dom) = pure Nothing
+    --
+    -- The occurs check is syntactic, so it also fires on an occurrence that is
+    -- about to be erased: the specialised containers the nesting compilation
+    -- builds routinely have fields like @(fun (x : T) => True) v@, where @T@
+    -- appears only in a binder annotation of a redex.  Whenever the syntactic
+    -- check fires the term is reduced and asked again, and only an occurrence
+    -- that survives reduction counts.
+    classifyField dom0
+      | not (occursSelf dom0) = pure Nothing
       | otherwise = do
-          (xs, res) <- peelPis dom
-          forM_ xs $ \x -> do
-            t <- localType x
-            unless (not (occursSelf t)) $
-              throwTC (ctxt ++ "occurrence of the inductive block to the left of\
-                               \ an arrow")
-          (j, idx) <- splitSelf "recursive field" res
-          tele <- teleOf xs
-          pure (Just (RecOcc j tele (map (abstractFVars xs) idx)))
+          dom <- whnf dom0
+          if not (occursSelf dom) then pure Nothing else do
+            (xs, res) <- peelPis dom
+            forM_ xs $ \x -> do
+              t <- localType x
+              when (occursSelf t) $ do
+                t' <- whnf t
+                when (occursSelf t') $
+                  throwTC (ctxt ++ "occurrence of the inductive block to the\
+                                   \ left of an arrow")
+            (j, idx) <- splitSelf "recursive field" res
+            tele <- teleOf xs
+            pure (Just (RecOcc j tele (map (abstractFVars xs) idx)))
 
     -- Require @res == t_j params idx@, and return @j@ and @idx@.
     splitSelf what res = do
@@ -334,14 +360,23 @@ analyzeCtor names selfL ps indLvl nps owner cn cty0 = do
 
 -- Large elimination -------------------------------------------------------------
 
--- | Thesis §2.9.2, per member.  A block may eliminate into an arbitrary sort
--- when /every/ member may, since they share the motives.  A member may when
--- either
+-- | Thesis §2.9.2.  A block eliminates into an arbitrary sort when either
 --
--- 1. it is provably not a @Prop@ under any assignment of the block's universes;
---    or
--- 2. it is a subsingleton: at most one constructor, each of whose fields is
---    either a proof or is recovered from the result's indices.
+-- 1. /every/ member is provably not a @Prop@ under any assignment of the
+--    block's universes -- they share the motives, so the weakest decides; or
+-- 2. the block has exactly one member and that member is a subsingleton: at
+--    most one constructor, each of whose fields is either a proof or is
+--    recovered from the result's indices.
+--
+-- The one-member side condition on case 2 is not decoration.  The subsingleton
+-- licence is justified by reading the eliminator back as a function that
+-- recovers the constructor's fields from the major premise's type, and that
+-- argument is about /one/ inductive family: a mutual block's recursor also
+-- carries motives and minor premises for its other members, whose data is not
+-- recovered from anything.  The nesting compilation (SPEC.md §9) makes blocks
+-- out of some declarations that were written as a single type, so a nested
+-- @Prop@ loses the licence too -- correctly, since the container field it
+-- nests under is data.
 --
 -- Case 2 is what makes @Eq.rec@, @And.rec@ and @Acc.rec@ large-eliminating while
 -- @Exists.rec@ is not: @Exists.intro@'s witness is data that the result type
@@ -365,14 +400,14 @@ analyzeCtor names selfL ps indLvl nps owner cn cty0 = do
 -- at @Sort (max 1 (max u v))@, which is provably non-zero, so they never reach
 -- the subsingleton test at all.
 decideLargeElim :: [(Level, [CtorShape])] -> Bool
-decideLargeElim = all ok
+decideLargeElim members
+  | all (isDefinitelyNonZero . fst) members = True
+  | [(_, shapes)] <- members = case shapes of
+      []   -> True                      -- an empty Prop eliminates into anything
+      [sh] -> all (recoverable sh) (csFields sh)
+      _    -> False
+  | otherwise = False
   where
-    ok (indLvl, shapes)
-      | isDefinitelyNonZero indLvl = True
-      | otherwise = case shapes of
-          []   -> True                  -- an empty Prop eliminates into anything
-          [sh] -> all (recoverable sh) (csFields sh)
-          _    -> False
     recoverable sh f =
       isDefinitelyZero (cfLevel f)
         || FVar (cfVar f) `elem` csResIdx sh

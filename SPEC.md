@@ -890,10 +890,12 @@ reasons worth recording:
   to index them with;
 - eliminating into `Sort u` from that index type requires it to large-eliminate,
   which is another obligation to discharge before the prelude has the machinery;
-- the members of a block may sit at *heterogeneous* universe levels, and a single
-  type has one level; reconciling them means inserting universe lifts, which
-  changes the types the export wrote down and so breaks the recursor-matching
-  check of §1.
+- the members of a block may sit at *heterogeneous* universe levels — the types
+  the file declares share one level (§8.3), but §9 adds a member per nested
+  occurrence and each of those stands for a container admitted elsewhere, at
+  whatever level that container has — and a single type has one level;
+  reconciling them means inserting universe lifts, which changes the types the
+  export wrote down and so breaks the recursor-matching check of §1.
 
 A mutual block is already the primitive the thesis treats (§2.9), and treating it
 directly costs one extra index (`which member?`) in the bookkeeping and nothing in
@@ -922,9 +924,22 @@ b_i : forall x::ξ_i, t_k π_i[b,x]      a recursive field, landing in the k-th 
    constructor may only see its own block's types as opaque constants of the right
    arity — it cannot exploit anything about their contents.
 3. Constructor analysis (§8.4).
-4. Derived attributes (§8.5, §8.6).
-5. Recursor construction (§8.7), whose derived type is itself type-checked as an
+4. **Uniform resultant universe.** Every type the file *declared* in this block
+   ends in the same sort, up to the level equivalence of §3. Members that §9
+   added for nested occurrences are exempt.
+5. Derived attributes (§8.5, §8.6).
+6. Recursor construction (§8.7), whose derived type is itself type-checked as an
    audit.
+
+Step 4 is a rule about what a mutual block *is*. A block is one declaration with
+one set of motives and one set of minor premises shared by all its members, read
+as a single family indexed by "which member?"; members at different universes
+would make that reading false, and the elaborators that produce these files hold
+to it. Nothing in the theory below breaks without it — the shared-motive
+elimination rules of §8.5 are stated per member and stay sound for a
+heterogeneous block — so this is a conformance rule in the sense of §12.3, and
+its exemption for §9's auxiliaries is what keeps it from rejecting the nesting
+compilation's own output.
 
 ### 8.4 The `ctor` judgement
 
@@ -956,24 +971,49 @@ occurring in `ī`. A *recursive field* may land in any member of the block; the
 Field types are whnf'd before being peeled, so a field whose type is a definition
 that only unfolds to a function type is still analysed correctly.
 
+The "occurs in" of the classification is *syntactic*, and a syntactic occurrence
+can be one that reduction is about to erase: the specialised containers §9 builds
+routinely have fields like `(fun (x : T) => True) v`, where the block member `T`
+survives only in the binder annotation of a redex. So whenever the syntactic
+check fires — on a field's type, or on a binder type inside `ξ` — the term is
+whnf'd and the check is asked again, and only an occurrence that survives
+reduction is treated as one. This can only accept fields that the syntactic
+reading would reject, and it accepts them because their types really are
+convertible to types the block does not occur in.
+
 ### 8.5 Large elimination
 
-A block eliminates into an arbitrary `Sort` when **every** member does, since they
-share the motives. A member does when either:
+A block eliminates into an arbitrary `Sort` when either:
 
-1. `isDefinitelyNonZero l_j` — it is provably not a proposition under any
-   assignment; **or**
-2. it is a *subsingleton*: at most one constructor, each of whose fields is
-   either a proof or is recovered from the result's indices. Formally, with the
-   single constructor's shape `sh`, every field `f` satisfies
+1. **every** member satisfies `isDefinitelyNonZero l_j` — none of them is a
+   proposition under any assignment. They share the motives, so the weakest
+   member decides; **or**
+2. the block has **exactly one** member and that member is a *subsingleton*: at
+   most one constructor, each of whose fields is either a proof or is recovered
+   from the result's indices. Formally, with the single constructor's shape
+   `sh`, every field `f` satisfies
 
    ```
    isDefinitelyZero (sort of f)   ∨   f ∈ resultIndices(sh)
    ```
 
+   A member with **no** constructors satisfies this vacuously: an empty
+   proposition eliminates into anything.
+
 Case 2 is what makes `Eq.rec`, `And.rec` and `Acc.rec` large-eliminating while
 `Exists.rec` is not: `Exists.intro`'s witness is data that the result type
 `Exists p` does not mention, so it must not be allowed to escape.
+
+**The one-member side condition on case 2 is load-bearing.** The subsingleton
+licence is justified by reading the eliminator back as a function that recovers
+the constructor's fields from the major premise and its indices — proof
+irrelevance says there was nothing else to know. That argument is about *one*
+family. A mutual block's recursor also carries motives and minor premises for
+the block's other members, and their constructors' data is recovered from
+nothing; a `Prop`-valued member of a mutual block therefore gets small
+elimination even when its own constructor is a subsingleton. The rule is stated
+on the block *after* §9 has run, so a nested `Prop` loses the licence too, which
+is right: the container field it nests under is data.
 
 **"Is a proof" is read absolutely.** The field's sort must be zero under every
 assignment, not merely whenever the member itself lands in `Prop`. The weaker,
@@ -1052,10 +1092,15 @@ Right-hand sides are stored abstracted over `params, C̄, ē, fields`, in that o
 Per §1: `all` lists exactly the block's declared types (not the recursors, and not
 the nesting auxiliaries); the parameter, motive, index and minor counts match; the
 `k` flag matches; the universe-parameter count matches; the type is definitionally
-equal; every rule matches a derived one with the same field count and a
-definitionally equal right-hand side; and there are no extra rules. Constructor
-bookkeeping (`induct`, `idx`, `numParams`, `numFields`, universe parameters) is
-checked the same way.
+equal; and the rules match, **positionally**, in constructor order, each with the
+same constructor name, the same field count and a definitionally equal right-hand
+side. Constructor bookkeeping (`induct`, `idx`, `numParams`, `numFields`,
+universe parameters) is checked the same way.
+
+Positionally, and not by looking each declared rule's constructor up among the
+derived ones: a permuted rule list is a file saying one thing and meaning another
+(§12.9), and matching by name would also let a file repeat one constructor's rule
+and drop another's while keeping the list the right length.
 
 A declared recursor's universe parameters must also be *distinct*. They are
 matched to the derived recursor's positionally, so a repeated name would make
@@ -1509,13 +1554,64 @@ because the projection side condition of §5.3 is stated as an `imax` inequality
 that the same complete procedure decides — so the extra power is used to close a
 hole rather than to open one.
 
+The place this is reachable from a file, rather than only from a term, is §8.4's
+universe condition `imax(l', l) ≤ l` on an inductive whose own level `l` is a
+variable or an `imax`. Three shapes it admits:
+
+| declaration | field levels | conditions |
+| --- | --- | --- |
+| `W.{u} : Sort (max u 1) → Sort u` | `max u 1` | `imax (max u 1) u ≤ u` |
+| `P.{u,v} : Sort (max u v) → Sort v → Sort (imax u v)` | `max u v`, `v` | `imax (max u v) (imax u v) ≤ imax u v`, `imax v (imax u v) ≤ imax u v` |
+| `P.{u,v} : Sort u → Sort v → Sort (imax u v)` | `u`, `v` | `imax u (imax u v) ≤ imax u v`, `imax v (imax u v) ≤ imax u v` |
+
+Every one of those inequalities holds under every assignment of the variables to
+naturals, and the case split that proves it is the one `levelLeq` performs
+anyway: split on whether the member's own level is zero. Where it is, the `imax`
+on the left is `0` and the inequality is `0 ≤ 0`; where it is not, every `imax`
+collapses to a `max` and what remains is true numerically — in row 1, `max u 1 ≤
+u` is exactly the branch's own hypothesis `u ≥ 1`. A reading that will not split
+on `u = 0` sees `max u 1 ≤ u` unguarded and refuses the declaration.
+
+Admitting them is safe for the reason that makes the rule safe generally: a
+universe-polymorphic declaration denotes the family of its instantiations, the
+condition holds at each of them, and so each instantiation is one of the
+monomorphic blocks §8 already admits. Nothing else in §8 loosens to match. In
+particular the elimination decision does not: a member whose level is not
+definitely nonzero gets large elimination only under §8.5's subsingleton clause,
+which none of these satisfy, so each is admitted as the small-eliminating type
+its own exported recursor declares it to be.
+
+Two other places in a file reach the same procedure. A definition may state its
+type in one spelling and its value in another — `fun x => x` at the type
+`Sort (imax (max u v) w) → Sort (max (imax u w) (imax v w))` — and is accepted
+because those are two spellings of one level, case split by case split. And
+§8.3's uniform-universe rule compares the members of a mutual block up to the
+level equivalence of §3 rather than syntactically, so a block whose two members
+are declared at `max u v` and at `imax u (max u v)` is one block rather than a
+heterogeneous one.
+
 ### 12.3 The quotient package is atomic
 
 Quotient primitives are *checked* one at a time — each against the type §10
 demands of its kind, stated over the type and constructor the file itself
-declared earlier. But the package is *admitted* whole or not at all: at the end
-of the file, if any `quot` declaration appeared then there must be exactly one
-of each of the four kinds `type`, `ctor`, `lift`, `ind`.
+declared. But the package is *admitted* whole or not at all: at the end of the
+file, if any `quot` declaration appeared then there must be exactly one of each
+of the four kinds `type`, `ctor`, `lift`, `ind`.
+
+**Order within the package carries no meaning.** §10's expected types are stated
+in terms of each other — `Quot.mk` lands in the quotient type, `Quot.ind`
+quantifies over the class map — so a `quot` line that arrives before the sibling
+its expected type needs is *held*, and retried when the next `quot` line arrives.
+A file that writes `Quot.mk` before `Quot` is accepted, and every primitive is
+still checked against the same expected type.
+
+What is *not* deferred is the file's own dependency order. A held primitive is
+retried only on another `quot` line, never at the end of the file, so the package
+is admitted at the position of its last `quot` line and everything it borrows
+from outside itself — `Quot.lift`'s premise mentions `Eq` (§12.1) — must have
+been declared before that point, exactly as for any other declaration. A file
+that puts `Quot.lift` ahead of `Eq` is rejected, with the reason the last attempt
+gave.
 
 This is a conformance rule, not a soundness rule, and the distinction matters
 for auditing. Every proper fragment of the package is sound on its own — the
@@ -1771,16 +1867,17 @@ and mean another, and the cost of closing it is one comparison.
 | `k` | §8.6 |
 | the recursor's type and rules | re-derived outright (§8.8) |
 
-`isRec` and `isReflexive` are checked against **two bounds** rather than one
-value. The format does not say whether the flag describes the member or the
-block it belongs to, and on a mutual block the two readings can differ — a member
-with no recursive field of its own inside a block that has one. So the lower
-bound is what this member's own constructors force, the upper bound is what the
-block as a whole permits, and a value is rejected only when it is wrong under
-both readings. On a single-member block the bounds coincide and the check is
-exact.
+`isRec` and `isReflexive` are read as describing the **block**, not the member.
+The two readings differ only on a mutual block — a member with no recursive field
+of its own inside a block that has one — and the block reading is the one that
+means something: the members of a block are admitted together and their
+recursors call each other, so that member's recursor recurses whether or not its
+own constructors do. Every member of a recursive block is therefore required to
+declare `isRec = true`, and likewise for `isReflexive`. Nesting auxiliaries count
+towards the block's answer, but they have no `isRec` field of their own to check.
 
-Agreement was confirmed on all 653 inductive declarations in the arena corpus.
+Agreement was confirmed on every inductive declaration in the arena corpus,
+including the 370,939-declaration `cslib` export.
 
 **Divergence.** Official Lean recomputes these fields and overwrites them rather
 than comparing, so a file whose bookkeeping is wrong is accepted there and
