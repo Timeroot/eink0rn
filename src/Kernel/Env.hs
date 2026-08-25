@@ -8,6 +8,7 @@
 module Kernel.Env
   ( ConstInfo (..)
   , DefInfo (..)
+  , Hint (..)
   , IndInfo (..)
   , CtorInfo (..)
   , RecInfo (..)
@@ -23,12 +24,13 @@ module Kernel.Env
   , constName
   , constLevels
   , constType
-  , computeHeight
+  , defPriority
   , isStructureLike
+  , isEtaReducible
   , ctorOfStructure
   ) where
 
-import qualified Data.Map.Strict as M
+import qualified Data.IntMap.Strict as IM
 import qualified Data.Set        as S
 import           Kernel.Expr
 import           Kernel.Name
@@ -52,6 +54,10 @@ data IndInfo = IndInfo
   , indCtors       :: ![Name]     -- ^ in constructor-index order
   , indIsRecursive :: !Bool       -- ^ does some member of the block occur in a field?
   , indLargeElim   :: !Bool       -- ^ may the recursor eliminate into any @Sort@?
+  , indK           :: !Bool
+    -- ^ does its recursor get K-like reduction?  The same flag as 'recK', kept
+    -- here so that a question about a /type/ can be answered without first
+    -- finding the recursor that eliminates it; see 'Kernel.Check.proofErasable'.
   } deriving (Eq, Show)
 
 data CtorInfo = CtorInfo
@@ -82,11 +88,31 @@ data DefInfo = DefInfo
   , defLevels :: ![Name]
   , defType   :: !Expr
   , defValue  :: !Expr
-  , defHeight :: !Int
-    -- ^ Purely a heuristic: it decides which of two constants to delta-unfold
-    -- first.  It is computed from the environment, never read from the input,
-    -- and cannot affect which terms are convertible -- only how fast we notice.
+  , defHint   :: !Hint
+    -- ^ which of two constants to delta-unfold first; see 'Hint'.
   } deriving (Eq, Show)
+
+-- | Scheduling advice for delta reduction, taken from the export's @hints@
+-- field.  Ordered so that the /greater/ of two definitions is the one to unfold
+-- first.
+--
+-- This is the one thing the kernel reads out of the file that it does not
+-- check, and it is safe to read precisely because there is nothing to check:
+-- the order in which two definitions are unfolded cannot change which terms are
+-- convertible.  When neither side wins, 'Kernel.Check.tryDelta' unfolds both, so
+-- every ordering -- including a deliberately perverse one -- decides the same
+-- questions.  It decides them at very different speeds, and that is all a hint
+-- is for.
+--
+-- @abbrev@ is a definition the elaborator considered too thin to be worth
+-- keeping folded, so it goes first.  @regular n@ carries a height: @n@ exceeds
+-- the height of everything the value mentions, so unfolding the taller of two
+-- constants is what lets the shorter one be reached from both sides.  @opaque@
+-- is the elaborator asking for this one to be left alone, and it is also what a
+-- theorem gets: the export gives @thm@ no hints field, and a proof is the last
+-- thing worth looking inside.
+data Hint = HOpaque | HRegular !Int | HAbbrev
+  deriving (Eq, Ord, Show)
 
 data ConstInfo
   = CAxiom !Name ![Name] !Expr
@@ -124,11 +150,9 @@ constType ci = case ci of
   CRec   r       -> recType r
   CQuot  _ _ t _ -> t
 
--- | @1 + max@ of the heights of the definitions a value mentions.
-computeHeight :: Env -> Expr -> Int
-computeHeight env v =
-  1 + maximum (0 : [ defHeight d | n <- S.toList (constsOf v)
-                                 , Just (CDef d) <- [lookupConst env n] ])
+-- | Which of two definitions to delta-unfold first: the greater goes first.
+defPriority :: DefInfo -> Hint
+defPriority = defHint
 
 -- | How much the kernel is willing to believe about the arithmetic constants
 -- before it computes with them on bignums.  See SPEC.md §6.5.
@@ -174,7 +198,12 @@ noLicences :: Licences
 noLicences = Licences False False S.empty S.empty
 
 data Env = Env
-  { envConsts   :: !(M.Map Name ConstInfo)
+  { envConsts   :: !(IM.IntMap [ConstInfo])
+    -- ^ keyed by 'nameHash', with a bucket per hash.  Every reduction step asks
+    -- this table what a constant is, and a tree keyed on 'Name' answers with
+    -- some seventeen calls to 'compare'; keyed on the hash the same seventeen
+    -- steps are primitive integer tests, and only the handful of names in the
+    -- surviving bucket are compared properly.  See 'lookupConst'.
   , envQuotInit :: !Bool
   , envAccel    :: !AccelMode
     -- ^ constant for the life of a run; it lives here because the accelerated
@@ -194,33 +223,55 @@ data Env = Env
   }
 
 emptyEnv :: Env
-emptyEnv = Env M.empty False AccelCanonical S.empty noLicences
+emptyEnv = Env IM.empty False AccelCanonical S.empty noLicences
 
 lookupConst :: Env -> Name -> Maybe ConstInfo
-lookupConst env n = M.lookup n (envConsts env)
+lookupConst env n = IM.lookup (nameHash n) (envConsts env) >>= go
+  where
+    go (ci : rest) | constName ci == n = Just ci
+                   | otherwise         = go rest
+    go []                              = Nothing
 
 -- | Declarations are write-once: a repeated name is a hard error, which is what
 -- rejects the @dup_*@ tests.
 addConst :: Env -> ConstInfo -> Either String Env
 addConst env ci
-  | M.member n (envConsts env) = Left ("duplicate declaration: " ++ showName n)
-  | otherwise = Right env { envConsts = M.insert n ci (envConsts env) }
+  | Just _ <- lookupConst env n = Left ("duplicate declaration: " ++ showName n)
+  | otherwise = Right env
+      { envConsts = IM.insertWith (++) (nameHash n) [ci] (envConsts env) }
   where n = constName ci
 
--- | Eligible for eta and for @Expr.proj@: exactly one constructor, no indices,
--- and not recursive.  (A recursive single-constructor type would make eta
--- expansion diverge.)
+-- | Eligible for @Expr.proj@ and for eta: exactly one constructor and no
+-- indices.
+--
+-- That is the whole content of the eta principle -- an element of such a type
+-- /is/ its constructor applied to its fields -- and it is all a projection
+-- needs.  Whether the type is recursive has nothing to do with it: recursion is
+-- a statement about what the fields may mention, and eta is a statement about
+-- the outermost constructor.
 isStructureLike :: Env -> Name -> Bool
 isStructureLike env n = case lookupConst env n of
   Just (CInd i) -> length (indCtors i) == 1
                 && indNumIndices i == 0
-                && not (indIsRecursive i)
   _ -> False
+
+-- | Structure-like, and safe to eta-expand /during reduction/: also not
+-- recursive.
+--
+-- The extra clause is about termination and nothing else.  Rewriting a stuck
+-- major premise @s@ to @mk s.0 ... s.(n-1)@ lets iota fire; but if a field is
+-- recursive, the rule it fires produces the recursor applied to @s.j@ -- stuck
+-- again, and eta-expanded again, forever.  Conversion's own eta rule (§7.2) has
+-- no such problem, because it only fires against a side that already /is/ a
+-- constructor application and descends into it.
+isEtaReducible :: Env -> Name -> Bool
+isEtaReducible env n = isStructureLike env n && case lookupConst env n of
+  Just (CInd i) -> not (indIsRecursive i)
+  _             -> False
 
 ctorOfStructure :: Env -> Name -> Maybe CtorInfo
 ctorOfStructure env n = case lookupConst env n of
   Just (CInd i) | [c] <- indCtors i
                 , indNumIndices i == 0
-                , not (indIsRecursive i)
                 , Just (CCtor ci) <- lookupConst env c -> Just ci
   _ -> Nothing

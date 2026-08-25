@@ -1,5 +1,8 @@
 # Build output
 dist-newstyle/
+dist-prof/
+dist-late/
+.claude/
 *.hi
 *.o
 

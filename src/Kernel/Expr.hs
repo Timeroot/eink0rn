@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns     #-}
 {-# LANGUAGE MagicHash        #-}
 {-# LANGUAGE PatternSynonyms  #-}
 -- | Core expressions.
@@ -36,7 +37,7 @@ module Kernel.Expr
   , exprHash
   , ptrEq
   -- * Construction
-  , mkApps, unApps, unAppsN
+  , mkApps, unApps, unAppsN, headOf
   , mkPis, mkLams, unPis, unPisN, unLamsN
   , mkArrow
   -- * de Bruijn plumbing
@@ -136,20 +137,96 @@ exprHash e = case e of
 instance Eq Expr where
   a == b = ptrEq a b || (exprHash a == exprHash b && eqE a b)
 
+-- | Equality below the root, for two terms whose hashes already agree.
+--
+-- Same shape as 'instN', and for the same reason. The plain recursion compares a
+-- shared pair of subterms once per /path/ that reaches it, and a term produced
+-- by unfolding a @brecOn@ has exponentially more paths than nodes; two such
+-- terms that really are equal are then the worst case, because nothing
+-- short-circuits. So the plain recursion runs under a visit budget and a
+-- memoised traversal takes over when that runs out. The budget is the detector:
+-- below it there is no sharing worth a table, and a comparison that exceeds it
+-- has nothing else that could be taking the time.
+--
+-- Only equal pairs are remembered, which is all that is needed: a @False@
+-- anywhere propagates through the conjunctions to the root, so no pair is ever
+-- asked about twice after answering @False@.
 eqE :: Expr -> Expr -> Bool
-eqE (XBVar i)             (XBVar j)             = i == j
-eqE (XFVar i)             (XFVar j)             = i == j
-eqE (XSort _ l)           (XSort _ m)           = l == m
-eqE (XConst _ n ls)       (XConst _ m ms)       = n == m && ls == ms
-eqE (XApp _ _ f a)        (XApp _ _ g b)        = f == g && a == b
-eqE (XLam _ _ n t b)      (XLam _ _ n' t' b')   = n == n' && t == t' && b == b'
-eqE (XPi  _ _ n t b)      (XPi  _ _ n' t' b')   = n == n' && t == t' && b == b'
-eqE (XLet _ _ n t v b)    (XLet _ _ n' t' v' b') =
-  n == n' && t == t' && v == v' && b == b'
-eqE (XProj _ _ s i b)     (XProj _ _ s' i' b')  = i == i' && s == s' && b == b'
-eqE (XNatLit _ x)         (XNatLit _ y)         = x == y
-eqE (XStrLit _ x)         (XStrLit _ y)         = x == y
-eqE _                     _                     = False
+eqE a0 b0 = case plain eqBudget a0 b0 of
+    (r, k) | k >= 0 -> r
+    _               -> runST (newSTRef IM.empty >>= \ref -> go ref a0 b0)
+  where
+    plain :: Int -> Expr -> Expr -> (Bool, Int)
+    plain !k x y
+      | k < 0                    = (False, k)
+      | ptrEq x y                = (True, k)
+      | exprHash x /= exprHash y = (False, k)
+      | otherwise = case (x, y) of
+          (XApp _ _ f a, XApp _ _ g b) -> two (k - 1) f g a b
+          (XLam _ _ n t b, XLam _ _ n' t' b')
+            | n == n'   -> two (k - 1) t t' b b'
+          (XPi _ _ n t b, XPi _ _ n' t' b')
+            | n == n'   -> two (k - 1) t t' b b'
+          (XLet _ _ n t v b, XLet _ _ n' t' v' b')
+            | n == n'   -> case two (k - 1) t t' v v' of
+                (True, k1) -> plain k1 b b'
+                r          -> r
+          (XProj _ _ s i b, XProj _ _ s' i' b')
+            | i == i', s == s' -> plain (k - 1) b b'
+          _ -> (eqLeaf x y, k - 1)
+
+    two !k f g a b = case plain k f g of
+      (True, k1) -> plain k1 a b
+      r          -> r
+
+    go :: STRef s (IntMap [(Expr, Expr)]) -> Expr -> Expr -> ST s Bool
+    go ref x y
+      | ptrEq x y                = pure True
+      | exprHash x /= exprHash y = pure False
+      | otherwise = do
+          m <- readSTRef ref
+          if seen (IM.findWithDefault [] (exprHash x) m) then pure True else do
+            r <- kids ref x y
+            if not r then pure False else do
+              modifySTRef' ref (IM.insertWith (++) (exprHash x) [(x, y)])
+              pure True
+      where
+        seen ((p, q) : rest) = (ptrEq p x && ptrEq q y) || seen rest
+        seen []              = False
+
+    kids ref x y = case (x, y) of
+      (XApp _ _ f a, XApp _ _ g b) -> andM (go ref f g) (go ref a b)
+      (XLam _ _ n t b, XLam _ _ n' t' b')
+        | n == n' -> andM (go ref t t') (go ref b b')
+      (XPi _ _ n t b, XPi _ _ n' t' b')
+        | n == n' -> andM (go ref t t') (go ref b b')
+      (XLet _ _ n t v b, XLet _ _ n' t' v' b')
+        | n == n' -> andM (go ref t t') (andM (go ref v v') (go ref b b'))
+      (XProj _ _ s i b, XProj _ _ s' i' b')
+        | i == i', s == s' -> go ref b b'
+      _ -> pure (eqLeaf x y)
+
+    andM p q = p >>= \r -> if r then q else pure False
+
+-- | The cases with no subterms to recur into.  Reached from 'eqE' only, where
+-- the two hashes are known to agree.
+eqLeaf :: Expr -> Expr -> Bool
+eqLeaf (XBVar i)     (XBVar j)     = i == j
+eqLeaf (XFVar i)     (XFVar j)     = i == j
+eqLeaf (XSort _ l)   (XSort _ m)   = l == m
+eqLeaf (XConst _ n ls) (XConst _ m ms) = n == m && ls == ms
+eqLeaf (XNatLit _ x) (XNatLit _ y) = x == y
+eqLeaf (XStrLit _ x) (XStrLit _ y) = x == y
+eqLeaf _             _             = False
+
+-- | How many pairs of nodes 'eqE' may compare before it is worth a memo table.
+--
+-- Larger than 'instBudget' because equality, unlike substitution, is asked about
+-- whole declared types and stored bodies as often as it is asked about the small
+-- open terms conversion produces, and because the work thrown away on a miss is
+-- a walk that allocates nothing.
+eqBudget :: Int
+eqBudget = 1024
 
 -- | Some total order agreeing with '=='.  Not alphabetical, not structural:
 -- hash first, which is fine because nothing reads an ordering on terms for
@@ -270,6 +347,15 @@ unApps = go []
   where go acc (App f a) = go (a : acc) f
         go acc e         = (e, acc)
 
+-- | The head of a spine, without building the list of arguments.
+--
+-- @fst . unApps@ says the same thing and allocates a cons cell per argument to
+-- do it.  Several of the hottest questions the checker asks -- is this head a
+-- definition, what is the conclusion of this telescope -- want only the head.
+headOf :: Expr -> Expr
+headOf (App f _) = headOf f
+headOf e         = e
+
 -- | Like 'unApps' but keeps at most @n@ arguments, leaving the rest applied to
 -- the head.  Used when a spine is longer than a reduction rule expects.
 unAppsN :: Int -> Expr -> (Expr, [Expr])
@@ -319,7 +405,16 @@ mkArrow a b = Pi (Binder anon) a (liftE 0 1 b)
 -- Nodes are matched by 'ptrEq' rather than '=='.  Structural equality is what
 -- we are trying not to pay for; a miss on a structurally-equal-but-distinct
 -- node only costs the recomputation we would have done anyway.
-type Memo s a = STRef s (IntMap [(Expr, Int, a)])
+-- | One slot per hash: a collision evicts rather than chains.
+--
+-- These tables are built and thrown away once per traversal, and every entry in
+-- them costs an insertion into the map.  Chaining would make a lookup complete
+-- -- it would find an entry whenever one exists -- but a memo does not have to
+-- be complete to be correct, only to be right when it answers.  Since a miss
+-- costs a recomputation and a hash collision between two nodes reached in the
+-- same traversal is rare, one slot per hash is the better trade, and it is the
+-- allocation of the chain that it saves.
+type Memo s a = STRef s (IntMap (Expr, Int, a))
 
 newMemo :: ST s (Memo s a)
 newMemo = newSTRef IM.empty
@@ -328,16 +423,25 @@ memoAt :: Memo s a -> Int -> Expr -> ST s a -> ST s a
 memoAt ref d ex mk = do
   m <- readSTRef ref
   let key = hashMix (exprHash ex) d
-  case hit (IM.findWithDefault [] key m) of
-    Just r  -> pure r
-    Nothing -> do
+  case IM.lookup key m of
+    Just (k, d', r) | d == d', ptrEq k ex -> pure r
+    _ -> do
       r <- mk
-      modifySTRef' ref (IM.insertWith (++) key [(ex, d, r)])
+      modifySTRef' ref (IM.insert key (ex, d, r))
       pure r
-  where
-    hit ((k, d', r) : rest) | d == d', ptrEq k ex = Just r
-                            | otherwise           = hit rest
-    hit []                                        = Nothing
+
+-- | How many nodes a level substitution may visit before it is worth a memo
+-- table.  Larger than 'instBudget' because the terms are declared types and
+-- stored bodies rather than the small open terms beta reduction rewrites.
+levelBudget :: Int
+levelBudget = 512
+
+-- | How many nodes a substitution may visit before it is worth a memo table.
+--
+-- Small enough that the work thrown away on a miss is a rounding error, large
+-- enough that a table is only built when there is real sharing to exploit.
+instBudget :: Int
+instBudget = 64
 
 -- de Bruijn plumbing ----------------------------------------------------------
 
@@ -366,13 +470,51 @@ liftE d0 k e0
 
 -- | @instN vs e@ substitutes @vs !! i@ for @BVar i@ (for @i < length vs@) and
 -- lowers the remaining indices by @length vs@.
+--
+-- Every beta step goes through here, and the great majority of them rewrite a
+-- handful of nodes: one bound variable inside the two or three that mention it.
+-- Setting up a memo table for that costs more than the substitution.  So the
+-- plain recursion is tried first under a visit budget, and the memoised
+-- traversal is kept in reserve for the terms that need it -- the ones whose
+-- sharing would make the plain recursion exponential, which is exactly what
+-- running out of budget detects.  Both compute the same term; only the sharing
+-- of the result differs, and below 'instBudget' nodes there is nothing to share.
 instN :: [Expr] -> Expr -> Expr
 instN [] e = e
 instN vs e0
   | looseBVarRange e0 == 0 = e0
+  | (r, k) <- plain instBudget 0 e0, k >= 0 = r
   | otherwise = runST (newMemo >>= \ref -> go ref 0 e0)
   where
     n = length vs
+
+    -- Returns the rewritten node and what is left of the budget; a negative
+    -- budget means the answer is unfinished and must be thrown away.
+    plain !k !d ex
+      | k < 0                  = (ex, k)
+      | looseBVarRange ex <= d = (ex, k)
+      | otherwise = case ex of
+          BVar i
+            | i < d + n   -> (liftE 0 d (vs !! (i - d)), k')
+            | otherwise   -> (BVar (i - n), k')
+          App f a       -> let (f', k1) = plain k' d f
+                               (a', k2) = plain k1 d a
+                           in (App f' a', k2)
+          Lam nm t b    -> let (t', k1) = plain k' d t
+                               (b', k2) = plain k1 (d + 1) b
+                           in (Lam nm t' b', k2)
+          Pi  nm t b    -> let (t', k1) = plain k' d t
+                               (b', k2) = plain k1 (d + 1) b
+                           in (Pi nm t' b', k2)
+          Let nm t v b  -> let (t', k1) = plain k' d t
+                               (v', k2) = plain k1 d v
+                               (b', k3) = plain k2 (d + 1) b
+                           in (Let nm t' v' b', k3)
+          Proj s i b    -> let (b', k1) = plain k' d b
+                           in (Proj s i b', k1)
+          _             -> (ex, k')
+      where k' = k - 1
+
     go ref d ex
       -- Nothing at or above @d@ occurs, so there is neither anything to
       -- substitute nor anything to lower.
@@ -440,10 +582,7 @@ occursConst n e0 = runST (newMemo >>= \ref -> go ref e0)
 --
 -- @Proj@ carries the structure's name as well as its subterm, and that name is
 -- included: it is a reference to a declaration exactly as a 'Const' node is,
--- and a caller asking \"what does this term depend on?\" needs it.  (The only
--- other caller, 'Kernel.Env.computeHeight', is unaffected either way -- a
--- projection's structure is an inductive type, never a definition with a
--- height.)
+-- and a caller asking \"what does this term depend on?\" needs it.
 constsOf :: Expr -> S.Set Name
 constsOf e0 = runST (newMemo >>= \ref -> go ref e0)
   where
@@ -482,9 +621,41 @@ anyM f (x : xs) = f x >>= \b -> if b then pure True else anyM f xs
 -- rebuilding the path to its @Sort@s and @Const@s.
 instLevelsE :: [Name] -> [Level] -> Expr -> Expr
 instLevelsE [] _ e = e
-instLevelsE ps vs e0 = runST (newMemo >>= \ref -> go ref e0)
+instLevelsE ps vs e0
+  | (r, k) <- plain levelBudget e0, k >= 0 = r
+  | otherwise = runST (newMemo >>= \ref -> go ref e0)
   where
     sub = instLevelParams ps vs
+
+    -- As in 'instN': the plain recursion first, under a budget, because almost
+    -- every body this is asked about is a declared type of a few dozen nodes
+    -- and building a memo table for it costs more than the walk.  A negative
+    -- budget means the answer is unfinished and is thrown away.
+    plain !k ex
+      | k < 0     = (ex, k)
+      | otherwise = case ex of
+          Sort l        -> (let l' = sub l in if l' == l then ex else Sort l', k')
+          Const _ []    -> (ex, k')
+          Const n ls    -> (let ls' = map sub ls
+                            in if ls' == ls then ex else Const n ls', k')
+          App f a       -> let (f', k1) = plain k' f
+                               (a', k2) = plain k1 a
+                           in (if ptrEq f f' && ptrEq a a' then ex else App f' a', k2)
+          Lam n t b     -> let (t', k1) = plain k' t
+                               (b', k2) = plain k1 b
+                           in (if ptrEq t t' && ptrEq b b' then ex else Lam n t' b', k2)
+          Pi  n t b     -> let (t', k1) = plain k' t
+                               (b', k2) = plain k1 b
+                           in (if ptrEq t t' && ptrEq b b' then ex else Pi n t' b', k2)
+          Let n t v b   -> let (t', k1) = plain k' t
+                               (v', k2) = plain k1 v
+                               (b', k3) = plain k2 b
+                           in (if ptrEq t t' && ptrEq v v' && ptrEq b b'
+                                 then ex else Let n t' v' b', k3)
+          Proj s i b    -> let (b', k1) = plain k' b
+                           in (if ptrEq b b' then ex else Proj s i b', k1)
+          _             -> (ex, k')
+      where k' = k - 1
 
     go ref ex = case ex of
       Sort l        -> pure (let l' = sub l in if l' == l then ex else Sort l')

@@ -158,6 +158,7 @@ admit cb = do
                   , indCtors       = map csName shs
                   , indIsRecursive = any (any (isRecField . cfRec) . csFields) shs
                   , indLargeElim   = largeElim
+                  , indK           = kLike
                   }
         | (m, idxTele, shs) <- zip3 ms idxTeles shapess ]
       ctorInfoss =

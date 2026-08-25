@@ -34,9 +34,9 @@ design; the whole point is that the core has fewer cases to get wrong.
 | --- | --- | --- |
 | binder annotations (`implicit`, `strictImplicit`, `instImplicit`) | erased | elaboration hints; no logical content |
 | `mdata` | erased | ditto |
-| `thm` | becomes a definition, after checking the statement is in `Prop` | the core has no theorems; the `Prop` requirement is the only thing lost, so it is checked here |
+| `thm` | statement checked to be in `Prop`, proof checked, then **sealed as an axiom** where §12.10 says nothing can ever look inside it | the core has no theorems; the `Prop` requirement is the only thing lost, so it is checked here |
 | `opaque` | checked like a definition, then admitted as an **axiom** | it must not delta-unfold; an axiom is exactly a constant that does not |
-| reducibility hints | erased | scheduling advice for the elaborator; the kernel unfolds by its own rules |
+| reducibility hints | **kept**, as the delta-unfolding order of §7 step 6 (§12.11) | scheduling advice, and advice is all it can be: no ordering changes which terms are convertible |
 | safety flags (`isUnsafe`, `safety`) | **kept**: they select a quarantined fragment (§12.7) | an unsafe declaration skipped the termination check, so its type is not a claim the kernel can use |
 | nested inductives | compiled to mutual blocks (§9) | the core's positivity judgement has no rule for nesting |
 | exported recursors | **re-derived and required to match** (§8.7) | see below |
@@ -56,12 +56,15 @@ an extra eliminator cannot be parked alongside the justified ones.
 
 **Options.** Two flags move the verdict, and both default to the strictest
 setting that does not reject a faithful export. Everything else in this document
-describes the default configuration.
+describes the default configuration. `--keep-proofs` and `--progress` cannot
+change a verdict at all.
 
 | flag | default | effect |
 | --- | --- | --- |
 | `--nat-accel=off\|canonical\|verified\|always` | `canonical` | how much evidence the arithmetic shortcuts of §6.5 demand before firing. `always` is unsound and exists only to reproduce other kernels' behaviour. |
 | `--pin-std=off\|warn\|error` | `off` | audit the standard constants against their stored forms (§12.5). Never affects soundness; `error` can reject files that are perfectly consistent. |
+| `--keep-proofs` | off | retain every proof term instead of sealing it (§12.10). A pure performance switch: the sealed and unsealed kernels accept exactly the same files. |
+| `--progress[=SECS]` | off | report on stderr as the file is checked, naming each declaration that took at least `SECS` seconds. |
 
 ---
 
@@ -180,10 +183,10 @@ Declarations are **write-once**: re-declaring a name is a hard error. Every
 constant's type is checked to be a well-formed type (`inferSortOf`) before it is
 admitted, and every definition's value is checked against its type.
 
-Definitions carry a *height* (`1 + max` of the heights of the definitions their
-value mentions). This is computed from the environment, never read from the
-input, and is used only to decide which of two constants to unfold first. It
-cannot affect what is convertible — only how fast the kernel notices.
+Definitions carry an unfolding *priority*, read from the export's `hints` field
+(§12.11) and used only to decide which of two constants to unfold first. It
+cannot affect what is convertible — only how fast the kernel notices — which is
+why it is the one field the kernel takes from the file without checking it.
 
 ---
 
@@ -263,8 +266,16 @@ device, and the kernel treats it as one everywhere.
    Γ ⊢ s.[T, i] : Fᵢ'
 ```
 
-"Structure-like" means: exactly one constructor, no indices, and not recursive.
-(The last clause is what stops eta expansion from diverging; see §7.4.)
+"Structure-like" means: exactly one constructor and no indices. That is the whole
+content of the eta principle — an element of such a type *is* its constructor
+applied to its fields — and it is all a projection needs. Whether the type is
+recursive is beside the point here: recursion constrains what the *fields* may
+mention, and this rule is about the *outermost* constructor. Lean's own libraries
+project out of recursive structures (`Lean.Meta.Grind.AC.DiseqCnstr.lhs`, whose
+type is one half of a mutual block), and there is nothing wrong with it.
+
+One consumer does need the extra clause, and it is a reduction rule rather than a
+typing rule: §6.3's eta expansion of a *stuck major premise*. See there.
 
 **The side condition.** If `T p̄` is a proposition then all of its inhabitants are
 convertible by proof irrelevance, so `(mk true).[T,0]` and `(mk false).[T,0]`
@@ -311,7 +322,15 @@ happens to be in head position.
 
 `whnf` alternates `whnfCore` with **delta**: unfold the head constant when it is a
 definition whose universe arity matches. Definitions declared `opaque` are
-axioms and never unfold.
+axioms and never unfold, and neither do proofs sealed under §12.10.
+
+Unfolding substitutes the occurrence's universe arguments into the stored body
+and applies it to the arguments the head had — and applies it by *contracting*
+the beta redex, all binders at once, rather than handing `whnfCore` a body under
+a spine for it to contract a binder at a time. The term is the same either way.
+What differs is the number of reduction steps it took to get there, and the
+budget of §7.4 is spent per step, so the difference decides how much of a
+comparison is done before the budget runs out and a speculation gives up.
 
 ### 6.3 Iota for recursors
 
@@ -349,6 +368,15 @@ reduce at `Eq a b` for non-convertible `a` and `b`.
 **Structure eta on the major premise.** For a structure-like `T`, every element is
 convertible to `T.mk s.[T,0] … s.[T,n-1]`, so a neutral major premise of structure
 type still reduces.
+
+This rule, alone among the ones that appeal to §5.3's structure-likeness, also
+requires `T` to be **not recursive**, and the reason is termination rather than
+soundness. Rewriting a stuck `s` to `T.mk s.[T,0] … ` lets iota fire; but if a
+field is recursive then the rule it fires produces the recursor applied to
+`s.[T,j]`, which is stuck again, and gets eta-expanded again, forever. The rule
+would be sound; it would simply never stop. §7.2's eta is not exposed to this,
+because it only fires against a side that already *is* a constructor application,
+and descends into that side.
 
 ### 6.4 Iota for `Quot`
 
@@ -562,6 +590,46 @@ This is sound for the same reason the expansion in §6.3 is: it is used only
 where §12.1's `Nat` shape check has passed, which is what makes `Nat.succ ⌜k⌝`
 and `⌜k+1⌝` the same term as far as conversion is concerned.
 
+The walk up the `succ`s is bounded, at 256. A tower a file writes by hand is one
+or two deep, and a tower it can only have arrived at by counting is one the reader
+should not be counting back down. Giving up returns the term unread, which costs
+at most the shortcut on that term.
+
+**The held numeral.** `Nat.add`, `Nat.sub`, `Nat.mul` and `Nat.pow` are all
+exported as structural recursions on their *second* argument, and this is the one
+place where the shape of the export leaks into what the kernel is willing to do.
+Unfolding one of them counts that argument down. With both arguments numerals
+that never happens, because the rule above fires first and answers in one step.
+With the first argument open it happens in full: `x + ⌜k⌝` sets a `brecOn` going
+that builds `k` levels of `Nat.below` before it can say anything, and what it
+eventually says is that there is nothing to say — `x + ⌜k⌝` has no head
+constructor to find. This is not hypothetical. A signed bit width appears in the
+prelude as an offset of `2³¹` or `2⁶³` against an open term, and two billion steps
+to learn that a term is stuck is the same thing as not terminating.
+
+So a licensed operation from that list, applied to a numeral larger than 4096 in
+the argument it recurses on, is **held**: `whnf` leaves the application alone
+rather than delta-unfolding it. The two sides of a conversion are then compared
+argument by argument, which is what they were always going to have to be compared
+by.
+
+Held is a property of the *application*, not of the constant, and everything that
+asks "may delta take a step here" has to ask it of the application. A conversion
+that asked only about the head would be told that a definition was there for the
+unfolding, be handed the term back unchanged when it asked for the unfolding, and
+ask again — for ever, on a budget that never moves because nothing reduces. So a
+held application answers "no" to that question, exactly as a local constant or an
+axiom does, and §7 reads it as rigid throughout.
+
+Nothing about the theory changes. Declining to unfold removes reduction sequences
+and so can only remove conversions, never add them; every judgement the kernel
+still makes it made before. What the bound is a statement about is effort, and it
+is placed where the trade is one-sided: below it, nothing is different, and above
+it the only conversions lost are between a numeral offset and a `succ` tower
+written out in full, which at that size nothing can write. Only a *licensed*
+operation is held — without a licence the kernel has no reason to believe the name
+recurses the way the equations say, and unfolds it like anything else.
+
 ---
 
 ## 7. Definitional equality
@@ -579,15 +647,32 @@ and `⌜k+1⌝` the same term as far as conversion is concerned.
    *Definitive*.
 4. **Rigid spine congruence** — when the head is *not* a delta-unfoldable
    definition (a local, an axiom, a constructor, an inductive type, a stuck
-   recursor, a stuck projection), compare heads and arguments pairwise.
+   recursor, a stuck projection, or an arithmetic application the kernel has
+   declined to unfold, §6.5), compare heads and arguments pairwise.
    *Positive only*: failure falls through.
 5. **Proof irrelevance** — if `t`'s type is a proposition and `s`'s type is
-   definitionally equal to it, `t ≡ s`.
-6. **Lazy delta** — unfold the side whose head definition has the greater height;
-   when heights are equal and both heads are the same constant, first try
-   argument-wise congruence, and only unfold both if that fails.
+   definitionally equal to it, `t ≡ s`. Preceded by the syntactic test of §7.5,
+   which settles most pairs without inferring anything.
+6. **Lazy delta** — unfold the side whose head definition has the greater
+   unfolding priority (§12.11); when priorities are equal and both heads are the
+   same constant, first try argument-wise congruence, and only unfold both if
+   that fails.
 7. When nothing can be unfolded, the **last resort** rules: projection
    congruence, structure eta, and unit-like eta.
+
+A round of step 6 that unfolds nothing is a round that ends the loop. This
+sounds like a restatement of step 7 and is in fact the only thing keeping the
+loop finite, because "the head is a definition" and "the definition will unfold"
+are two different questions: an arithmetic application over a large numeral has
+a definition for a head and is nevertheless held (§6.5). A round that answered
+"unfolded, carry on" while handing back the terms it was given would have the
+loop ask the identical question forever, on a budget that is never spent because
+nothing is reducing. So step 6 reports what it did rather than what it intended,
+a side that declines falls through to the other side, and only a round in which
+neither side moved stops. The rigid reading of a held application in step 4 is
+the other half of the same correction: a comparison that delta will not be
+allowed to advance should get the congruence rule that a rigid pair gets, and
+get it on the full budget rather than the speculative one.
 
 ### 7.1 Why this order
 
@@ -599,7 +684,7 @@ is what proof irrelevance would otherwise do.
 
 For a head that *is* a definition the same congruence *is* speculative, since the
 two sides may only agree after unfolding, so it is left to step 6 where it can be
-weighed against the heights.
+weighed against the priorities.
 
 ### 7.2 Structure eta and unit-like eta
 
@@ -607,6 +692,11 @@ weighed against the heights.
   other has that type, compare each `fᵢ` with `other.[T, i]`.
 - **Unit-like eta**: a structure with *no* fields has exactly one element up to
   conversion, so any two terms of that type are equal.
+
+Both terminate on a recursive structure as well as on a flat one, unlike §6.3's
+eta on a major premise. The rule only fires when one side is already a
+constructor application, and it recurses into the fields *of that side*, which is
+a finite term that gets strictly smaller.
 
 ### 7.3 The one-sided invariant
 
@@ -627,9 +717,37 @@ unfolding the head is about to discard, and normalising them can cost arbitraril
 more than the comparison the caller actually wants.
 
 So a speculative comparison runs under a step budget (`tcFuel`), drawn from a
-per-declaration allowance for *wasted* work (`tcWaste`, 20000 steps). When the
-budget runs out, reduction stops where it stands and the comparison answers
-`False`.
+running allowance for *wasted* work (`tcWaste`). When the budget runs out,
+reduction stops where it stands and the comparison answers `False`.
+
+A *step* is a **reduction** step — a beta, zeta, iota or projection rewrite, or a
+delta unfolding — and nothing else. In particular the *descent* is free:
+congruence walks into arguments without reducing anything, and none of that is
+charged.
+
+That asymmetry is deliberate and was measured. Charging a step per comparison
+does bound the speculative subtree, and it bounds the wrong one: deep spines of
+equal heads are exactly what congruence exists for, and a speculation that runs
+out of budget part-way down one sends the loop off to unfold both heads instead —
+the expensive thing the rule was there to avoid. On Mathlib's category theory
+that is the difference between a file that checks in four minutes and one that
+does not finish. The principle behind the asymmetry is that what a descent costs
+is bounded by the terms in front of it, and shared subterms are compared once
+because the answer is remembered (§11.4), whereas what a reduction costs is
+bounded by nothing at all — one `Nat` numeral can ask for two billion steps.
+
+The allowance is **credited**, not fixed. A declaration opens with 50000 steps
+and earns one more for every eight reduction steps the checker performs outside a
+speculation, to a ceiling of the same 50000. A fixed per-declaration allowance is
+the wrong shape for this: it is generous on a one-line lemma and is gone in the
+first instant of a machine-generated arithmetic certificate, and what happens when
+it runs out is not that the checker goes a little slower — it stops speculating at
+all, and every congruence that would have closed in a hundred steps is replaced by
+unfolding both heads. The cap meant to stop a proof running away is then exactly
+what makes it run away. Crediting says the affordable thing instead: dead ends may
+consume a bounded fraction of the reduction the checker was going to do anyway,
+whatever the size of the declaration, and the opening balance doubles as the most
+that may be spent on any one speculation.
 
 This is sound because **every rule that answers `True` is sound no matter how much
 reduction preceded it**. A starved comparison can therefore only ever answer
@@ -650,10 +768,63 @@ Two consequences are handled explicitly:
 - `DStarved` is returned when the budget ran out before *anything* could be
   unfolded. It is not a statement about the terms — it says the round made no
   progress, so the loop must stop rather than ask the same question forever.
+- An **error** raised inside a speculation is caught and read as `False`, and the
+  state is rolled back. With the budget gone, reduction has stopped where it
+  stands, so a type read off what it left behind can be anything at all —
+  `(fun x => A → B) c` is not a function type until someone can afford the beta
+  step — and a rule that reads types off terms must be able to answer "no
+  opinion" rather than "this file is wrong". Nothing is hidden by this: every
+  term a speculation compares is a subterm of something the declaration's own
+  *unmetered* inference visits, and by §7.3 a `False` can only ever decline. A
+  real error is therefore reported by the pass whose job it is, not by a
+  shortcut that ran out of money.
 
 The budget is therefore a completeness knob with no soundness content. Raising it
 can only turn rejections into acceptances of things that were already provable;
 lowering it can only turn acceptances into rejections.
+
+### 7.5 Deciding "not a proof" without inferring a type
+
+Step 5 is asked about nearly every pair the loop reaches, and it answers *no*
+almost every time, because what is usually being compared is two values rather
+than two proofs. Answering it the direct way costs two inferences and all the
+reduction they set off, so the kernel first tries to rule the term out on sight.
+
+A term `t` is a proof exactly when the type of its type is `Prop`. Write `u` for
+the universe of `t`'s type — the level with `T(t) : Sort u`. Then `t` is a proof
+iff `u ≈ 0`, so any argument that `u` is *definitely nonzero* rules step 5 out.
+
+For a term whose head is a constant `c` declared `∀ x₁ .. xₙ, B`, that argument
+can be made from declared types alone:
+
+- if `B` is `Sort v`, then `u = v+1`, which is never zero;
+- if `B` is a constant `d` applied to arguments and `d` is declared
+  `∀ ȳ, Sort w`, then `u = w` with `c`'s level arguments substituted;
+- if `B` is a *bound* variable `xⱼ` applied to arguments and `xⱼ` is declared
+  `∀ z̄, Sort w`, then `u = w`.
+
+The last case is what matters in practice: it is the shape of every eliminator
+and every match auxiliary, whose result is a motive applied to its major
+premise, and the motive's universe is written down in its own binder. The
+middle case covers everything that computes — `Nat.mul a b`, `List.cons x xs` —
+whose result is an inductive type whose universe is written down in *its*
+declaration. A definition standing in the way is unfolded, because the class
+hierarchy declares its output parameters `outParam (Type u)` rather than
+`Type u`, and an argument whose type is a type is exactly what has to be
+recognised. The answer is read off `c`'s declaration once and cached under `c`'s
+name; the occurrence's own level arguments are substituted at each use.
+
+The number of arguments does not enter into it, which is worth spelling out
+because it looks like it should. Applying `c` to *fewer* than `n` arguments
+gives a type `∀ rest, B`, whose universe is `imax _ u`; applying it to *more*
+requires `B` to be a function type `∀ x:A, C`, whose universe `u` is
+`imax (univ A) (univ C)`. An `imax` is zero exactly when its right argument is,
+so in both directions "definitely nonzero" is preserved, and a single level per
+constant answers for every arity.
+
+Everything here is one-sided in the sense of §7.3: a *yes* ("not a proof") must
+be right, and it is, being a chain of declared types and the `imax` rule; a *no*
+costs only the slow route, which is the rule as stated.
 
 ---
 
@@ -1015,14 +1186,41 @@ than on its tree unfolding:
 Both are maintained by pattern synonyms, so nothing outside `Kernel.Expr` can set
 a cache to a lie.
 
+Each traversal also builds a memo table on the nodes it visits, so that a shared
+node is rewritten once rather than once per path to it, and so that the *result*
+is a graph too. Substitution and universe instantiation are the exception, and
+only in how they start: almost every beta step rewrites a handful of nodes, and
+almost every universe instantiation is asked about a declared type of a few dozen,
+and setting up a table for either costs more than the walk. So the plain recursion
+is tried first under a visit budget and the memoised traversal is kept for the
+terms that exceed it. Exceeding the budget is exactly the symptom of the sharing
+that makes a table worth having. The two compute the same term; they differ only
+in how much of the *result* is shared, and below the budget there is nothing to
+share.
+
 ### 11.4 Memoisation keys
 
-Inference and `whnf` are memoised on `(node, local environment)`, keyed by hash and
-matched by **pointer equality**, never by structural equality: asking whether two
-same-hash nodes are structurally equal can cost exponentially more than
-recomputing the answer. A lookup therefore finds an entry only when it is
-literally the same node — which is exactly the case that matters, since what makes
-a shared subterm expensive is being visited once per path to it.
+Inference and `whnf` are memoised on `(term, local environment)`, keyed by hash and
+matched by **structural equality**.
+
+Matching by pointer alone is the tempting rule — the tables are asked millions of
+questions on a hard declaration and a pointer test is one instruction — and it is
+wrong, because it misses the repetition that actually happens. Reduction
+*rebuilds*: a beta step substitutes into a body and hands back fresh nodes, so
+the same subterm arrives at the table again and again as a different pointer with
+the same shape. A pointer-matched table answers none of those, and on a
+machine-generated proof that is the difference between having a memo and not
+having one. It is what made one `Char` lemma in `init.ndjson` ask the same seven
+pairs of stuck terms about a million times each, and never finish.
+
+Structural equality is affordable because it is not the naive one. A bucket is
+reached by hash, so the two candidates already agree on their hashes before
+anything is walked; the comparison then tries pointer equality, and only then
+walks — under the graph-aware `eqE` of §11.3, a plain recursion under a visit
+budget with a memoised traversal taking over when the budget runs out. So
+comparing two shared terms costs their graphs and not their tree unfoldings, and
+the walk that a pointer test was avoiding is bounded by the same reasoning that
+bounds every other traversal in the kernel.
 
 The environment half of the key is just the innermost local, which identifies the
 whole list: fresh locals are handed out from a counter that only ever grows and
@@ -1035,15 +1233,43 @@ universe parameters change, since both the inferred type and what a constant
 unfolds to depend on them. Buckets are capped so a hash collision cannot turn the
 table into a leak. Missing a hit only wastes time.
 
-The `whnf` memo has one extra condition: an entry is recorded only when the
-reduction ran *outside* a speculation (§7.4). A starved reduction stops where it
+The tables are *mutable* — an array of buckets indexed by the low bits of the
+key, doubling when it fills. A balanced tree of ten million entries answers a
+lookup in some two dozen dependent pointer chases, essentially all of them cache
+misses, and pays for an insertion by copying the path it came down; a hard
+declaration asks and answers millions of these questions. Nothing else about the
+tables changes: the same keys, the same test, the same cap on how long a
+bucket may get. The mutation does not escape: the tables are made, used and
+dropped inside one call, so checking the same declaration twice against the same
+environment gives the same answer, and the checker's interface stays pure.
+
+One more table is kept, on a different key. Delta and iota both work by taking a
+body out of the environment and replacing that declaration's universe parameters
+with the ones written at the occurrence, and a proof that unfolds the same
+polymorphic constant ten thousand times asks for the same instantiation ten
+thousand times. Those are memoised on `(stored body, universe arguments)` — the
+body by pointer, since it comes from the environment and is stable for as long as
+the table lives, and the arguments properly, being short. Unlike the three above,
+this one survives the environment changing, because what it records is a fact
+about a body and some levels and not about an environment.
+
+The `whnf` memo has one extra condition. A starved reduction stops where it
 stands and returns a term that is correct to **use** — a speculation reads a
 failure to reduce as "not this way", never as "not equal" — but not correct to
 **remember**, since a later caller with a real budget would be handed the
 half-reduced term as if it were the normal form and could fail a comparison that
-holds. Outside a speculation the fuel is unmetered and stays so for the whole
-call — `spend` leaves it alone and `speculate` puts it back — so testing it once
-on entry is enough.
+holds.
+
+The condition is not "the reduction ran outside a speculation", which is the
+obvious rule and much too coarse: inside a speculation is exactly where the same
+dictionary is normalised for the twentieth time, so a memo that switches itself
+off there switches itself off when it is worth the most. What matters is not
+whether there *was* a budget but whether the budget was ever *reached*. So the
+checker keeps a count of how many times reduction has stopped for want of fuel —
+a number that only ever goes up within a declaration — and `whnf` reads it before
+and after. If it did not move, nothing anywhere inside that call gave up early,
+and what came back is the normal form however small the budget was. That is the
+common case, and it is recorded. If it moved, the result is used and forgotten.
 
 That leaves the waste allowance, which a nested speculation *can* exhaust, and
 which therefore also affects how far an unmetered reduction gets. It needs no
@@ -1054,10 +1280,85 @@ and no later caller is handed a result computed with less than it had itself.
 that is *more* reduced than a caller could have managed is still reached by
 reduction steps, so it is a correct answer, just a better one.)
 
+Conversion is memoised too, on **pairs** of terms, matched the same way and
+symmetrically: the key mixes the two hashes in an order that does not depend on
+which side is which, and a hit is accepted either way round, because §7's relation
+is symmetric and half the questions asked of it are the other half asked
+backwards. Only pairs whose sides are both applications or projections are filed,
+since anything else is settled by one equality test or by one look at a head.
+
+This table is the one place where a *negative* answer is remembered, so it is
+worth saying why that cannot cost soundness. Every `true` in it was produced by
+the rules of §7 and stays true however much or little reduction preceded it, so
+replaying one replays a derivation. A `false` can only ever *decline*: it makes
+some check fail, and a check that fails rejects the file. So the table can cost
+completeness and cannot cost acceptance of an unsound file — and to keep the
+completeness cost at nothing that matters, the two answers are filed on different
+terms. A `true` is recorded unconditionally: it was derived, and a derivation does
+not stop being one because the derivation was cheap. A `false` is recorded only
+when the comparison that produced it ran **outside every speculation**, since a
+`false` reached by giving up says "not this way" and not "not equal". Entries are
+*read* under any budget: a remembered answer is at least as good as what the
+caller would have worked out for itself.
+
+The starvation count of the previous paragraph is the wrong ticket here, and the
+difference is worth spelling out, because using it looks safer and is in fact
+ruinous. A speculation nested somewhere inside an unmetered comparison moves that
+count whenever it declines — and by §7.4 it declines *often*, since the allowance
+is meant to run dry on a hard declaration. Reading the count across the whole
+comparison therefore reports "someone, somewhere in here, gave up", which on a
+hard declaration is always, and the negative half of the table switches itself off
+for exactly the declarations it exists for.
+
+The count means something for `whnf` and nothing here, and the reason is what the
+two calls leave behind. A starved reduction leaves a half-reduced *term*, and a
+caller handed it cannot tell; that is a real hazard and the count is the right
+guard for it. A declined speculation leaves only a `false`, and its caller reads
+that `false` as "unfold and ask again" — which it then does, and unfolding
+preserves conversion, so the answer the unmetered call finally reaches is the
+answer congruence would have given it, only later. What the enclosing comparison
+concluded is therefore its own conclusion and not a truncation of one.
+
+One exposure survives, and is stated rather than hidden. K-like reduction (§6.3)
+consults conversion to decide whether the major premise may be rebuilt, and a
+speculation that declines inside *that* comparison does change a reduct: `whnf`
+returns the eliminator unreduced. `whnf` will not remember that term, but an
+unmetered conversion that fails because of it will remember its `false`. This is
+the same completeness gap §7.4 already accepts — a starved speculation costs an
+unfolding — with the retry removed, and like the rest of §7.4 it can only decline.
+
+One consequence is worth noting, because it runs the safe way. A cached `false`
+is returned without spending the waste allowance the original comparison spent,
+so later speculations have more budget than they would have had, and the checker
+becomes *more* complete than an uncached run, never less.
+
 Without these memos, inference and reduction run over the term's tree unfolding,
 which for a shared term is exponentially larger than the term. In practice the
 `whnf` memo is what makes arithmetic proofs finish at all: the same dictionary —
 `instHMul`, `instOfNat` — is reached from every operation in the expression.
+
+### 11.5 One local per binder occurrence
+
+A binder is opened by replacing its bound variable with a fresh local constant.
+Done naively, "fresh" means a counter, and the same `Lam` node opened twice gets
+two different locals — which makes the two bodies two different terms, so every
+memo above misses, and a term whose graph has a few thousand nodes is walked as
+though it were its tree.
+
+So locals are *interned*: the local for a binder is remembered against the pair
+`(the binder's type as stored, the enclosing scope)`, and opening the same binder
+again in the same scope hands back the same local. The enclosing scope is the
+local that the innermost enclosing binder was opened as — a token, not a list.
+
+Interning locals is the one place in the kernel where a term's identity is reused
+across contexts, so the invariant that makes it safe is worth stating. What must
+never happen is one local occurring twice in the same telescope: abstracting over
+it at the outer occurrence would capture the inner one. It cannot happen here.
+A local is created once and filed under exactly one scope. If a lookup made while
+somewhere inside `x`'s own body ever returned `x`, then `x` would have been filed
+under a scope at or below itself in the binder chain — a scope that did not exist
+when `x` was made. So no environment ever holds one local twice, and no
+abstraction can capture the wrong occurrences.
 
 The memos above are keyed on a term and so are discarded between declarations.
 The §6.5 licences are not: they are facts about the *environment*, they are
@@ -1440,3 +1741,82 @@ Agreement was confirmed on all 653 inductive declarations in the arena corpus.
 **Divergence.** Official Lean recomputes these fields and overwrites them rather
 than comparing, so a file whose bookkeeping is wrong is accepted there and
 rejected here.
+
+### 12.10 Proof bodies are sealed
+
+A checked theorem normally enters the environment as a definition, and a
+definition delta-unfolds. This kernel instead **discards the proof and admits an
+axiom** whenever it can show that no reduction rule could ever look inside it.
+`--keep-proofs` turns this off; it changes nothing but the timings.
+
+The argument is that a proof is used in exactly three ways, and each one can be
+ruled out from the *statement* alone.
+
+- **Compared with another term.** Never needs the value. A proof can only be
+  convertible with another proof, and §7 step 5 settles any comparison between
+  two proofs from their types. Sealing a proof does not even weaken step 4: an
+  axiom is a rigid head, so `thm ā ≡ thm b̄` still goes through congruence.
+- **Major premise of a recursor.** This is the case that can need the value, so
+  it is the one the test is about.
+- **Target of a projection.** Same, and it reduces to the same test.
+
+Write `C` for the head of the statement's conclusion, after stripping its
+`forall`s and head-normalising. The proof is sealed when `C` is an inductive type
+and any of:
+
+| condition | why nothing can be waiting on the value | examples |
+| --- | --- | --- |
+| `C` has no constructors | there is no iota rule to fire and no field to project | `False`, `Empty` |
+| `C` does not admit large elimination (§8.5) | `C.rec`'s motive lands in `Prop`, so every term a stuck `C.rec` blocks is *itself* a proof, and step 5 answers for it. A projection is in the same position: §5.3 only admits one whose field is a proof, and a type with a data field is exactly a type that does not eliminate largely | `Or`, `Exists`, `Nonempty`, `Nat.le` |
+| `C` has the `k` flag (§8.6) | K-like reduction rebuilds the constructor application from the major premise's *type*, so iota fires with the value untouched | `Eq`, `HEq`, `True` |
+
+Anything else is kept — including a conclusion that is a variable, a sort, a
+quotient, or a constant that head normalisation could not resolve.
+
+One class *must* be kept, and it is worth naming: a `Prop` that eliminates
+largely **and** has fields is one whose recursor needs to see a real constructor
+before it can produce the data it promised. `Acc` is the important one — sealing
+a proof of `Acc r a` would stop well-founded recursion from unfolding — and
+`And`, `Iff` and `WellFounded` have the same shape. Structure eta (§7.2) does not
+rescue them: it replaces the major premise with `C.mk h.[C,0] .. h.[C,n]`, whose
+fields are projections that are themselves stuck on the value we would have
+thrown away.
+
+This is a completeness claim, not a soundness one, and it is one-sided in the
+safe direction either way: a proof that should have been kept can only cause a
+reduction to get stuck, and a stuck reduction can only cause a rejection (§7.3).
+
+**Divergence.** None observed. Official Lean keeps theorem values, so a file that
+this kernel rejects for want of an unfolding it sealed away would be a
+divergence; none of the arena corpus, the pathological corpus, or `init`
+contains one.
+
+### 12.11 Reducibility hints are believed
+
+The `hints` field of a `def` is the one thing this kernel reads out of the file
+and does not check. It is safe to read precisely because there is nothing to
+check: it orders `isDefEq`'s step 6, and **the order in which two definitions are
+unfolded cannot change which terms are convertible**. When neither side wins,
+both are unfolded; when one wins, unfolding it still makes progress, and the
+environment is acyclic, so every ordering — including a deliberately perverse
+one — decides the same questions. It decides them at very different speeds, and
+that is the whole of what a hint is for.
+
+The order, greatest first:
+
+| hint | priority | meaning |
+| --- | --- | --- |
+| `abbrev` | highest | the elaborator judged this too thin to be worth keeping folded |
+| `regular n` | by `n` | `n` exceeds the height of everything the value mentions, so unfolding the taller of two constants is what lets the shorter be reached from both sides |
+| `opaque` | lowest | leave this one alone |
+
+A `thm` carries no `hints` field, and one that survives §12.10 is given `opaque`:
+a proof is the last thing worth looking inside.
+
+Earlier versions computed the height themselves, as `1 + max` over the
+definitions a value mentions. That agrees with `regular n` on every export
+`lean4export` produces, but it costs a traversal of every value in the file and
+it has no answer for `abbrev`.
+
+**Divergence.** None possible. Two runs that differ only in this field accept and
+reject exactly the same files.
