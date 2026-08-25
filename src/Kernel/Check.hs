@@ -107,14 +107,25 @@ readLicences s = Licences
   }
   where yeses = M.keysSet . M.filter id
 
--- | A memo table on (term node, local environment) pairs.
+-- | A memo table on (term, local environment) pairs.
 --
--- Keyed by 'exprHash' and matched by 'ptrEq', never by structural equality: a
--- term is a graph, and asking whether two same-hash nodes are equal can cost
--- exponentially more than recomputing the answer.  So a lookup finds an entry
--- only when it is literally the same node -- which is exactly the case that
--- matters, since what makes a shared subterm expensive is being visited once
--- per path to it.
+-- Keyed by 'exprHash' and matched by '=='.  Matching on 'ptrEq' alone is
+-- tempting -- the tables are asked millions of questions a declaration and a
+-- pointer test is one instruction -- but it misses the case that actually
+-- repeats.  Reduction /rebuilds/: every beta step substitutes into a body and
+-- hands back fresh nodes, so the same subterm arrives at the table again and
+-- again as a different pointer with the same shape, and a pointer-matched table
+-- answers none of those.  On a machine-generated arithmetic proof that is the
+-- difference between a memo and no memo at all: the same handful of stuck
+-- comparisons were being recomputed a million times over, each on a freshly
+-- rebuilt copy of terms the table already had the answer for.
+--
+-- Structural equality is affordable here because it is not the naive one.  The
+-- bucket is reached by hash, so the two candidates already agree on it; '=='
+-- tries 'ptrEq' first and then 'eqE', which is graph-aware -- a plain recursion
+-- under a visit budget, with a memoised traversal taking over if the budget runs
+-- out -- so a comparison of two shared terms costs their graphs and not their
+-- tree unfoldings.
 --
 -- The second component of the key is the environment the node is read in; see
 -- 'envKey'.
@@ -129,9 +140,9 @@ memoEntryKey (k, ek, _) = hashMix (exprHash k) ek
 memoLookup :: Memo -> Int -> Expr -> IO (Maybe Expr)
 memoLookup m ek e = go <$> bucket m (hashMix (exprHash e) ek)
   where
-    go ((k, ek', v) : rest) | ek == ek', ptrEq k e = Just v
-                            | otherwise            = go rest
-    go []                                          = Nothing
+    go ((k, ek', v) : rest) | ek == ek', k == e = Just v
+                            | otherwise         = go rest
+    go []                                       = Nothing
 
 memoInsert :: Memo -> Int -> Expr -> Expr -> IO ()
 memoInsert m ek k v = push memoEntryKey m (hashMix (exprHash k) ek) (k, ek, v)
@@ -154,13 +165,12 @@ localIdLookup m pk t = go <$> bucket m (hashMix (exprHash t) pk)
 localIdInsert :: LocalMemo -> Int -> Expr -> Int -> IO ()
 localIdInsert m pk t x = push localEntryKey m (hashMix (exprHash t) pk) (t, pk, x)
 
--- | A memo on /pairs/ of term nodes: what 'isDefEq' last answered about them.
+-- | A memo on /pairs/ of terms: what 'isDefEq' last answered about them.
 --
--- Keyed and matched exactly as 'Memo' is, on node identity rather than on
--- structure, and symmetrically: the key mixes the two hashes in an order that
--- does not depend on which side is which, and a hit accepts the entry either way
--- round.  Conversion is symmetric, so half the questions are the other half
--- asked backwards.
+-- Keyed and matched exactly as 'Memo' is, and symmetrically: the key mixes the
+-- two hashes in an order that does not depend on which side is which, and a hit
+-- accepts the entry either way round.  Conversion is symmetric, so half the
+-- questions are the other half asked backwards.
 --
 -- Sound to consult under any budget, and that is worth spelling out, because a
 -- @False@ here is not always the last word.  Every @True@ was produced by the
@@ -185,10 +195,10 @@ eqLookup :: EqMemo -> Expr -> Expr -> IO (Maybe Bool)
 eqLookup m a b = go <$> bucket m (eqKey a b)
   where
     go ((x, y, v) : rest)
-      | ptrEq x a && ptrEq y b = Just v
-      | ptrEq x b && ptrEq y a = Just v
-      | otherwise              = go rest
-    go []                      = Nothing
+      | x == a && y == b = Just v
+      | x == b && y == a = Just v
+      | otherwise        = go rest
+    go []                = Nothing
 
 eqInsert :: EqMemo -> Expr -> Expr -> Bool -> IO ()
 eqInsert m a b v = push eqEntryKey m (eqKey a b) (a, b, v)
@@ -1354,7 +1364,13 @@ isDefEq t0 s0
         when (b || full) (insertEq t0 s0 b)
         pure b
   where
+    -- A comparison the memo could not answer is a step.  Congruence descends
+    -- into arguments without reducing anything, so a budget that counted only
+    -- reduction would not bound it at all: a speculation could compare two
+    -- stuck spines against each other for as long as the spines were deep,
+    -- which on a machine-generated arithmetic proof is longer than anyone has.
     decide = outOfFuel >>= \out -> if out then pure False else do
+      spend
       t <- whnfCore t0
       s <- whnfCore s0
       if t == s then pure True else defEqLoop t s

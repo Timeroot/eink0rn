@@ -698,6 +698,16 @@ So a speculative comparison runs under a step budget (`tcFuel`), drawn from a
 running allowance for *wasted* work (`tcWaste`). When the budget runs out,
 reduction stops where it stands and the comparison answers `False`.
 
+A *step* is a reduction step — a beta, zeta, iota or projection rewrite, or a
+delta unfolding — and also **one conversion question the memo could not answer**.
+The last is easy to leave out and the omission is not a small one. Congruence
+descends into arguments without reducing anything, so a budget that counted only
+reduction would not bound congruence at all: a speculation could compare two
+stuck spines against each other for as long as the spines were deep, and on a
+machine-generated arithmetic proof that is longer than anyone has. Charging the
+question makes the budget bound the whole speculative subtree and not just its
+reductions.
+
 The allowance is **credited**, not fixed. A declaration opens with 50000 steps
 and earns one more for every eight reduction steps the checker performs outside a
 speculation, to a ceiling of the same 50000. A fixed per-declaration allowance is
@@ -1152,12 +1162,27 @@ share.
 
 ### 11.4 Memoisation keys
 
-Inference and `whnf` are memoised on `(node, local environment)`, keyed by hash and
-matched by **pointer equality**, never by structural equality: asking whether two
-same-hash nodes are structurally equal can cost exponentially more than
-recomputing the answer. A lookup therefore finds an entry only when it is
-literally the same node — which is exactly the case that matters, since what makes
-a shared subterm expensive is being visited once per path to it.
+Inference and `whnf` are memoised on `(term, local environment)`, keyed by hash and
+matched by **structural equality**.
+
+Matching by pointer alone is the tempting rule — the tables are asked millions of
+questions on a hard declaration and a pointer test is one instruction — and it is
+wrong, because it misses the repetition that actually happens. Reduction
+*rebuilds*: a beta step substitutes into a body and hands back fresh nodes, so
+the same subterm arrives at the table again and again as a different pointer with
+the same shape. A pointer-matched table answers none of those, and on a
+machine-generated proof that is the difference between having a memo and not
+having one. It is what made one `Char` lemma in `init.ndjson` ask the same seven
+pairs of stuck terms about a million times each, and never finish.
+
+Structural equality is affordable because it is not the naive one. A bucket is
+reached by hash, so the two candidates already agree on their hashes before
+anything is walked; the comparison then tries pointer equality, and only then
+walks — under the graph-aware `eqE` of §11.3, a plain recursion under a visit
+budget with a memoised traversal taking over when the budget runs out. So
+comparing two shared terms costs their graphs and not their tree unfoldings, and
+the walk that a pointer test was avoiding is bounded by the same reasoning that
+bounds every other traversal in the kernel.
 
 The environment half of the key is just the innermost local, which identifies the
 whole list: fresh locals are handed out from a counter that only ever grows and
@@ -1175,7 +1200,7 @@ key, doubling when it fills. A balanced tree of ten million entries answers a
 lookup in some two dozen dependent pointer chases, essentially all of them cache
 misses, and pays for an insertion by copying the path it came down; a hard
 declaration asks and answers millions of these questions. Nothing else about the
-tables changes: the same keys, the same pointer test, the same cap on how long a
+tables changes: the same keys, the same test, the same cap on how long a
 bucket may get. The mutation does not escape: the tables are made, used and
 dropped inside one call, so checking the same declaration twice against the same
 environment gives the same answer, and the checker's interface stays pure.
@@ -1217,12 +1242,12 @@ and no later caller is handed a result computed with less than it had itself.
 that is *more* reduced than a caller could have managed is still reached by
 reduction steps, so it is a correct answer, just a better one.)
 
-Conversion is memoised too, on **pairs** of nodes, and symmetrically: the key
-mixes the two hashes in an order that does not depend on which side is which, and
-a hit is accepted either way round, because §7's relation is symmetric and half
-the questions asked of it are the other half asked backwards. Only pairs whose
-sides are both applications or projections are filed, since anything else is
-settled by a pointer test or by one look at a head.
+Conversion is memoised too, on **pairs** of terms, matched the same way and
+symmetrically: the key mixes the two hashes in an order that does not depend on
+which side is which, and a hit is accepted either way round, because §7's relation
+is symmetric and half the questions asked of it are the other half asked
+backwards. Only pairs whose sides are both applications or projections are filed,
+since anything else is settled by one equality test or by one look at a head.
 
 This table is the one place where a *negative* answer is remembered, so it is
 worth saying why that cannot cost soundness. Every `true` in it was produced by
@@ -1245,9 +1270,7 @@ count whenever it declines — and by §7.4 it declines *often*, since the allow
 is meant to run dry on a hard declaration. Reading the count across the whole
 comparison therefore reports "someone, somewhere in here, gave up", which on a
 hard declaration is always, and the negative half of the table switches itself off
-for exactly the declarations it exists for. The observed cost of that is not a
-constant factor: one `Char` lemma in `init.ndjson` asked the same seven pairs of
-stuck terms about a million times each and never finished.
+for exactly the declarations it exists for.
 
 The count means something for `whnf` and nothing here, and the reason is what the
 two calls leave behind. A starved reduction leaves a half-reduced *term*, and a
