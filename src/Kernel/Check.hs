@@ -922,9 +922,10 @@ unflatten e = do
               | Just (CCtor ci) <- lookupConst env c
               , ctorInduct ci == idxTy
               , ctorIdx ci < length ms
-              , length targs >= nps ->
-                  pure (mkApps (Const (ms !! ctorIdx ci) ls)
-                               (take nps args ++ drop nps targs))
+              , let m = ms !! ctorIdx ci
+              , Just mi <- inductiveAt env m
+              , length targs == nps + indNumIndices mi ->
+                  pure (mkApps (Const m ls) (take nps args ++ drop nps targs))
             _ -> pure e
     _ -> pure e
 

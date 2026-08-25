@@ -1271,6 +1271,21 @@ recursion on one type.
 **Elimination is decided by §8.5 case 1 alone.** For a block of two or more
 members case 2 never applies anyway, so `isDefinitelyNonZero l` is the whole rule.
 
+**How often any of this happens.** Mutual blocks are rare, and blocks this can
+flatten are rarer:
+
+| corpus | inductive blocks | mutual | of those, nested | flattened | member counts |
+|---|---|---|---|---|---|
+| `init` | 588 | 0 | 0 | 0 | — |
+| `std` | 908 | 0 | 0 | 0 | — |
+| `cslib` | 4336 | 12 | 3 | 9 | 2×6, 3×2, 7×1 |
+| `mathlib` | 6644 | 13 | 3 | 10 | 2×8, 3×1, 7×1 |
+
+So `init` and `std` bound the fork's cost on the *common* path and say nothing
+about the flattening itself; and the validation corpus, where a hundred-odd files
+declare a mutual block on purpose, is where the construction is actually
+exercised.
+
 #### 9.3.3 What it costs
 
 `Idx`, `F`, `Idx.rec` and `F.rec` genuinely enter the environment. They are named
