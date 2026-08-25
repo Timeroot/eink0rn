@@ -20,6 +20,7 @@ library
                       Kernel.Level
                       Kernel.Expr
                       Kernel.Env
+                      Kernel.Cache
                       Kernel.Canon
                       Kernel.Check
                       Kernel.Inductive

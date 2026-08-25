@@ -316,6 +316,14 @@ happens to be in head position.
 definition whose universe arity matches. Definitions declared `opaque` are
 axioms and never unfold, and neither do proofs sealed under §12.10.
 
+Unfolding substitutes the occurrence's universe arguments into the stored body
+and applies it to the arguments the head had — and applies it by *contracting*
+the beta redex, all binders at once, rather than handing `whnfCore` a body under
+a spine for it to contract a binder at a time. The term is the same either way.
+What differs is the number of reduction steps it took to get there, and the
+budget of §7.4 is spent per step, so the difference decides how much of a
+comparison is done before the budget runs out and a speculation gives up.
+
 ### 6.3 Iota for recursors
 
 ```
@@ -585,7 +593,8 @@ and `⌜k+1⌝` the same term as far as conversion is concerned.
    recursor, a stuck projection), compare heads and arguments pairwise.
    *Positive only*: failure falls through.
 5. **Proof irrelevance** — if `t`'s type is a proposition and `s`'s type is
-   definitionally equal to it, `t ≡ s`.
+   definitionally equal to it, `t ≡ s`. Preceded by the syntactic test of §7.5,
+   which settles most pairs without inferring anything.
 6. **Lazy delta** — unfold the side whose head definition has the greater
    unfolding priority (§12.11); when priorities are equal and both heads are the
    same constant, first try argument-wise congruence, and only unfold both if
@@ -658,6 +667,49 @@ Two consequences are handled explicitly:
 The budget is therefore a completeness knob with no soundness content. Raising it
 can only turn rejections into acceptances of things that were already provable;
 lowering it can only turn acceptances into rejections.
+
+### 7.5 Deciding "not a proof" without inferring a type
+
+Step 5 is asked about nearly every pair the loop reaches, and it answers *no*
+almost every time, because what is usually being compared is two values rather
+than two proofs. Answering it the direct way costs two inferences and all the
+reduction they set off, so the kernel first tries to rule the term out on sight.
+
+A term `t` is a proof exactly when the type of its type is `Prop`. Write `u` for
+the universe of `t`'s type — the level with `T(t) : Sort u`. Then `t` is a proof
+iff `u ≈ 0`, so any argument that `u` is *definitely nonzero* rules step 5 out.
+
+For a term whose head is a constant `c` declared `∀ x₁ .. xₙ, B`, that argument
+can be made from declared types alone:
+
+- if `B` is `Sort v`, then `u = v+1`, which is never zero;
+- if `B` is a constant `d` applied to arguments and `d` is declared
+  `∀ ȳ, Sort w`, then `u = w` with `c`'s level arguments substituted;
+- if `B` is a *bound* variable `xⱼ` applied to arguments and `xⱼ` is declared
+  `∀ z̄, Sort w`, then `u = w`.
+
+The last case is what matters in practice: it is the shape of every eliminator
+and every match auxiliary, whose result is a motive applied to its major
+premise, and the motive's universe is written down in its own binder. The
+middle case covers everything that computes — `Nat.mul a b`, `List.cons x xs` —
+whose result is an inductive type whose universe is written down in *its*
+declaration. A definition standing in the way is unfolded, because the class
+hierarchy declares its output parameters `outParam (Type u)` rather than
+`Type u`, and an argument whose type is a type is exactly what has to be
+recognised. The answer is read off `c`'s declaration once and cached under `c`'s
+name; the occurrence's own level arguments are substituted at each use.
+
+The number of arguments does not enter into it, which is worth spelling out
+because it looks like it should. Applying `c` to *fewer* than `n` arguments
+gives a type `∀ rest, B`, whose universe is `imax _ u`; applying it to *more*
+requires `B` to be a function type `∀ x:A, C`, whose universe `u` is
+`imax (univ A) (univ C)`. An `imax` is zero exactly when its right argument is,
+so in both directions "definitely nonzero" is preserved, and a single level per
+constant answers for every arity.
+
+Everything here is one-sided in the sense of §7.3: a *yes* ("not a proof") must
+be right, and it is, being a chain of declared types and the `imax` rule; a *no*
+costs only the slow route, which is the rule as stated.
 
 ---
 
@@ -1021,13 +1073,15 @@ a cache to a lie.
 
 Each traversal also builds a memo table on the nodes it visits, so that a shared
 node is rewritten once rather than once per path to it, and so that the *result*
-is a graph too. Substitution is the exception, and only in how it starts: almost
-every beta step rewrites a handful of nodes, and setting up a table for that costs
-more than the substitution, so the plain recursion is tried first under a visit
-budget and the memoised traversal is kept for the terms that exceed it. Exceeding
-the budget is exactly the symptom of the sharing that makes a table worth having.
-The two compute the same term; they differ only in how much of the *result* is
-shared, and below the budget there is nothing to share.
+is a graph too. Substitution and universe instantiation are the exception, and
+only in how they start: almost every beta step rewrites a handful of nodes, and
+almost every universe instantiation is asked about a declared type of a few dozen,
+and setting up a table for either costs more than the walk. So the plain recursion
+is tried first under a visit budget and the memoised traversal is kept for the
+terms that exceed it. Exceeding the budget is exactly the symptom of the sharing
+that makes a table worth having. The two compute the same term; they differ only
+in how much of the *result* is shared, and below the budget there is nothing to
+share.
 
 ### 11.4 Memoisation keys
 
@@ -1048,6 +1102,26 @@ All three tables are invalidated when the global environment or the declaration'
 universe parameters change, since both the inferred type and what a constant
 unfolds to depend on them. Buckets are capped so a hash collision cannot turn the
 table into a leak. Missing a hit only wastes time.
+
+The tables are *mutable* — an array of buckets indexed by the low bits of the
+key, doubling when it fills. A balanced tree of ten million entries answers a
+lookup in some two dozen dependent pointer chases, essentially all of them cache
+misses, and pays for an insertion by copying the path it came down; a hard
+declaration asks and answers millions of these questions. Nothing else about the
+tables changes: the same keys, the same pointer test, the same cap on how long a
+bucket may get. The mutation does not escape: the tables are made, used and
+dropped inside one call, so checking the same declaration twice against the same
+environment gives the same answer, and the checker's interface stays pure.
+
+One more table is kept, on a different key. Delta and iota both work by taking a
+body out of the environment and replacing that declaration's universe parameters
+with the ones written at the occurrence, and a proof that unfolds the same
+polymorphic constant ten thousand times asks for the same instantiation ten
+thousand times. Those are memoised on `(stored body, universe arguments)` — the
+body by pointer, since it comes from the environment and is stable for as long as
+the table lives, and the arguments properly, being short. Unlike the three above,
+this one survives the environment changing, because what it records is a fact
+about a body and some levels and not about an environment.
 
 The `whnf` memo has one extra condition: an entry is recorded only when the
 reduction ran *outside* a speculation (§7.4). A starved reduction stops where it
@@ -1096,6 +1170,29 @@ Without these memos, inference and reduction run over the term's tree unfolding,
 which for a shared term is exponentially larger than the term. In practice the
 `whnf` memo is what makes arithmetic proofs finish at all: the same dictionary —
 `instHMul`, `instOfNat` — is reached from every operation in the expression.
+
+### 11.5 One local per binder occurrence
+
+A binder is opened by replacing its bound variable with a fresh local constant.
+Done naively, "fresh" means a counter, and the same `Lam` node opened twice gets
+two different locals — which makes the two bodies two different terms, so every
+memo above misses, and a term whose graph has a few thousand nodes is walked as
+though it were its tree.
+
+So locals are *interned*: the local for a binder is remembered against the pair
+`(the binder's type as stored, the enclosing scope)`, and opening the same binder
+again in the same scope hands back the same local. The enclosing scope is the
+local that the innermost enclosing binder was opened as — a token, not a list.
+
+Interning locals is the one place in the kernel where a term's identity is reused
+across contexts, so the invariant that makes it safe is worth stating. What must
+never happen is one local occurring twice in the same telescope: abstracting over
+it at the outer occurrence would capture the inner one. It cannot happen here.
+A local is created once and filed under exactly one scope. If a lookup made while
+somewhere inside `x`'s own body ever returned `x`, then `x` would have been filed
+under a scope at or below itself in the binder chain — a scope that did not exist
+when `x` was made. So no environment ever holds one local twice, and no
+abstraction can capture the wrong occurrences.
 
 The memos above are keyed on a term and so are discarded between declarations.
 The §6.5 licences are not: they are facts about the *environment*, they are

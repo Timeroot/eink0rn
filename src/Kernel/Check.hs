@@ -41,11 +41,14 @@ import qualified Data.IntMap.Strict     as IM
 import           Data.List              (find)
 import           Data.Map.Strict        (Map)
 import qualified Data.Map.Strict        as M
+import           Kernel.Cache           (Cache, bucket, clearCache, newCache,
+                                         push)
 import           Kernel.Canon
 import           Kernel.Env
 import           Kernel.Expr
 import           Kernel.Level
 import           Kernel.Name
+import           System.IO.Unsafe       (unsafePerformIO)
 
 -- The checking monad ----------------------------------------------------------
 
@@ -63,10 +66,15 @@ data TCState = TCState
   , tcWhnf        :: !Memo     -- ^ memo for 'whnf'
   , tcDefEq       :: !EqMemo   -- ^ memo for 'isDefEq'; see 'EqMemo'
   , tcLevelInst   :: !LevelMemo -- ^ memo for 'instLevels'
+  , tcLocalId     :: !LocalMemo -- ^ which local stands for which binder; see
+                                --   'sharedLocal'
+  , tcScope       :: !Int      -- ^ the innermost local currently in scope, or
+                               --   @-1@; see 'sharedLocal'
   , tcNatOk       :: !(Maybe Bool)  -- ^ cached 'natShapeOk'; see 'expandLit'
   , tcStrOk       :: !(Maybe Bool)  -- ^ cached 'strShapeOk'
   , tcNatOps      :: !(Map Name Bool)  -- ^ cached 'natOpOk'; see 'reduceNatOp'
   , tcCanonOk     :: !(Map Name Bool)  -- ^ cached 'canonIndMatches'
+  , tcSortRes     :: !(Map Name (Maybe ([Name], Level))) -- ^ cached 'resultUniverse'
   }
 
 -- | Start the four licence caches off from what the environment already knows,
@@ -107,19 +115,38 @@ readLicences s = Licences
 --
 -- Missing a hit only wastes time.  Buckets are capped so that a hash collision
 -- cannot turn the table into a leak.
-type Memo = IntMap [(Expr, Int, Expr)]
+type Memo = Cache (Expr, Int, Expr)
 
-memoLookup :: Memo -> Int -> Expr -> Maybe Expr
-memoLookup m ek e = IM.lookup (hashMix (exprHash e) ek) m >>= go
+memoEntryKey :: (Expr, Int, Expr) -> Int
+memoEntryKey (k, ek, _) = hashMix (exprHash k) ek
+
+memoLookup :: Memo -> Int -> Expr -> IO (Maybe Expr)
+memoLookup m ek e = go <$> bucket m (hashMix (exprHash e) ek)
   where
     go ((k, ek', v) : rest) | ek == ek', ptrEq k e = Just v
                             | otherwise            = go rest
     go []                                          = Nothing
 
-memoInsert :: Int -> Expr -> Expr -> Memo -> Memo
-memoInsert ek k v =
-  IM.insertWith (\new old -> head new : take 7 old)
-                (hashMix (exprHash k) ek) [(k, ek, v)]
+memoInsert :: Memo -> Int -> Expr -> Expr -> IO ()
+memoInsert m ek k v = push memoEntryKey m (hashMix (exprHash k) ek) (k, ek, v)
+
+-- | Which local constant stands for a binder: the binder's type node and the
+-- environment it is read in, to the identifier inference gave it.  See
+-- 'sharedLocal'.
+type LocalMemo = Cache (Expr, Int, Int)
+
+localEntryKey :: (Expr, Int, Int) -> Int
+localEntryKey (t, pk, _) = hashMix (exprHash t) pk
+
+localIdLookup :: LocalMemo -> Int -> Expr -> IO (Maybe Int)
+localIdLookup m pk t = go <$> bucket m (hashMix (exprHash t) pk)
+  where
+    go ((k, pk', x) : rest) | pk == pk', ptrEq k t = Just x
+                            | otherwise            = go rest
+    go []                                          = Nothing
+
+localIdInsert :: LocalMemo -> Int -> Expr -> Int -> IO ()
+localIdInsert m pk t x = push localEntryKey m (hashMix (exprHash t) pk) (t, pk, x)
 
 -- | A memo on /pairs/ of term nodes: what 'isDefEq' last answered about them.
 --
@@ -138,15 +165,18 @@ memoInsert ek k v =
 -- completeness cost at nothing that matters, entries are written only from a
 -- call that ran unmetered, never from inside a 'speculate' where @False@ means
 -- no more than "not this way".
-type EqMemo = IntMap [(Expr, Expr, Bool)]
+type EqMemo = Cache (Expr, Expr, Bool)
 
 -- | Symmetric in its arguments, as conversion is.
 eqKey :: Expr -> Expr -> Int
 eqKey a b = let x = exprHash a; y = exprHash b
             in hashMix (min x y) (max x y)
 
-eqLookup :: EqMemo -> Expr -> Expr -> Maybe Bool
-eqLookup m a b = IM.lookup (eqKey a b) m >>= go
+eqEntryKey :: (Expr, Expr, Bool) -> Int
+eqEntryKey (a, b, _) = eqKey a b
+
+eqLookup :: EqMemo -> Expr -> Expr -> IO (Maybe Bool)
+eqLookup m a b = go <$> bucket m (eqKey a b)
   where
     go ((x, y, v) : rest)
       | ptrEq x a && ptrEq y b = Just v
@@ -154,9 +184,8 @@ eqLookup m a b = IM.lookup (eqKey a b) m >>= go
       | otherwise              = go rest
     go []                      = Nothing
 
-eqInsert :: Expr -> Expr -> Bool -> EqMemo -> EqMemo
-eqInsert a b v =
-  IM.insertWith (\new old -> head new : take 7 old) (eqKey a b) [(a, b, v)]
+eqInsert :: EqMemo -> Expr -> Expr -> Bool -> IO ()
+eqInsert m a b v = push eqEntryKey m (eqKey a b) (a, b, v)
 
 -- | Is a comparison of these two worth a table lookup?
 --
@@ -168,7 +197,7 @@ eqWorthMemo a b = big a && big b
   where big e = case e of App{} -> True; Proj{} -> True; _ -> False
 
 -- | A memo on (stored body, universe arguments) pairs; see 'instLevels'.
-type LevelMemo = IntMap [(Expr, [Level], Expr)]
+type LevelMemo = Cache (Expr, [Level], Expr)
 
 -- | 'instLevelsE', remembered for the length of one declaration.
 --
@@ -184,38 +213,46 @@ type LevelMemo = IntMap [(Expr, [Level], Expr)]
 -- Missing a hit only wastes time, so the bucket is capped.
 instLevels :: [Name] -> [Level] -> Expr -> TC Expr
 instLevels [] _  e = pure e
-instLevels ps ls e = TC $ \s ->
-  let key    = exprHash e
-      bucket = IM.findWithDefault [] key (tcLevelInst s)
+instLevels ps ls e = TC $ \s -> do
+  let tbl = tcLevelInst s
+      key = exprHash e
       hit ((b, ls', r) : rest) | ptrEq b e, ls' == ls = Just r
                                | otherwise            = hit rest
       hit []                                          = Nothing
-  in case hit bucket of
-       Just r  -> Right (r, s)
-       Nothing ->
-         let r = instLevelsE ps ls e
-         in Right (r, s { tcLevelInst =
-                            IM.insert key ((e, ls, r) : take 7 bucket)
-                                      (tcLevelInst s) })
+  b <- bucket tbl key
+  case hit b of
+    Just r  -> pure (Right (r, s))
+    Nothing -> do
+      let r = instLevelsE ps ls e
+      push (\(x, _, _) -> exprHash x) tbl key (e, ls, r)
+      pure (Right (r, s))
 
-newtype TC a = TC { unTC :: TCState -> Either String (a, TCState) }
+-- | The checking monad: state, failure, and -- because the memo tables above
+-- are mutable -- 'IO'.
+--
+-- The 'IO' does not escape.  'runTCLearn' creates the tables, runs the whole
+-- computation and returns a value; nothing a caller can hold on to refers to a
+-- table, and running the same check twice on the same environment gives the
+-- same answer, because a cache is all any of the tables is.  So the outside of
+-- 'runTC' is pure, and says so.
+newtype TC a = TC { unTC :: TCState -> IO (Either String (a, TCState)) }
 
 instance Functor TC where
-  fmap f (TC g) = TC $ \s -> case g s of
-    Left e        -> Left e
-    Right (a, s') -> Right (f a, s')
+  fmap f (TC g) = TC $ \s -> g s >>= \case
+    Left e        -> pure (Left e)
+    Right (a, s') -> pure (Right (f a, s'))
 
 instance Applicative TC where
-  pure a = TC $ \s -> Right (a, s)
-  TC f <*> TC g = TC $ \s -> case f s of
-    Left e        -> Left e
-    Right (h, s') -> case g s' of
-      Left e         -> Left e
-      Right (a, s'') -> Right (h a, s'')
+  pure a = TC $ \s -> pure (Right (a, s))
+  TC f <*> TC g = TC $ \s -> f s >>= \case
+    Left e        -> pure (Left e)
+    Right (h, s') -> g s' >>= \case
+      Left e         -> pure (Left e)
+      Right (a, s'') -> pure (Right (h a, s''))
 
 instance Monad TC where
-  TC g >>= k = TC $ \s -> case g s of
-    Left e        -> Left e
+  TC g >>= k = TC $ \s -> g s >>= \case
+    Left e        -> pure (Left e)
     Right (a, s') -> unTC (k a) s'
 
 runTC :: Env -> [Name] -> TC a -> Either String a
@@ -225,15 +262,22 @@ runTC env lps act = fst <$> runTCLearn env lps act
 -- the caller can store them in the environment it carries to the next
 -- declaration.  See 'Licences' for why that is sound, and 'seedLicences'.
 runTCLearn :: Env -> [Name] -> TC a -> Either String (a, Licences)
-runTCLearn env lps (TC f) =
-  fmap readLicences <$>
-    f (seedLicences env
-        (TCState env IM.empty 0 lps unmetered wasteBudget
-                 IM.empty IM.empty IM.empty IM.empty IM.empty
-                 Nothing Nothing M.empty M.empty))
+runTCLearn env lps (TC f) = unsafePerformIO $ do
+  inferV <- newCache
+  inferA <- newCache
+  whnfM  <- newCache
+  defEq  <- newCache
+  lvlM   <- newCache
+  locId  <- newCache
+  r <- f (seedLicences env
+           (TCState env IM.empty 0 lps unmetered wasteBudget
+                    inferV inferA whnfM defEq lvlM locId (-1)
+                    Nothing Nothing M.empty M.empty M.empty))
+  pure (fmap readLicences <$> r)
+{-# NOINLINE runTCLearn #-}
 
 throwTC :: String -> TC a
-throwTC msg = TC $ \_ -> Left msg
+throwTC msg = TC $ \_ -> pure (Left msg)
 
 -- Work budgets ------------------------------------------------------------------
 
@@ -254,14 +298,14 @@ wasteBudget = 20000
 
 -- | Charge one reduction step.
 spend :: TC ()
-spend = TC $ \s -> Right ((), if tcFuel s == unmetered
-                                then s
-                                else s { tcFuel = tcFuel s - 1 })
+spend = TC $ \s -> pure (Right ((), if tcFuel s == unmetered
+                                      then s
+                                      else s { tcFuel = tcFuel s - 1 }))
 
 -- | Has the current speculative comparison run out of budget?  When it has,
 -- reduction stops where it stands and conversion answers @False@.
 outOfFuel :: TC Bool
-outOfFuel = TC $ \s -> Right (tcFuel s <= 0, s)
+outOfFuel = TC $ \s -> pure (Right (tcFuel s <= 0, s))
 
 -- | Run a comparison whose /negative/ answer is not conclusive -- the caller
 -- will unfold and ask again -- under a budget.
@@ -276,9 +320,9 @@ speculate :: TC Bool -> TC Bool
 speculate (TC act) = TC $ \s ->
   let fuel0 = tcFuel s
       allow = if fuel0 == unmetered then tcWaste s else min fuel0 (tcWaste s)
-  in if allow <= 0 then Right (False, s) else
-     case act s { tcFuel = allow } of
-       Left e        -> Left e
+  in if allow <= 0 then pure (Right (False, s)) else
+     act s { tcFuel = allow } >>= \case
+       Left e        -> pure (Left e)
        Right (b, s') ->
          let used  = allow - tcFuel s'
              fuel' | fuel0 == unmetered = unmetered
@@ -287,7 +331,7 @@ speculate (TC act) = TC $ \s ->
              -- work the checker would have had to do anyway.
              waste' | b         = tcWaste s'
                     | otherwise = max 0 (tcWaste s' - used)
-         in Right (b, s' { tcFuel = fuel', tcWaste = waste' })
+         in pure (Right (b, s' { tcFuel = fuel', tcWaste = waste' }))
 
 -- | Run an action on a full budget, whatever the caller has left of theirs.
 --
@@ -298,9 +342,10 @@ speculate (TC act) = TC $ \s ->
 -- restored afterwards, so nothing it is entitled to is consumed.
 unmeteredly :: TC a -> TC a
 unmeteredly (TC act) = TC $ \s ->
-  case act s { tcFuel = unmetered, tcWaste = wasteBudget } of
-    Left e        -> Left e
-    Right (a, s') -> Right (a, s' { tcFuel = tcFuel s, tcWaste = tcWaste s })
+  act s { tcFuel = unmetered, tcWaste = wasteBudget } >>= \case
+    Left e        -> pure (Left e)
+    Right (a, s') -> pure (Right (a, s' { tcFuel  = tcFuel s
+                                        , tcWaste = tcWaste s }))
 
 -- | Run an action on a fixed budget, whatever the caller has left of theirs.
 --
@@ -314,9 +359,10 @@ unmeteredly (TC act) = TC $ \s ->
 -- answers @False@, which only ever declines a shortcut.
 onBudget :: Int -> TC a -> TC a
 onBudget n (TC act) = TC $ \s ->
-  case act s { tcFuel = n, tcWaste = n } of
-    Left e        -> Left e
-    Right (a, s') -> Right (a, s' { tcFuel = tcFuel s, tcWaste = tcWaste s })
+  act s { tcFuel = n, tcWaste = n } >>= \case
+    Left e        -> pure (Left e)
+    Right (a, s') -> pure (Right (a, s' { tcFuel  = tcFuel s
+                                        , tcWaste = tcWaste s }))
 
 -- | What the whole probe battery of one operation may spend.
 --
@@ -333,26 +379,25 @@ withFuel :: TC (Maybe a) -> TC (Maybe a)
 withFuel act = outOfFuel >>= \out -> if out then pure Nothing else act
 
 getEnv :: TC Env
-getEnv = TC $ \s -> Right (tcEnv s, s)
+getEnv = TC $ \s -> pure (Right (tcEnv s, s))
 
 setLevelParams :: [Name] -> TC ()
-setLevelParams lps = TC $ \s ->
-  Right ((), s { tcLevelParams = lps
-               , tcInferV = IM.empty, tcInferA = IM.empty, tcWhnf = IM.empty
-               , tcDefEq = IM.empty })
+setLevelParams lps = TC $ \s -> do
+  forgetMemos s
+  pure (Right ((), s { tcLevelParams = lps }))
 
 freshFVar :: Binder -> Expr -> TC Int
 freshFVar n t = TC $ \s ->
   let i = tcNextFVar s
-  in Right (i, s { tcNextFVar = i + 1
-                 , tcLocals   = IM.insert i (n, t) (tcLocals s) })
+  in pure (Right (i, s { tcNextFVar = i + 1
+                       , tcLocals   = IM.insert i (n, t) (tcLocals s) }))
 
 localType :: Int -> TC Expr
 localType i = snd <$> localInfo i
 
 -- | The binder name and type a local constant was introduced with.
 localInfo :: Int -> TC (Binder, Expr)
-localInfo i = TC $ \s -> case IM.lookup i (tcLocals s) of
+localInfo i = TC $ \s -> pure $ case IM.lookup i (tcLocals s) of
   Just nt -> Right (nt, s)
   Nothing -> Left ("unbound local constant x!" ++ show i)
 
@@ -377,17 +422,80 @@ withEnv env act = do
 -- function of its key: substituting universes in a term does not consult the
 -- environment at all.
 setEnv :: Env -> TC ()
-setEnv env = TC $ \s ->
-  Right ((), seedLicences env
-               s { tcEnv    = env
-                 , tcInferV = IM.empty
-                 , tcInferA = IM.empty
-                 , tcWhnf   = IM.empty
-                 , tcDefEq  = IM.empty })
+setEnv env = TC $ \s -> do
+  forgetMemos s
+  pure (Right ((), seedLicences env s { tcEnv = env }))
+
+-- | Throw away everything keyed on a term alone.  'tcLevelInst' is not among
+-- them: what it remembers is a pure function of its key, and neither is
+-- 'tcLocalId': what it remembers is which /name/ a binder was given, and a name
+-- means the same thing under every environment.
+forgetMemos :: TCState -> IO ()
+forgetMemos s = do
+  clearCache (tcInferV s)
+  clearCache (tcInferA s)
+  clearCache (tcWhnf s)
+  clearCache (tcDefEq s)
+
+-- | Run an action with @x@ recorded as the innermost local in scope.
+--
+-- 'tcScope' is not a context -- 'tcLocals' is -- but a token for one: what it
+-- identifies is the whole chain of locals a term may mention free.  See
+-- 'sharedLocal', which is the only thing that reads it.
+withScope :: Int -> TC a -> TC a
+withScope x act = do
+  old <- TC $ \s -> pure (Right (tcScope s, s { tcScope = x }))
+  a   <- act
+  TC $ \s -> pure (Right ((), s { tcScope = old }))
+  pure a
 
 -- | Introduce a local constant of the given type and run an action with it.
 withLocal :: Binder -> Expr -> (Int -> TC a) -> TC a
-withLocal n t k = freshFVar n t >>= k
+withLocal n t k = freshFVar n t >>= \x -> withScope x (k x)
+
+-- | The local constant that stands for a binder.  @raw@ is the binder's type as
+-- it appears in the term, still open with respect to @env@; the continuation
+-- also gets it closed.
+--
+-- The point is that two readings of the /same/ binder node in the /same/ scope
+-- get the /same/ local, where 'withLocal' would have given them two.  That
+-- sounds like a nicety and is the difference between checking a shared term and
+-- checking the tree it denotes.  Inference is memoised on the pair of a node and
+-- the environment it is read in ('memoKey'), and an environment is identified by
+-- its innermost local ('envKey'); so if every binder hands out a brand new
+-- local, a subterm reached along @2^n@ paths is read in @2^n@ environments no
+-- two of which are ever the same, the memo never answers, and the checker walks
+-- the term's tree unfolding.  Handing out the same local along every path
+-- collapses those environments back into one.
+--
+-- A local is only a name, and the type this one is recorded with is
+-- @closeIn env raw@ -- a function of exactly what the entry is keyed on, since
+-- the scope determines the environment.  So two binders that share a local do
+-- agree about what it is.
+--
+-- What must not happen is for a binder to be given a local that some enclosing
+-- binder already holds, because then 'abstractFVars' would capture the wrong
+-- occurrences.  It cannot: a local is created fresh and filed under one key,
+-- so if a lookup in scope @p@ returned a local @x@ that is already somewhere in
+-- @p@'s own chain, @x@ would have been filed under a scope that is a descendant
+-- of @x@ -- and a descendant of @x@ is something that did not exist when @x@ was
+-- made.
+sharedLocal :: LEnv -> Binder -> Expr -> (Int -> Expr -> TC a) -> TC a
+sharedLocal env n raw k = do
+  p     <- TC $ \s -> pure (Right (tcScope s, s))
+  found <- TC $ \s -> do
+    x <- localIdLookup (tcLocalId s) p raw
+    pure (Right (x, s))
+  case found of
+    Just x  -> do (_, t') <- localInfo x
+                  withScope x (k x t')
+    Nothing -> do
+      t' <- closeIn env raw
+      x  <- freshFVar n t'
+      TC $ \s -> do
+        localIdInsert (tcLocalId s) p raw x
+        pure (Right ((), s))
+      withScope x (k x t')
 
 -- | Open a telescope, introducing one local per binder.  The telescope's types
 -- are in de Bruijn form relative to the preceding binders.
@@ -398,11 +506,11 @@ withLocals tele k = go [] tele
     go acc ((n, t) : ts) = do
       let t' = instN (map FVar acc) t
       x <- freshFVar n t'
-      go (x : acc) ts
+      withScope x (go (x : acc) ts)
 
 -- | Every universe parameter mentioned must have been declared.
 checkLevel :: Level -> TC ()
-checkLevel l = TC $ \s ->
+checkLevel l = TC $ \s -> pure $
   case [ p | p <- levelParamsOf l, p `notElem` tcLevelParams s ] of
     []      -> Right ((), s)
     (p : _) -> Left ("undeclared universe parameter " ++ showName p)
@@ -458,13 +566,17 @@ whnfRaw e = do
 
 -- | Is this the real reduction, rather than one under a speculative budget?
 unmeteredNow :: TC Bool
-unmeteredNow = TC $ \s -> Right (tcFuel s == unmetered, s)
+unmeteredNow = TC $ \s -> pure (Right (tcFuel s == unmetered, s))
 
 lookupWhnf :: Expr -> TC (Maybe Expr)
-lookupWhnf e = TC $ \s -> Right (memoLookup (tcWhnf s) whnfKey e, s)
+lookupWhnf e = TC $ \s -> do
+  v <- memoLookup (tcWhnf s) whnfKey e
+  pure (Right (v, s))
 
 insertWhnf :: Expr -> Expr -> TC ()
-insertWhnf k v = TC $ \s -> Right ((), s { tcWhnf = memoInsert whnfKey k v (tcWhnf s) })
+insertWhnf k v = TC $ \s -> do
+  memoInsert (tcWhnf s) whnfKey k v
+  pure (Right ((), s))
 
 -- | 'whnf' takes no 'LEnv' -- it is only ever called on closed terms, since the
 -- types inference hands out are closed -- so the environment half of the key is
@@ -511,7 +623,7 @@ unfoldDelta e = outOfFuel >>= \out -> if out then pure Nothing else do
         Just (CDef d) | length ls == length (defLevels d) -> do
           spend
           body <- instLevels (defLevels d) ls (defValue d)
-          pure (Just (mkApps body args))
+          pure (Just (betaApply body args))
         _ -> pure Nothing
     _ -> pure Nothing
 
@@ -993,9 +1105,9 @@ canonIndMatches c =
 -- while checking them can fail outright.  For a question of the form "may this
 -- shortcut be taken?" that is an answer.  State is rolled back on failure.
 attempt :: TC Bool -> TC Bool
-attempt (TC act) = TC $ \s -> case act s of
-  Left _ -> Right (False, s)
-  ok     -> ok
+attempt (TC act) = TC $ \s -> act s >>= \case
+  Left _ -> pure (Right (False, s))
+  ok     -> pure ok
 
 -- | Is @cn@ a constructor of the inductive type @tn@, with no universe
 -- parameters of its own beyond that type's, this many parameters and this many
@@ -1014,8 +1126,9 @@ isCtorOf env tn (cn, nps, nf) = case (lookupConst env tn, lookupConst env cn) of
 -- | Does this closed term check against this type?  A failure is an answer, not
 -- an error: the caller is asking whether an assumption holds, not relying on it.
 wellTyped :: Expr -> Expr -> TC Bool
-wellTyped e t = TC $ \s -> Right (either (const False) (const True)
-                                         (unTC (checkType e t) s), s)
+wellTyped e t = TC $ \s -> do
+  r <- unTC (checkType e t) s
+  pure (Right (either (const False) (const True) r, s))
 
 -- | Run a check once per environment and remember the answer.
 --
@@ -1024,12 +1137,12 @@ wellTyped e t = TC $ \s -> Right (either (const False) (const True)
 -- (Nothing currently does: the witnesses reduce only literal-free types.)
 cached :: (TCState -> Maybe Bool) -> (Maybe Bool -> TCState -> TCState)
        -> TC Bool -> TC Bool
-cached get put act = TC (\s -> Right (get s, s)) >>= \case
+cached get put act = TC (\s -> pure (Right (get s, s))) >>= \case
   Just b  -> pure b
   Nothing -> do
-    TC $ \s -> Right ((), put (Just False) s)
+    TC $ \s -> pure (Right ((), put (Just False) s))
     b <- act
-    TC $ \s -> Right ((), put (Just b) s)
+    TC $ \s -> pure (Right ((), put (Just b) s))
     pure b
 
 -- | 'cached', for a question asked about one name out of many.  Parking at
@@ -1037,14 +1150,14 @@ cached get put act = TC (\s -> Right (get s, s)) >>= \case
 -- they are establishing, and would otherwise ask themselves.
 cachedName :: (TCState -> Map Name Bool) -> (Map Name Bool -> TCState -> TCState)
            -> Name -> TC Bool -> TC Bool
-cachedName get put n act = TC (\s -> Right (M.lookup n (get s), s)) >>= \case
+cachedName get put n act = TC (\s -> pure (Right (M.lookup n (get s), s))) >>= \case
   Just b  -> pure b
   Nothing -> do
     note False
     b <- act
     note b
     pure b
-  where note b = TC $ \s -> Right ((), put (M.insert n b (get s)) s)
+  where note b = TC $ \s -> pure (Right ((), put (M.insert n b (get s)) s))
 
 -- | Decode a UTF-8 byte string into code points.
 utf8Chars :: B.ByteString -> [Integer]
@@ -1081,10 +1194,14 @@ isDefEq t0 s0
       if t == s then pure True else defEqLoop t s
 
 lookupEq :: Expr -> Expr -> TC (Maybe Bool)
-lookupEq a b = TC $ \s -> Right (eqLookup (tcDefEq s) a b, s)
+lookupEq a b = TC $ \s -> do
+  v <- eqLookup (tcDefEq s) a b
+  pure (Right (v, s))
 
 insertEq :: Expr -> Expr -> Bool -> TC ()
-insertEq a b v = TC $ \s -> Right ((), s { tcDefEq = eqInsert a b v (tcDefEq s) })
+insertEq a b v = TC $ \s -> do
+  eqInsert (tcDefEq s) a b v
+  pure (Right ((), s))
 
 defEqLoop :: Expr -> Expr -> TC Bool
 defEqLoop t s = do
@@ -1150,9 +1267,128 @@ trySortLit a b
     headIsCtorish e = case headOf e of Const{} -> True; _ -> False
 trySortLit _ _ = pure Nothing
 
+-- | Where a constant's result type lives.
+--
+-- @Just (n, ps, u)@ says the declared type is a telescope of @n@ binders, and
+-- that the body of that telescope -- the type of @c a1 .. an@ -- is a @Sort u@,
+-- with @u@ written in terms of the level parameters @ps@ the constant was
+-- declared over.  A use site substitutes its own level arguments into it.
+--
+-- Read off declared types only, without reducing anything, so @Nothing@ means
+-- /do not know/ rather than /no/.  Cached by name, because 'notAProof' asks
+-- about the same handful of heads millions of times.
+resultUniverse :: Name -> TC (Maybe ([Name], Level))
+resultUniverse n = do
+  cached <- TC $ \s -> pure (Right (M.lookup n (tcSortRes s), s))
+  case cached of
+    Just r  -> pure r
+    Nothing -> do
+      genv <- getEnv
+      let r = do ci       <- lookupConst genv n
+                 (ctx, b) <- Just (splitPis [] (constType ci))
+                 u        <- univOf genv univDepth ctx b
+                 pure (constLevels ci, u)
+      TC $ \s -> pure (Right ((), s { tcSortRes = M.insert n r (tcSortRes s) }))
+      pure r
+  where
+    splitPis ctx (Pi _ t b) = splitPis (t : ctx) b
+    splitPis ctx b          = (ctx, b)
+
+-- | How far 'univOf' will chase a head through other declarations' types.
+--
+-- A bound rather than a cycle check: the environment is built in dependency
+-- order, so a declaration's type cannot mention the declaration itself, and
+-- this only exists so that no amount of nesting can make the question
+-- expensive.
+univDepth :: Int
+univDepth = 8
+
+-- | @Just u@ when @e@ is a type living in universe @u@ -- when @e : Sort u@ --
+-- as far as the declared type of its head says, without reducing anything.
+--
+-- @ctx@ holds the types of the enclosing binders, innermost first, so that a
+-- 'BVar' head can be looked up.
+univOf :: Env -> Int -> [Expr] -> Expr -> Maybe Level
+univOf env d ctx e
+  | d <= 0    = Nothing
+  | otherwise = case e of
+      Sort u   -> Just (mkSucc u)
+      -- @(x : t) -> b : Sort (imax _ u)@, which is zero exactly when @u@ is.
+      Pi _ t b -> univOf env (d - 1) (t : ctx) b
+      _        -> case headOf e of
+        Const c ls -> do
+          ci     <- lookupConst env c
+          (_, u) <- teleSort env (d - 1) 0 (constType ci)
+          Just (instLevelParams (constLevels ci) ls u)
+        BVar i -> do
+          t      <- nth i ctx
+          (_, u) <- teleSort env (d - 1) 0 t
+          Just u
+        _ -> Nothing
+  where
+    nth _ []       = Nothing
+    nth 0 (x : _)  = Just x
+    nth k (_ : xs) = nth (k - 1 :: Int) xs
+
+-- | A telescope ending in a sort: how many binders, and which sort.
+--
+-- A definition standing between the two is unfolded, because the class
+-- hierarchy is full of binders declared @outParam (Type u)@ and an argument
+-- whose type is a type is exactly what has to be recognised here.
+teleSort :: Env -> Int -> Int -> Expr -> Maybe (Int, Level)
+teleSort env d !k e = case e of
+  Pi _ _ b -> teleSort env d (k + 1) b
+  Sort u   -> Just (k, u)
+  _ | d <= 0    -> Nothing
+    | otherwise -> case unApps e of
+        (Const c ls, as) -> do
+          ci <- lookupConst env c
+          v  <- case ci of CDef di -> Just (defValue di); _ -> Nothing
+          teleSort env (d - 1) k
+                   (betaApply (instLevelsE (constLevels ci) ls v) as)
+        _ -> Nothing
+
+-- | A term that is patently not a proof, decided without inferring its type.
+--
+-- \"Not a proof\" means the type of its type is not @Prop@.  A sort, a pi and a
+-- literal are ruled out on sight.  Beyond those, the question is settled by the
+-- declared type of the term's head: if @c@ is declared @forall x1 .. xn, T@ and
+-- 'univOf' can say that @T@ lives in a universe that is definitely not zero,
+-- then @c a1 .. ak : forall rest, T@ for @k <= n@ lives in @Sort (imax .. u)@,
+-- and an @imax@ whose right argument is nonzero is nonzero, so the term's type
+-- is not a proposition.
+--
+-- 'univOf' is what makes this worth having.  Reading @T@ for a syntactic @Sort@
+-- catches @Nat.le@ and @Eq@ but nothing that computes: the terms that actually
+-- turn up here are stuck arithmetic and stuck eliminators -- @Nat.mul a b@,
+-- @Int.casesOn motive i _ _@, @HAdd.hAdd _ _ _ inst a b@ -- whose declared
+-- result is an inductive type, a bound type variable, or a motive applied to
+-- its major premise.  Each of those has a universe that can still be read off
+-- without reduction, one indirection further in.
+--
+-- The point is that 'tryProofIrrel' is asked millions of times per hard
+-- declaration and answers @False@ essentially every time, because what it is
+-- being asked about is usually two /values/ being compared rather than two
+-- proofs -- and finding that out its own way costs two inferences and the
+-- reductions they set off.  A @True@ here has to be right; a @False@ only costs
+-- the slow route.
+notAProof :: Expr -> TC Bool
+notAProof e = case e of
+  Sort{}   -> pure True
+  Pi{}     -> pure True
+  NatLit{} -> pure True
+  StrLit{} -> pure True
+  _        -> case headOf e of
+    Const c ls -> resultUniverse c >>= \case
+      Just (ps, u) -> pure (isDefinitelyNonZero
+                              (if null ps then u else instLevelParams ps ls u))
+      Nothing      -> pure False
+    _ -> pure False
+
 -- | Proof irrelevance: any two proofs of the same proposition are equal.
 tryProofIrrel :: Expr -> Expr -> TC Bool
-tryProofIrrel t s = outOfFuel >>= \out -> if out then pure False else do
+tryProofIrrel t s = notAProof t >>= \no -> if no then pure False else
+                    outOfFuel >>= \out -> if out then pure False else do
   tt <- inferOnly t
   l  <- ensureSort =<< inferOnly tt
   if not (isDefinitelyZero l) then pure False else do
@@ -1492,13 +1728,18 @@ inferM m env e
       Let{} -> False; Proj{} -> False; _ -> True
 
 lookupInfer :: InferMode -> Int -> Expr -> TC (Maybe Expr)
-lookupInfer m ek e = TC $ \s ->
-  Right (memoLookup (if m == Verify then tcInferV s else tcInferA s) ek e, s)
+lookupInfer m ek e = TC $ \s -> do
+  v <- memoLookup (inferMemo m s) ek e
+  pure (Right (v, s))
 
 insertInfer :: InferMode -> Int -> Expr -> Expr -> TC ()
-insertInfer m ek k v = TC $ \s -> Right ((), case m of
-  Verify -> s { tcInferV = memoInsert ek k v (tcInferV s) }
-  Assume -> s { tcInferA = memoInsert ek k v (tcInferA s) })
+insertInfer m ek k v = TC $ \s -> do
+  memoInsert (inferMemo m s) ek k v
+  pure (Right ((), s))
+
+inferMemo :: InferMode -> TCState -> Memo
+inferMemo Verify = tcInferV
+inferMemo Assume = tcInferA
 
 inferCore :: InferMode -> LEnv -> Expr -> TC Expr
 inferCore m env e = case e of
@@ -1530,16 +1771,14 @@ inferCore m env e = case e of
                                        pure (inst1 a' cod)
   Lam n t b -> do
     when (m == Verify) (() <$ inferSortOfIn env t)
-    t' <- closeIn env t
-    withLocal n t' $ \x -> do
+    sharedLocal env n t $ \x t' -> do
       tb <- inferM m (x : env) b
       pure (Pi n t' (abstractFVars [x] tb))
   Pi n t b -> do
     -- Both sorts are part of the /result/, not a premise, so they are computed
     -- in either mode; only the recursive verification of @t@ and @b@ is dropped.
     l1 <- ensureSort =<< inferM m env t
-    t' <- closeIn env t
-    withLocal n t' $ \x -> do
+    sharedLocal env n t $ \x _ -> do
       l2 <- ensureSort =<< inferM m (x : env) b
       pure (Sort (mkIMax l1 l2))
   Let _ t v b -> do

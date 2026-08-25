@@ -354,6 +354,12 @@ memoAt ref d ex mk = do
       modifySTRef' ref (IM.insert key (ex, d, r))
       pure r
 
+-- | How many nodes a level substitution may visit before it is worth a memo
+-- table.  Larger than 'instBudget' because the terms are declared types and
+-- stored bodies rather than the small open terms beta reduction rewrites.
+levelBudget :: Int
+levelBudget = 512
+
 -- | How many nodes a substitution may visit before it is worth a memo table.
 --
 -- Small enough that the work thrown away on a miss is a rounding error, large
@@ -539,9 +545,41 @@ anyM f (x : xs) = f x >>= \b -> if b then pure True else anyM f xs
 -- rebuilding the path to its @Sort@s and @Const@s.
 instLevelsE :: [Name] -> [Level] -> Expr -> Expr
 instLevelsE [] _ e = e
-instLevelsE ps vs e0 = runST (newMemo >>= \ref -> go ref e0)
+instLevelsE ps vs e0
+  | (r, k) <- plain levelBudget e0, k >= 0 = r
+  | otherwise = runST (newMemo >>= \ref -> go ref e0)
   where
     sub = instLevelParams ps vs
+
+    -- As in 'instN': the plain recursion first, under a budget, because almost
+    -- every body this is asked about is a declared type of a few dozen nodes
+    -- and building a memo table for it costs more than the walk.  A negative
+    -- budget means the answer is unfinished and is thrown away.
+    plain !k ex
+      | k < 0     = (ex, k)
+      | otherwise = case ex of
+          Sort l        -> (let l' = sub l in if l' == l then ex else Sort l', k')
+          Const _ []    -> (ex, k')
+          Const n ls    -> (let ls' = map sub ls
+                            in if ls' == ls then ex else Const n ls', k')
+          App f a       -> let (f', k1) = plain k' f
+                               (a', k2) = plain k1 a
+                           in (if ptrEq f f' && ptrEq a a' then ex else App f' a', k2)
+          Lam n t b     -> let (t', k1) = plain k' t
+                               (b', k2) = plain k1 b
+                           in (if ptrEq t t' && ptrEq b b' then ex else Lam n t' b', k2)
+          Pi  n t b     -> let (t', k1) = plain k' t
+                               (b', k2) = plain k1 b
+                           in (if ptrEq t t' && ptrEq b b' then ex else Pi n t' b', k2)
+          Let n t v b   -> let (t', k1) = plain k' t
+                               (v', k2) = plain k1 v
+                               (b', k3) = plain k2 b
+                           in (if ptrEq t t' && ptrEq v v' && ptrEq b b'
+                                 then ex else Let n t' v' b', k3)
+          Proj s i b    -> let (b', k1) = plain k' b
+                           in (if ptrEq b b' then ex else Proj s i b', k1)
+          _             -> (ex, k')
+      where k' = k - 1
 
     go ref ex = case ex of
       Sort l        -> pure (let l' = sub l in if l' == l then ex else Sort l')
