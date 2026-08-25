@@ -360,6 +360,14 @@ outOfFuel = TC $ \s ->
   in do when out (bumpCounter (tcStarve s))
         pure (Right (out, s))
 
+-- | Is this call running outside every speculation?
+--
+-- 'tcFuel' is 'unmetered' outside one and stays so for the whole call -- 'spend'
+-- leaves it alone and 'speculate' puts it back -- so asking once, on entry, is
+-- enough.
+unmeteredNow :: TC Bool
+unmeteredNow = TC $ \s -> pure (Right (tcFuel s == unmetered, s))
+
 -- | A ticket that says how much reduction has been abandoned half-done.
 --
 -- 'whnf' remembers what it computed, and what it computes under a speculative
@@ -1318,6 +1326,22 @@ utf8Chars = go . map fromEnum . B.unpack
 
 -- Definitional equality -------------------------------------------------------
 
+-- | Conversion.
+--
+-- A @True@ is worth remembering however it was arrived at.  A @False@ is worth
+-- remembering only when the comparison that produced it was allowed to run to
+-- the end, which is what 'unmeteredNow' asks: inside a 'speculate', @False@
+-- means "not this way", and writing that down would answer a later caller's
+-- honest question with a dead end.
+--
+-- A nested speculation that declines does /not/ spoil an unmetered answer.
+-- 'sameHeadCongr' is the only rule that speculates, its refusal sends
+-- 'defEqLoop' round to unfold both sides, and unfolding preserves conversion --
+-- so the answer the unmetered call finally reaches is the one it would have
+-- reached with congruence, only later.  This is the whole difference between
+-- this guard and 'whnf''s: there, a starved reduction leaves a half-reduced
+-- /term/ behind, and remembering that really would cost a later caller the
+-- answer it was entitled to.
 isDefEq :: Expr -> Expr -> TC Bool
 isDefEq t0 s0
   | t0 == s0            = pure True
@@ -1325,10 +1349,9 @@ isDefEq t0 s0
   | otherwise = lookupEq t0 s0 >>= \case
       Just b  -> pure b
       Nothing -> do
-        before <- starving
-        b      <- decide
-        after  <- starving
-        when (b || before == after) (insertEq t0 s0 b)
+        full <- unmeteredNow
+        b    <- decide
+        when (b || full) (insertEq t0 s0 b)
         pure b
   where
     decide = outOfFuel >>= \out -> if out then pure False else do

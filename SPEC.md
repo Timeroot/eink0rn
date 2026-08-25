@@ -1233,10 +1233,38 @@ completeness and cannot cost acceptance of an unsound file — and to keep the
 completeness cost at nothing that matters, the two answers are filed on different
 terms. A `true` is recorded unconditionally: it was derived, and a derivation does
 not stop being one because the derivation was cheap. A `false` is recorded only
-when the starvation count of the previous paragraph did not move across the
-comparison, since a `false` reached by giving up says "not this way" and not "not
-equal". Entries are *read* under any budget: a remembered answer is at least as
-good as what the caller would have worked out for itself.
+when the comparison that produced it ran **outside every speculation**, since a
+`false` reached by giving up says "not this way" and not "not equal". Entries are
+*read* under any budget: a remembered answer is at least as good as what the
+caller would have worked out for itself.
+
+The starvation count of the previous paragraph is the wrong ticket here, and the
+difference is worth spelling out, because using it looks safer and is in fact
+ruinous. A speculation nested somewhere inside an unmetered comparison moves that
+count whenever it declines — and by §7.4 it declines *often*, since the allowance
+is meant to run dry on a hard declaration. Reading the count across the whole
+comparison therefore reports "someone, somewhere in here, gave up", which on a
+hard declaration is always, and the negative half of the table switches itself off
+for exactly the declarations it exists for. The observed cost of that is not a
+constant factor: one `Char` lemma in `init.ndjson` asked the same seven pairs of
+stuck terms about a million times each and never finished.
+
+The count means something for `whnf` and nothing here, and the reason is what the
+two calls leave behind. A starved reduction leaves a half-reduced *term*, and a
+caller handed it cannot tell; that is a real hazard and the count is the right
+guard for it. A declined speculation leaves only a `false`, and its caller reads
+that `false` as "unfold and ask again" — which it then does, and unfolding
+preserves conversion, so the answer the unmetered call finally reaches is the
+answer congruence would have given it, only later. What the enclosing comparison
+concluded is therefore its own conclusion and not a truncation of one.
+
+One exposure survives, and is stated rather than hidden. K-like reduction (§6.3)
+consults conversion to decide whether the major premise may be rebuilt, and a
+speculation that declines inside *that* comparison does change a reduct: `whnf`
+returns the eliminator unreduced. `whnf` will not remember that term, but an
+unmetered conversion that fails because of it will remember its `false`. This is
+the same completeness gap §7.4 already accepts — a starved speculation costs an
+unfolding — with the retry removed, and like the rest of §7.4 it can only decline.
 
 One consequence is worth noting, because it runs the safe way. A cached `false`
 is returned without spending the waste allowance the original comparison spent,
