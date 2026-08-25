@@ -225,38 +225,6 @@ peelPis = go []
         go (x : acc) (inst1 (FVar x) cod)
       res -> pure (reverse acc, res)
 
--- | Peel the shared parameter telescope off an arity or a constructor type,
--- substituting the block's parameter locals for it and requiring the binder
--- types to agree.
-peelSharedParams :: String -> Int -> [Int] -> Expr -> TC Expr
-peelSharedParams ctxt nps = go nps
-  where
-    go 0 _ ty = pure ty
-    go k (p : rest) ty = whnf ty >>= \case
-      Pi _ dom cod -> do
-        pt <- localType p
-        ok <- isDefEq dom pt
-        unless ok $
-          throwTC (ctxt ++ "parameter " ++ show (nps - k) ++ " has the wrong type")
-        go (k - 1) rest (inst1 (FVar p) cod)
-      _ -> throwTC (ctxt ++ "expected " ++ show nps ++ " parameter binders")
-    go _ [] _ = throwTC (ctxt ++ "parameter list exhausted")
-
--- | Recover a closed de Bruijn telescope from locals introduced in order.
-teleOf :: [Int] -> TC [(Binder, Expr)]
-teleOf xs = forM (zip [0 ..] xs) $ \(i, x) -> do
-  (n, t) <- localInfo x
-  pure (n, abstractFVars (take i xs) t)
-
-closePis, closeLams :: [Int] -> Expr -> TC Expr
-closePis  = closeWith Pi
-closeLams = closeWith Lam
-
-closeWith :: (Binder -> Expr -> Expr -> Expr) -> [Int] -> Expr -> TC Expr
-closeWith mk xs body = do
-  tele <- teleOf xs
-  pure (foldr (\(n, t) acc -> mk n t acc) (abstractFVars xs body) tele)
-
 -- | Open a recursive field's @xi@, handing the callback the locals and the
 -- indices @pi@ instantiated at them.
 withRecOcc :: RecOcc -> ([Int] -> [Expr] -> TC a) -> TC a

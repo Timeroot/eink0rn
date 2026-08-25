@@ -26,6 +26,10 @@ module Kernel.Check
   , freshFVar
   , localType
   , localInfo
+  , teleOf
+  , closePis
+  , closeLams
+  , peelSharedParams
   , checkLevel
   , getEnv
   , withEnv
@@ -606,6 +610,41 @@ withLocals tele k = go [] tele
       let t' = instN (map FVar acc) t
       x <- freshFVar n t'
       withScope x (go (x : acc) ts)
+
+-- | Recover a closed de Bruijn telescope from locals introduced in order.
+teleOf :: [Int] -> TC [(Binder, Expr)]
+teleOf xs = mapM one (zip [0 ..] xs)
+  where
+    one (i, x) = do
+      (n, t) <- localInfo x
+      pure (n, abstractFVars (take i xs) t)
+
+-- | Close a term over locals introduced in order, as a @Pi@ or @Lam@ telescope.
+closePis, closeLams :: [Int] -> Expr -> TC Expr
+closePis  = closeWith Pi
+closeLams = closeWith Lam
+
+closeWith :: (Binder -> Expr -> Expr -> Expr) -> [Int] -> Expr -> TC Expr
+closeWith mk xs body = do
+  tele <- teleOf xs
+  pure (foldr (\(n, t) acc -> mk n t acc) (abstractFVars xs body) tele)
+
+-- | Peel the shared parameter telescope off an arity or a constructor type,
+-- substituting the given parameter locals for it and requiring the binder types
+-- to agree.
+peelSharedParams :: String -> Int -> [Int] -> Expr -> TC Expr
+peelSharedParams ctxt nps = go nps
+  where
+    go 0 _ ty = pure ty
+    go k (p : rest) ty = whnf ty >>= \case
+      Pi _ dom cod -> do
+        pt <- localType p
+        ok <- isDefEq dom pt
+        unless ok $
+          throwTC (ctxt ++ "parameter " ++ show (nps - k) ++ " has the wrong type")
+        go (k - 1) rest (inst1 (FVar p) cod)
+      _ -> throwTC (ctxt ++ "expected " ++ show nps ++ " parameter binders")
+    go _ [] _ = throwTC (ctxt ++ "parameter list exhausted")
 
 -- | Every universe parameter mentioned must have been declared.
 checkLevel :: Level -> TC ()

@@ -20,6 +20,7 @@ module Kernel.Env
   , Env (..)
   , emptyEnv
   , lookupConst
+  , inductiveAt
   , addConst
   , constName
   , constLevels
@@ -31,6 +32,7 @@ module Kernel.Env
   ) where
 
 import qualified Data.IntMap.Strict as IM
+import qualified Data.Map.Strict as M
 import qualified Data.Set        as S
 import           Kernel.Expr
 import           Kernel.Name
@@ -217,13 +219,24 @@ data Env = Env
     -- consulted in exactly one place, "Front.Lower"'s barrier check; no rule of
     -- §5 or §6 looks at it, so an unsafe constant behaves as an opaque constant
     -- of its declared type wherever it is legal at all.
+  , envInternal :: !(S.Set Name)
+    -- ^ constants the checker invented, rather than read: the tag type and the
+    -- flat type that "Front.Lower"'s flattening of a mutual block builds
+    -- (SPEC.md §9.3).  They are ordinary constants in every other respect --
+    -- reduction and typing know nothing about this set -- but the file that is
+    -- being checked may not name one, or it would be reaching into a
+    -- construction that is supposed to be an implementation detail.
+  , envFlat     :: !(M.Map Name IndInfo)
+    -- ^ what a flattened member of a mutual block (SPEC.md §9.3) would have been
+    -- had it been admitted as an inductive type.  Read by 'inductiveAt' and by
+    -- nothing else.
   , envLicence  :: !Licences
     -- ^ what has already been established about this environment; a cache, in
     -- the sense that clearing it changes only how long the answer takes.
   }
 
 emptyEnv :: Env
-emptyEnv = Env IM.empty False AccelCanonical S.empty noLicences
+emptyEnv = Env IM.empty False AccelCanonical S.empty S.empty M.empty noLicences
 
 lookupConst :: Env -> Name -> Maybe ConstInfo
 lookupConst env n = IM.lookup (nameHash n) (envConsts env) >>= go
@@ -231,6 +244,22 @@ lookupConst env n = IM.lookup (nameHash n) (envConsts env) >>= go
     go (ci : rest) | constName ci == n = Just ci
                    | otherwise         = go rest
     go []                              = Nothing
+
+-- | The inductive type a name stands for, seeing through the flattening of a
+-- mutual block.
+--
+-- A flattened member is a definition, and every rule of the theory is entitled
+-- to see it as one: it reduces to an application of the flat type, and nothing
+-- in §5, §6 or §7 needs to know more than that.  The nesting compilation of §9
+-- is the exception, because it does not /use/ a container, it /copies/ one: it
+-- needs the arity and the constructors of the type the file declared, which the
+-- flattening spent.  So those are kept, and this is the only lookup that finds
+-- them.  A file that nests inside a member of a mutual block is then compiled
+-- exactly as it would have been without the fork.
+inductiveAt :: Env -> Name -> Maybe IndInfo
+inductiveAt env n = case lookupConst env n of
+  Just (CInd i) -> Just i
+  _             -> M.lookup n (envFlat env)
 
 -- | Declarations are write-once: a repeated name is a hard error, which is what
 -- rejects the @dup_*@ tests.
