@@ -1376,13 +1376,17 @@ isDefEq t0 s0
         when (b || full) (insertEq t0 s0 b)
         pure b
   where
-    -- A comparison the memo could not answer is a step.  Congruence descends
-    -- into arguments without reducing anything, so a budget that counted only
-    -- reduction would not bound it at all: a speculation could compare two
-    -- stuck spines against each other for as long as the spines were deep,
-    -- which on a machine-generated arithmetic proof is longer than anyone has.
+    -- Not charged against the budget.  Charging a step per comparison is
+    -- tempting -- congruence descends into arguments without reducing anything,
+    -- so the budget does not bound the descent -- and it is a bad trade: it is
+    -- deep spines of equal heads that congruence exists for, and a speculation
+    -- that runs out part-way down one sends 'defEqLoop' off to unfold both
+    -- heads instead, which is the expensive thing the rule was avoiding.  On
+    -- Mathlib's category theory that turns a four-minute file into one that
+    -- does not finish.  What the descent costs is bounded by the terms in front
+    -- of it; what reduction costs is not, which is why reduction is what the
+    -- budget counts.
     decide = outOfFuel >>= \out -> if out then pure False else do
-      spend
       t <- whnfCore t0
       s <- whnfCore s0
       if t == s then pure True else defEqLoop t s

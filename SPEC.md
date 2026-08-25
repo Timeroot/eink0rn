@@ -720,15 +720,21 @@ So a speculative comparison runs under a step budget (`tcFuel`), drawn from a
 running allowance for *wasted* work (`tcWaste`). When the budget runs out,
 reduction stops where it stands and the comparison answers `False`.
 
-A *step* is a reduction step — a beta, zeta, iota or projection rewrite, or a
-delta unfolding — and also **one conversion question the memo could not answer**.
-The last is easy to leave out and the omission is not a small one. Congruence
-descends into arguments without reducing anything, so a budget that counted only
-reduction would not bound congruence at all: a speculation could compare two
-stuck spines against each other for as long as the spines were deep, and on a
-machine-generated arithmetic proof that is longer than anyone has. Charging the
-question makes the budget bound the whole speculative subtree and not just its
-reductions.
+A *step* is a **reduction** step — a beta, zeta, iota or projection rewrite, or a
+delta unfolding — and nothing else. In particular the *descent* is free:
+congruence walks into arguments without reducing anything, and none of that is
+charged.
+
+That asymmetry is deliberate and was measured. Charging a step per comparison
+does bound the speculative subtree, and it bounds the wrong one: deep spines of
+equal heads are exactly what congruence exists for, and a speculation that runs
+out of budget part-way down one sends the loop off to unfold both heads instead —
+the expensive thing the rule was there to avoid. On Mathlib's category theory
+that is the difference between a file that checks in four minutes and one that
+does not finish. The principle behind the asymmetry is that what a descent costs
+is bounded by the terms in front of it, and shared subterms are compared once
+because the answer is remembered (§11.4), whereas what a reduction costs is
+bounded by nothing at all — one `Nat` numeral can ask for two billion steps.
 
 The allowance is **credited**, not fixed. A declaration opens with 50000 steps
 and earns one more for every eight reduction steps the checker performs outside a
