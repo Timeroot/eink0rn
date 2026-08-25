@@ -1605,15 +1605,34 @@ tryRigidSpine t s = do
   unfoldable <- isUnfoldableHead t
   if unfoldable then pure Nothing else trySpine t s
 
--- | Is the head of this application a definition the kernel may delta-unfold?
-isUnfoldableHead :: Expr -> TC Bool
-isUnfoldableHead e = case headOf e of
+-- | May delta take a step on this application, and at what priority?
+--
+-- \"May\" has to mean exactly what 'unfoldDelta' will do, which is why this
+-- looks at the arguments and not only at the head: an arithmetic application
+-- over a large numeral is /held/ (see 'natBlocked'), and a caller told that its
+-- head is a definition would keep being promised a reduction that never
+-- arrives.  A held application is therefore reported the same way a local
+-- constant or an axiom is -- as rigid -- which is also the right thing for
+-- 'tryRigidSpine', since congruence is the only rule left for it.
+deltaHead :: Expr -> TC (Maybe Hint)
+deltaHead e = case headOf e of
   Const n ls -> do
     env <- getEnv
-    pure $ case lookupConst env n of
-      Just (CDef d) -> length ls == length (defLevels d)
-      _             -> False
-  _ -> pure False
+    case lookupConst env n of
+      Just (CDef d) | length ls == length (defLevels d) -> do
+        -- The arguments are only wanted for the four operations that can be
+        -- held, and taking a spine apart is not free, so the cheap half of
+        -- 'natBlocked''s guard is repeated here rather than paid for everywhere.
+        held <- if n `elem` natSymOps
+                  then natBlocked n (snd (unApps e))
+                  else pure False
+        pure (if held then Nothing else Just (defPriority d))
+      _ -> pure Nothing
+  _ -> pure Nothing
+
+-- | Is the head of this application a definition the kernel may delta-unfold?
+isUnfoldableHead :: Expr -> TC Bool
+isUnfoldableHead e = maybe False (const True) <$> deltaHead e
 
 -- | The outcome of one round of lazy delta unfolding.
 --
@@ -1629,31 +1648,51 @@ data Delta = DEq | DGo Expr Expr | DStuck | DStarved
 -- definition however tall it is.  Nothing about which terms are convertible
 -- depends on the order -- when neither side wins, both are unfolded -- but a
 -- great deal about how long finding out takes.
+--
+-- The preferred side may decline: 'deltaHead' and 'unfoldDelta' agree on which
+-- applications are held, but not on whether the budget will still be there when
+-- the unfolding is asked for.  So a refusal falls through to the other side, and
+-- only a round in which neither side moved ends the loop.
 tryDelta :: Expr -> Expr -> TC Delta
 tryDelta t s = outOfFuel >>= \out -> if out then pure DStarved else do
-  ht <- headHeight t
-  hs <- headHeight s
+  ht <- deltaHead t
+  hs <- deltaHead s
   case (ht, hs) of
     (Nothing, Nothing) -> pure DStuck
-    (Just _,  Nothing) -> DGo <$> forceUnfold t <*> pure s
-    (Nothing, Just _)  -> DGo t <$> forceUnfold s
+    (Just _,  Nothing) -> leftFirst
+    (Nothing, Just _)  -> rightFirst
     (Just a,  Just b)
-      | a > b     -> DGo <$> forceUnfold t <*> pure s
-      | b > a     -> DGo t <$> forceUnfold s
+      | a > b     -> leftFirst
+      | b > a     -> rightFirst
       | otherwise -> do
           same <- sameHeadCongr t s
-          if same then pure DEq else DGo <$> forceUnfold t <*> forceUnfold s
+          if same then pure DEq else bothSides
   where
-    headHeight e = case headOf e of
-      Const n ls -> do
-        env <- getEnv
-        pure $ case lookupConst env n of
-          Just (CDef d) | length ls == length (defLevels d) -> Just (defPriority d)
-          _ -> Nothing
-      _ -> pure Nothing
-    forceUnfold e = unfoldDelta e >>= \case
-      Just e' -> pure e'
-      Nothing -> pure e
+    -- Every exit reports what actually happened.  Answering @DGo t s@ with the
+    -- terms it was handed would ask the caller to compare them again, which is
+    -- what it just did: 'defEqLoop' would spin.  So a round that unfolds
+    -- nothing is a round that ends, and the two reasons for unfolding nothing
+    -- are told apart -- 'DStarved' means the loop stops because the budget did,
+    -- 'DStuck' means there is nothing left to try.
+    leftFirst = unfoldDelta t >>= \case
+      Just t' -> pure (DGo t' s)
+      Nothing -> rightOnly
+    rightFirst = unfoldDelta s >>= \case
+      Just s' -> pure (DGo t s')
+      Nothing -> leftOnly
+    leftOnly = unfoldDelta t >>= \case
+      Just t' -> pure (DGo t' s)
+      Nothing -> nothingDoing
+    rightOnly = unfoldDelta s >>= \case
+      Just s' -> pure (DGo t s')
+      Nothing -> nothingDoing
+    bothSides = do
+      mt <- unfoldDelta t
+      ms <- unfoldDelta s
+      case (mt, ms) of
+        (Nothing, Nothing) -> nothingDoing
+        _ -> pure (DGo (maybe t id mt) (maybe s id ms))
+    nothingDoing = outOfFuel >>= \out -> pure (if out then DStarved else DStuck)
 
 -- | If both sides are the same constant applied to the same number of
 -- arguments, try comparing arguments pairwise.  A failure here is /not/

@@ -596,6 +596,14 @@ rather than delta-unfolding it. The two sides of a conversion are then compared
 argument by argument, which is what they were always going to have to be compared
 by.
 
+Held is a property of the *application*, not of the constant, and everything that
+asks "may delta take a step here" has to ask it of the application. A conversion
+that asked only about the head would be told that a definition was there for the
+unfolding, be handed the term back unchanged when it asked for the unfolding, and
+ask again — for ever, on a budget that never moves because nothing reduces. So a
+held application answers "no" to that question, exactly as a local constant or an
+axiom does, and §7 reads it as rigid throughout.
+
 Nothing about the theory changes. Declining to unfold removes reduction sequences
 and so can only remove conversions, never add them; every judgement the kernel
 still makes it made before. What the bound is a statement about is effort, and it
@@ -622,7 +630,8 @@ recurses the way the equations say, and unfolds it like anything else.
    *Definitive*.
 4. **Rigid spine congruence** — when the head is *not* a delta-unfoldable
    definition (a local, an axiom, a constructor, an inductive type, a stuck
-   recursor, a stuck projection), compare heads and arguments pairwise.
+   recursor, a stuck projection, or an arithmetic application the kernel has
+   declined to unfold, §6.5), compare heads and arguments pairwise.
    *Positive only*: failure falls through.
 5. **Proof irrelevance** — if `t`'s type is a proposition and `s`'s type is
    definitionally equal to it, `t ≡ s`. Preceded by the syntactic test of §7.5,
@@ -633,6 +642,20 @@ recurses the way the equations say, and unfolds it like anything else.
    that fails.
 7. When nothing can be unfolded, the **last resort** rules: projection
    congruence, structure eta, and unit-like eta.
+
+A round of step 6 that unfolds nothing is a round that ends the loop. This
+sounds like a restatement of step 7 and is in fact the only thing keeping the
+loop finite, because "the head is a definition" and "the definition will unfold"
+are two different questions: an arithmetic application over a large numeral has
+a definition for a head and is nevertheless held (§6.5). A round that answered
+"unfolded, carry on" while handing back the terms it was given would have the
+loop ask the identical question forever, on a budget that is never spent because
+nothing is reducing. So step 6 reports what it did rather than what it intended,
+a side that declines falls through to the other side, and only a round in which
+neither side moved stops. The rigid reading of a held application in step 4 is
+the other half of the same correction: a comparison that delta will not be
+allowed to advance should get the congruence rule that a rigid pair gets, and
+get it on the full budget rather than the speculative one.
 
 ### 7.1 Why this order
 
