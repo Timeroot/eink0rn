@@ -1716,8 +1716,24 @@ the name is checking a different statement, and will report a contradiction that
 is not in the file. Here `eink0rn` is not being lax: it is refusing to invent a
 definitional equality the file never asserted.
 
-*`eink0rn` rejects what a name-keyed kernel accepts.* Here the divergence is a
-timeout rather than a verdict. An operation whose licence does not check is not
+*`eink0rn` rejects what a name-keyed kernel accepts.* This happens two ways, and
+the first is what the whole discipline is for. Take the same file the other way
+round: it defines `Nat.add` as `fun _ _ => 0` and then asserts `Nat.add 2 3 = 5`,
+with `Eq.refl 5` as the proof. `eink0rn` checks the claim against the definition
+the file gave, finds `0` against `5`, and rejects. A kernel that keys the
+shortcut on the name computes `5` for the left-hand side and accepts — in an
+environment where that same left-hand side unfolds to `0`. What the file has then
+proved is `0 = 5`, and `Nat.noConfusion` turns that into `False`. The
+redefinition does not have to be as blatant as this one, and it does not have to
+be of `add`: the same file shape works for `sub`, `div`, `pow`, `beq` and `ble`,
+and all that is really required is that whatever fixes the meaning of the
+operation for the accelerator be something other than the environment the proof
+is checked against. §6.5 is precisely the demand that those two never come apart,
+and it is why this kernel can use machine arithmetic at all without also
+maintaining a list of names it trusts.
+
+The second way is a timeout rather than a verdict. An operation whose licence
+does not check is not
 accelerated and is unfolded instead, so a proof that a name-keyed kernel disposes
 of in a machine multiplication is checked the slow way, and on the numerals such
 proofs actually use it does not finish. `div` and `mod` are the interesting case,
@@ -1961,3 +1977,76 @@ it has no answer for `abbrev`.
 
 **Divergence.** None possible. Two runs that differ only in this field accept and
 reject exactly the same files.
+
+### 12.12 Nesting at a fixed index
+
+§9 compiles a nested occurrence away by specialising the container at the
+arguments it was actually applied to. Nothing in that construction asks where
+those arguments came from, and in particular it does not ask that the block
+member appear at the family's own index variables. So an indexed family that
+nests itself at a *constant* index —
+
+```
+T : Nat -> Type
+T.leaf : T 0
+T.node : (n : Nat) -> List (T 0) -> T 0
+```
+
+— is compiled exactly as a nested occurrence at a variable index would be. §9.1
+discovers `List (T 0)` (the container's parameter is closed with respect to bound
+variables, and a member occurs in it), adds one auxiliary member for it with
+`nil`- and `cons`-shaped constructors, and rewrites `T.node`'s field to mention
+the auxiliary. What reaches §8 is the flat mutual block `T` together with that
+auxiliary. Its `cons` field is `T 0`: a recursive occurrence of a block member,
+applied to an index in which no member of the block occurs, which is exactly and
+all that §8.4 asks. The block is strictly positive, it is admitted with no
+special case, and the two recursors the file declares are checked against the two
+the construction derives.
+
+The soundness argument is §9.2's, unchanged, because the construction is
+unchanged. The auxiliary is an ordinary inductive type — `List` specialised at
+one closed type — the flat block is an ordinary mutual inductive, and the
+recursor is the one §8.7 derives from that block, re-typechecked in the final
+environment by §9.1's last step.
+A constant index is not a weaker input to any of this than a variable one; if
+anything it is a more specific one.
+
+The divergence, then, is permissive and this kernel is on the right side of it:
+files of this shape are sound and are accepted. A nesting compiler that
+recognises the occurrence only when the member appears applied to the family's
+own indices sees `T 0` as something other than the family and refuses. `eink0rn`
+never needs that recognition, because it never re-uses the container's own
+recursor for the specialised copy — it builds a fresh member and derives
+everything about it from scratch.
+
+One detail of the same family is worth naming separately, because it is a
+divergence about equality rather than about nesting. A constructor may state its
+result index as a closed term that is only *convertible* to the index the
+recursor's minor premises use — `T.node ... : T (List.length [])` against a
+recursor written at `T 0`. §8.4 asks only that no member of the block occur in
+the index, so the constructor is analysed as written; the derived recursor
+carries `List.length []` where the export carries `0`; and §8.8 compares the two
+up to definitional equality, which is what the rest of this kernel does
+everywhere else and what makes the comparison meaningful rather than syntactic.
+
+### 12.13 A proof is not a constructor
+
+`Acc r a` is a proposition, so by §7's proof irrelevance any two of its
+inhabitants are convertible, and it is tempting to let a *variable* proof
+`a : Acc r n` stand in for a constructor application `Acc.intro n h` and so let
+`Acc.rec` fire on it. This kernel does not. §6.3 lists the three ways a
+non-constructor major premise becomes usable and `Acc` qualifies for none of
+them: its recursor is not `k`-like, and the type is recursive, which rules out
+eta on the major premise for the termination reason given there. A definition by
+well-founded recursion therefore does not unfold when applied to a proof whose
+shape it cannot see, and a file that asks for `f 1 a = f 0 (Acc.inv a h)` to hold
+by `Eq.refl`, with `a` a bound variable, is rejected.
+
+This is the restrictive direction, and the restriction is the right one. Firing
+the rule would mean inventing the constructor's fields — here the `h` that
+`Acc.intro` carries — and different inventions compute different results.
+Irrelevance makes the proofs *equal*; it does not make them *known*, and a
+recursor eliminating out of `Prop` (§8.5) is precisely a place where the
+difference is observable. Well-founded definitions still compute wherever their
+`Acc` argument is a closed term, which is every place in the arena corpus where
+one is asked to.
