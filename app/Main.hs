@@ -17,7 +17,8 @@ import           Numeric               (showFFloat)
 import           System.Environment    (getArgs, getProgName)
 import           System.Exit           (ExitCode (..), exitFailure, exitSuccess,
                                         exitWith)
-import           System.IO             (char8, hPutStrLn, hSetEncoding, stderr,
+import           System.IO             (BufferMode (..), char8, hPutStrLn,
+                                        hSetBuffering, hSetEncoding, stderr,
                                         stdout)
 
 -- | How a failed @--pin-std@ audit is reported.
@@ -109,6 +110,9 @@ main = do
   -- byte-transparent handle is the whole fix; everything the checker writes
   -- itself is ASCII.
   mapM_ (`hSetEncoding` char8) [stdout, stderr]
+  -- @--progress@ is only useful if it arrives while the run is still going, and
+  -- a redirected handle blocks by default.
+  hSetBuffering stderr LineBuffering
   args <- getArgs
   prog <- getProgName
   case parseArgs args of

@@ -61,6 +61,7 @@ data TCState = TCState
   , tcInferV      :: !Memo     -- ^ memo for 'inferM' @Verify@; see 'Memo'
   , tcInferA      :: !Memo     -- ^ memo for 'inferM' @Assume@
   , tcWhnf        :: !Memo     -- ^ memo for 'whnf'
+  , tcDefEq       :: !EqMemo   -- ^ memo for 'isDefEq'; see 'EqMemo'
   , tcLevelInst   :: !LevelMemo -- ^ memo for 'instLevels'
   , tcNatOk       :: !(Maybe Bool)  -- ^ cached 'natShapeOk'; see 'expandLit'
   , tcStrOk       :: !(Maybe Bool)  -- ^ cached 'strShapeOk'
@@ -119,6 +120,52 @@ memoInsert :: Int -> Expr -> Expr -> Memo -> Memo
 memoInsert ek k v =
   IM.insertWith (\new old -> head new : take 7 old)
                 (hashMix (exprHash k) ek) [(k, ek, v)]
+
+-- | A memo on /pairs/ of term nodes: what 'isDefEq' last answered about them.
+--
+-- Keyed and matched exactly as 'Memo' is, on node identity rather than on
+-- structure, and symmetrically: the key mixes the two hashes in an order that
+-- does not depend on which side is which, and a hit accepts the entry either way
+-- round.  Conversion is symmetric, so half the questions are the other half
+-- asked backwards.
+--
+-- Sound to consult under any budget, and that is worth spelling out, because a
+-- @False@ here is not always the last word.  Every @True@ was produced by the
+-- rules of SPEC.md §6 and stays true however much or little reduction preceded
+-- it, so replaying one is replaying a proof.  A @False@ can only ever /decline/:
+-- it makes a check fail, and a check that fails rejects the file.  So the table
+-- can cost completeness and cannot cost soundness -- and to keep the
+-- completeness cost at nothing that matters, entries are written only from a
+-- call that ran unmetered, never from inside a 'speculate' where @False@ means
+-- no more than "not this way".
+type EqMemo = IntMap [(Expr, Expr, Bool)]
+
+-- | Symmetric in its arguments, as conversion is.
+eqKey :: Expr -> Expr -> Int
+eqKey a b = let x = exprHash a; y = exprHash b
+            in hashMix (min x y) (max x y)
+
+eqLookup :: EqMemo -> Expr -> Expr -> Maybe Bool
+eqLookup m a b = IM.lookup (eqKey a b) m >>= go
+  where
+    go ((x, y, v) : rest)
+      | ptrEq x a && ptrEq y b = Just v
+      | ptrEq x b && ptrEq y a = Just v
+      | otherwise              = go rest
+    go []                      = Nothing
+
+eqInsert :: Expr -> Expr -> Bool -> EqMemo -> EqMemo
+eqInsert a b v =
+  IM.insertWith (\new old -> head new : take 7 old) (eqKey a b) [(a, b, v)]
+
+-- | Is a comparison of these two worth a table lookup?
+--
+-- Anything whose head is not an application or a projection is settled by
+-- 'isDefEq'\'s own first line or by one look at a constructor, and remembering
+-- that costs more than redoing it.
+eqWorthMemo :: Expr -> Expr -> Bool
+eqWorthMemo a b = big a && big b
+  where big e = case e of App{} -> True; Proj{} -> True; _ -> False
 
 -- | A memo on (stored body, universe arguments) pairs; see 'instLevels'.
 type LevelMemo = IntMap [(Expr, [Level], Expr)]
@@ -182,7 +229,7 @@ runTCLearn env lps (TC f) =
   fmap readLicences <$>
     f (seedLicences env
         (TCState env IM.empty 0 lps unmetered wasteBudget
-                 IM.empty IM.empty IM.empty IM.empty
+                 IM.empty IM.empty IM.empty IM.empty IM.empty
                  Nothing Nothing M.empty M.empty))
 
 throwTC :: String -> TC a
@@ -291,7 +338,8 @@ getEnv = TC $ \s -> Right (tcEnv s, s)
 setLevelParams :: [Name] -> TC ()
 setLevelParams lps = TC $ \s ->
   Right ((), s { tcLevelParams = lps
-               , tcInferV = IM.empty, tcInferA = IM.empty, tcWhnf = IM.empty })
+               , tcInferV = IM.empty, tcInferA = IM.empty, tcWhnf = IM.empty
+               , tcDefEq = IM.empty })
 
 freshFVar :: Binder -> Expr -> TC Int
 freshFVar n t = TC $ \s ->
@@ -334,7 +382,8 @@ setEnv env = TC $ \s ->
                s { tcEnv    = env
                  , tcInferV = IM.empty
                  , tcInferA = IM.empty
-                 , tcWhnf   = IM.empty })
+                 , tcWhnf   = IM.empty
+                 , tcDefEq  = IM.empty })
 
 -- | Introduce a local constant of the given type and run an action with it.
 withLocal :: Binder -> Expr -> (Int -> TC a) -> TC a
@@ -1016,11 +1065,26 @@ utf8Chars = go . map fromEnum . B.unpack
 
 isDefEq :: Expr -> Expr -> TC Bool
 isDefEq t0 s0
-  | t0 == s0  = pure True
-  | otherwise = outOfFuel >>= \out -> if out then pure False else do
+  | t0 == s0            = pure True
+  | not (eqWorthMemo t0 s0) = decide
+  | otherwise = lookupEq t0 s0 >>= \case
+      Just b  -> pure b
+      Nothing -> do
+        b    <- decide
+        real <- unmeteredNow
+        when real (insertEq t0 s0 b)
+        pure b
+  where
+    decide = outOfFuel >>= \out -> if out then pure False else do
       t <- whnfCore t0
       s <- whnfCore s0
       if t == s then pure True else defEqLoop t s
+
+lookupEq :: Expr -> Expr -> TC (Maybe Bool)
+lookupEq a b = TC $ \s -> Right (eqLookup (tcDefEq s) a b, s)
+
+insertEq :: Expr -> Expr -> Bool -> TC ()
+insertEq a b v = TC $ \s -> Right ((), s { tcDefEq = eqInsert a b v (tcDefEq s) })
 
 defEqLoop :: Expr -> Expr -> TC Bool
 defEqLoop t s = do
@@ -1083,7 +1147,7 @@ trySortLit a b
     isLit NatLit{} = True
     isLit StrLit{} = True
     isLit _        = False
-    headIsCtorish e = case fst (unApps e) of Const{} -> True; _ -> False
+    headIsCtorish e = case headOf e of Const{} -> True; _ -> False
 trySortLit _ _ = pure Nothing
 
 -- | Proof irrelevance: any two proofs of the same proposition are equal.
@@ -1142,7 +1206,7 @@ proofErasable = go (0 :: Int)
       Pi n dom body -> withLocal n dom $ \x -> go (k + 1) (instantiateBody x body)
       _ -> do
         env <- getEnv
-        pure $ case fst (unApps ty') of
+        pure $ case headOf ty' of
           Const n _ | Just (CInd i) <- lookupConst env n ->
             null (indCtors i) || not (indLargeElim i) || indK i
           _ -> False
@@ -1164,7 +1228,7 @@ tryRigidSpine t s = do
 
 -- | Is the head of this application a definition the kernel may delta-unfold?
 isUnfoldableHead :: Expr -> TC Bool
-isUnfoldableHead e = case fst (unApps e) of
+isUnfoldableHead e = case headOf e of
   Const n ls -> do
     env <- getEnv
     pure $ case lookupConst env n of
@@ -1201,7 +1265,7 @@ tryDelta t s = outOfFuel >>= \out -> if out then pure DStarved else do
           same <- sameHeadCongr t s
           if same then pure DEq else DGo <$> forceUnfold t <*> forceUnfold s
   where
-    headHeight e = case fst (unApps e) of
+    headHeight e = case headOf e of
       Const n ls -> do
         env <- getEnv
         pure $ case lookupConst env n of
@@ -1283,7 +1347,7 @@ tryStructEta t s = withFuel $ do
       , length as == ctorNumParams ci + ctorNumFields ci
       , ctorNumFields ci > 0 -> do
           sTy <- inferOnly s >>= whnf
-          case fst (unApps sTy) of
+          case headOf sTy of
             Const tn _ | tn == ctorInduct ci -> do
               let fields = drop (ctorNumParams ci) as
               b <- allM (\(i, f) -> isDefEq f (Proj tn i s)) (zip [0 ..] fields)
@@ -1296,7 +1360,7 @@ tryUnitLike :: Expr -> Expr -> TC (Maybe Bool)
 tryUnitLike t s = withFuel $ do
   env <- getEnv
   tTy <- inferOnly t >>= whnf
-  case fst (unApps tTy) of
+  case headOf tTy of
     Const tn _
       | isStructureLike env tn
       , Just ci <- ctorOfStructure env tn

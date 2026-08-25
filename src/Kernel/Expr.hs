@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns     #-}
 {-# LANGUAGE MagicHash        #-}
 {-# LANGUAGE PatternSynonyms  #-}
 -- | Core expressions.
@@ -36,7 +37,7 @@ module Kernel.Expr
   , exprHash
   , ptrEq
   -- * Construction
-  , mkApps, unApps, unAppsN
+  , mkApps, unApps, unAppsN, headOf
   , mkPis, mkLams, unPis, unPisN, unLamsN
   , mkArrow
   -- * de Bruijn plumbing
@@ -270,6 +271,15 @@ unApps = go []
   where go acc (App f a) = go (a : acc) f
         go acc e         = (e, acc)
 
+-- | The head of a spine, without building the list of arguments.
+--
+-- @fst . unApps@ says the same thing and allocates a cons cell per argument to
+-- do it.  Several of the hottest questions the checker asks -- is this head a
+-- definition, what is the conclusion of this telescope -- want only the head.
+headOf :: Expr -> Expr
+headOf (App f _) = headOf f
+headOf e         = e
+
 -- | Like 'unApps' but keeps at most @n@ arguments, leaving the rest applied to
 -- the head.  Used when a spine is longer than a reduction rule expects.
 unAppsN :: Int -> Expr -> (Expr, [Expr])
@@ -344,6 +354,13 @@ memoAt ref d ex mk = do
       modifySTRef' ref (IM.insert key (ex, d, r))
       pure r
 
+-- | How many nodes a substitution may visit before it is worth a memo table.
+--
+-- Small enough that the work thrown away on a miss is a rounding error, large
+-- enough that a table is only built when there is real sharing to exploit.
+instBudget :: Int
+instBudget = 64
+
 -- de Bruijn plumbing ----------------------------------------------------------
 
 -- | @liftE d k e@ adds @k@ to every bound variable of @e@ with index @>= d@.
@@ -371,13 +388,51 @@ liftE d0 k e0
 
 -- | @instN vs e@ substitutes @vs !! i@ for @BVar i@ (for @i < length vs@) and
 -- lowers the remaining indices by @length vs@.
+--
+-- Every beta step goes through here, and the great majority of them rewrite a
+-- handful of nodes: one bound variable inside the two or three that mention it.
+-- Setting up a memo table for that costs more than the substitution.  So the
+-- plain recursion is tried first under a visit budget, and the memoised
+-- traversal is kept in reserve for the terms that need it -- the ones whose
+-- sharing would make the plain recursion exponential, which is exactly what
+-- running out of budget detects.  Both compute the same term; only the sharing
+-- of the result differs, and below 'instBudget' nodes there is nothing to share.
 instN :: [Expr] -> Expr -> Expr
 instN [] e = e
 instN vs e0
   | looseBVarRange e0 == 0 = e0
+  | (r, k) <- plain instBudget 0 e0, k >= 0 = r
   | otherwise = runST (newMemo >>= \ref -> go ref 0 e0)
   where
     n = length vs
+
+    -- Returns the rewritten node and what is left of the budget; a negative
+    -- budget means the answer is unfinished and must be thrown away.
+    plain !k !d ex
+      | k < 0                  = (ex, k)
+      | looseBVarRange ex <= d = (ex, k)
+      | otherwise = case ex of
+          BVar i
+            | i < d + n   -> (liftE 0 d (vs !! (i - d)), k')
+            | otherwise   -> (BVar (i - n), k')
+          App f a       -> let (f', k1) = plain k' d f
+                               (a', k2) = plain k1 d a
+                           in (App f' a', k2)
+          Lam nm t b    -> let (t', k1) = plain k' d t
+                               (b', k2) = plain k1 (d + 1) b
+                           in (Lam nm t' b', k2)
+          Pi  nm t b    -> let (t', k1) = plain k' d t
+                               (b', k2) = plain k1 (d + 1) b
+                           in (Pi nm t' b', k2)
+          Let nm t v b  -> let (t', k1) = plain k' d t
+                               (v', k2) = plain k1 d v
+                               (b', k3) = plain k2 (d + 1) b
+                           in (Let nm t' v' b', k3)
+          Proj s i b    -> let (b', k1) = plain k' d b
+                           in (Proj s i b', k1)
+          _             -> (ex, k')
+      where k' = k - 1
+
     go ref d ex
       -- Nothing at or above @d@ occurs, so there is neither anything to
       -- substitute nor anything to lower.
@@ -445,10 +500,7 @@ occursConst n e0 = runST (newMemo >>= \ref -> go ref e0)
 --
 -- @Proj@ carries the structure's name as well as its subterm, and that name is
 -- included: it is a reference to a declaration exactly as a 'Const' node is,
--- and a caller asking \"what does this term depend on?\" needs it.  (The only
--- other caller, 'Kernel.Env.computeHeight', is unaffected either way -- a
--- projection's structure is an inductive type, never a definition with a
--- height.)
+-- and a caller asking \"what does this term depend on?\" needs it.
 constsOf :: Expr -> S.Set Name
 constsOf e0 = runST (newMemo >>= \ref -> go ref e0)
   where

@@ -183,10 +183,10 @@ Declarations are **write-once**: re-declaring a name is a hard error. Every
 constant's type is checked to be a well-formed type (`inferSortOf`) before it is
 admitted, and every definition's value is checked against its type.
 
-Definitions carry a *height* (`1 + max` of the heights of the definitions their
-value mentions). This is computed from the environment, never read from the
-input, and is used only to decide which of two constants to unfold first. It
-cannot affect what is convertible — only how fast the kernel notices.
+Definitions carry an unfolding *priority*, read from the export's `hints` field
+(§12.11) and used only to decide which of two constants to unfold first. It
+cannot affect what is convertible — only how fast the kernel notices — which is
+why it is the one field the kernel takes from the file without checking it.
 
 ---
 
@@ -1019,6 +1019,16 @@ than on its tree unfolding:
 Both are maintained by pattern synonyms, so nothing outside `Kernel.Expr` can set
 a cache to a lie.
 
+Each traversal also builds a memo table on the nodes it visits, so that a shared
+node is rewritten once rather than once per path to it, and so that the *result*
+is a graph too. Substitution is the exception, and only in how it starts: almost
+every beta step rewrites a handful of nodes, and setting up a table for that costs
+more than the substitution, so the plain recursion is tried first under a visit
+budget and the memoised traversal is kept for the terms that exceed it. Exceeding
+the budget is exactly the symptom of the sharing that makes a table worth having.
+The two compute the same term; they differ only in how much of the *result* is
+shared, and below the budget there is nothing to share.
+
 ### 11.4 Memoisation keys
 
 Inference and `whnf` are memoised on `(node, local environment)`, keyed by hash and
@@ -1057,6 +1067,30 @@ and no later caller is handed a result computed with less than it had itself.
 (In the other direction there is nothing to protect against. A cached result
 that is *more* reduced than a caller could have managed is still reached by
 reduction steps, so it is a correct answer, just a better one.)
+
+Conversion is memoised too, on **pairs** of nodes, and symmetrically: the key
+mixes the two hashes in an order that does not depend on which side is which, and
+a hit is accepted either way round, because §7's relation is symmetric and half
+the questions asked of it are the other half asked backwards. Only pairs whose
+sides are both applications or projections are filed, since anything else is
+settled by a pointer test or by one look at a head.
+
+This table is the one place where a *negative* answer is remembered, so it is
+worth saying why that cannot cost soundness. Every `true` in it was produced by
+the rules of §7 and stays true however much or little reduction preceded it, so
+replaying one replays a derivation. A `false` can only ever *decline*: it makes
+some check fail, and a check that fails rejects the file. So the table can cost
+completeness and cannot cost acceptance of an unsound file — and to keep the
+completeness cost at nothing that matters, an entry is written only from a
+comparison that ran unmetered, never from inside a speculation (§7.4), where
+`false` means no more than "not this way". Entries are *read* under any budget:
+a remembered answer is the answer the unmetered comparison gave, which is at
+least as good as what the starved caller would have worked out for itself.
+
+One consequence is worth noting, because it runs the safe way. A cached `false`
+is returned without spending the waste allowance the original comparison spent,
+so later speculations have more budget than they would have had, and the checker
+becomes *more* complete than an uncached run, never less.
 
 Without these memos, inference and reduction run over the term's tree unfolding,
 which for a shared term is exponentially larger than the term. In practice the

@@ -29,7 +29,7 @@ module Kernel.Env
   , ctorOfStructure
   ) where
 
-import qualified Data.Map.Strict as M
+import qualified Data.IntMap.Strict as IM
 import qualified Data.Set        as S
 import           Kernel.Expr
 import           Kernel.Name
@@ -197,7 +197,12 @@ noLicences :: Licences
 noLicences = Licences False False S.empty S.empty
 
 data Env = Env
-  { envConsts   :: !(M.Map Name ConstInfo)
+  { envConsts   :: !(IM.IntMap [ConstInfo])
+    -- ^ keyed by 'nameHash', with a bucket per hash.  Every reduction step asks
+    -- this table what a constant is, and a tree keyed on 'Name' answers with
+    -- some seventeen calls to 'compare'; keyed on the hash the same seventeen
+    -- steps are primitive integer tests, and only the handful of names in the
+    -- surviving bucket are compared properly.  See 'lookupConst'.
   , envQuotInit :: !Bool
   , envAccel    :: !AccelMode
     -- ^ constant for the life of a run; it lives here because the accelerated
@@ -217,17 +222,22 @@ data Env = Env
   }
 
 emptyEnv :: Env
-emptyEnv = Env M.empty False AccelCanonical S.empty noLicences
+emptyEnv = Env IM.empty False AccelCanonical S.empty noLicences
 
 lookupConst :: Env -> Name -> Maybe ConstInfo
-lookupConst env n = M.lookup n (envConsts env)
+lookupConst env n = IM.lookup (nameHash n) (envConsts env) >>= go
+  where
+    go (ci : rest) | constName ci == n = Just ci
+                   | otherwise         = go rest
+    go []                              = Nothing
 
 -- | Declarations are write-once: a repeated name is a hard error, which is what
 -- rejects the @dup_*@ tests.
 addConst :: Env -> ConstInfo -> Either String Env
 addConst env ci
-  | M.member n (envConsts env) = Left ("duplicate declaration: " ++ showName n)
-  | otherwise = Right env { envConsts = M.insert n ci (envConsts env) }
+  | Just _ <- lookupConst env n = Left ("duplicate declaration: " ++ showName n)
+  | otherwise = Right env
+      { envConsts = IM.insertWith (++) (nameHash n) [ci] (envConsts env) }
   where n = constName ci
 
 -- | Eligible for eta and for @Expr.proj@: exactly one constructor, no indices,
