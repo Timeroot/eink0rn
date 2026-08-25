@@ -1771,6 +1771,7 @@ lastResort :: Expr -> Expr -> TC Bool
 lastResort t s = do
   m <- firstJustM
     [ tryProjCongr t s
+    , tryNatOffset t s
     , tryStructEta t s
     , tryStructEta s t
     , tryUnitLike t s
@@ -1807,6 +1808,81 @@ tryProjCongr (Proj n1 i1 s1) (Proj n2 i2 s2)
       b <- isDefEq s1 s2
       pure (if b then Just True else Nothing)
 tryProjCongr _ _ = pure Nothing
+
+-- | Two numerals offset from the same term: @Nat.succ (x + ⌜k⌝)@ against
+-- @x + ⌜k+1⌝@.
+--
+-- This is the conversion §6.5's held numeral takes away, and it is not the
+-- exotic one that section expected to lose.  @Char@'s bounds proofs are full of
+-- it: a lemma states @x + ⌜57344⌝ + ⌜1⌝ ≤ ⌜1114112⌝@ and is used where
+-- @x + ⌜57345⌝ ≤ ⌜1114112⌝@ is wanted.  Reduction gets the first to
+-- @Nat.succ (x + ⌜57344⌝)@ -- the outer @+1@ is small enough to unfold -- and
+-- there it stops, because the second is over a numeral too large to unfold and
+-- is held.  One side is a successor, the other is an addition, and no congruence
+-- rule relates them.
+--
+-- So relate them by what they are: both sides are read as a base term and a
+-- numeral offset, and two such are convertible when the offsets agree and the
+-- bases do.  The two equations that makes this a derivation rather than a guess
+-- -- @x + 0 ≡ x@ and @x + succ y ≡ succ (x + y)@ -- are the ones 'natOpOk' has
+-- already checked against this file's own @Nat.add@, so the rule is only offered
+-- where that licence holds; without it @Nat.add@ is not held in the first place
+-- and reduction handles the pair on its own.
+--
+-- Only offered when one of the two /is/ held, which is the only way this pair
+-- reaches a stuck comparison at all.  That keeps the reading off every other
+-- last-resort comparison, and it is also what makes the rule cheap: it is
+-- undoing a specific refusal, in the one place that refusal shows.
+tryNatOffset :: Expr -> Expr -> TC (Maybe Bool)
+tryNatOffset t s = do
+  ht <- heldSide t
+  hs <- if ht then pure True else heldSide s
+  if not (ht || hs) then pure Nothing else natOpOk nameNatAdd >>= \ok ->
+    if not ok then pure Nothing else do
+      (bt, kt) <- natOffset t
+      (bs, ks) <- natOffset s
+      -- Offsets of zero are two terms with no arithmetic in them, which is
+      -- every other rule's business and not this one's.
+      if kt /= ks || kt == 0 then pure Nothing else do
+        b <- isDefEq bt bs
+        pure (if b then Just True else Nothing)
+  where
+    heldSide e = case unApps e of
+      (Const n _, args) -> natBlocked n args
+      _                 -> pure False
+
+-- | Read a term as @base + k@ with @k@ a numeral, reducing as far as it takes to
+-- see the shape.
+--
+-- Reducing is the point.  The terms this is asked about have had their heads
+-- normalised and nothing else, so the first thing under a @Nat.succ@ is
+-- typically an unreduced @HAdd.hAdd@ tower with the interesting numeral several
+-- instance projections down.  Each layer is therefore 'whnf'\'d before it is
+-- read, which stops of its own accord at the held application this rule exists
+-- to look inside.
+--
+-- The walk is bounded for the same reason 'natShape'\'s is: nothing stops a term
+-- from being a successor tower deeper than anyone wants to count, and giving up
+-- costs only this rule on this pair.
+natOffset :: Expr -> TC (Expr, Integer)
+natOffset = go offsetWalk 0
+  where
+    go :: Int -> Integer -> Expr -> TC (Expr, Integer)
+    go !d !acc e0 = do
+      e <- whnf e0
+      if d <= 0 then pure (e, acc) else case unApps e of
+        (Const c [], [])     | c == nameNatZero -> pure (NatLit 0, acc)
+        (Const c [], [a])    | c == nameNatSucc -> go (d - 1) (acc + 1) a
+        (Const c [], [a, b]) | c == nameNatAdd  -> natShape b >>= \case
+            NSLit k -> go (d - 1) (acc + k) a
+            _       -> pure (e, acc)
+        _ -> case e of
+          NatLit v | v >= 0 -> pure (NatLit 0, acc + v)
+          _                 -> pure (e, acc)
+
+-- | How many @+ ⌜k⌝@ and @Nat.succ@ layers 'natOffset' will read through.
+offsetWalk :: Int
+offsetWalk = 256
 
 -- | If one side is a constructor application of a structure, expand the other
 -- side into one via projections.

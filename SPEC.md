@@ -623,12 +623,20 @@ axiom does, and §7 reads it as rigid throughout.
 
 Nothing about the theory changes. Declining to unfold removes reduction sequences
 and so can only remove conversions, never add them; every judgement the kernel
-still makes it made before. What the bound is a statement about is effort, and it
-is placed where the trade is one-sided: below it, nothing is different, and above
-it the only conversions lost are between a numeral offset and a `succ` tower
-written out in full, which at that size nothing can write. Only a *licensed*
-operation is held — without a licence the kernel has no reason to believe the name
-recurses the way the equations say, and unfolds it like anything else.
+still makes it made before. What the bound is a statement about is effort. Only a
+*licensed* operation is held — without a licence the kernel has no reason to
+believe the name recurses the way the equations say, and unfolds it like anything
+else.
+
+**What is lost, and where it is given back.** The conversions the hold removes
+are those between an offset over a large numeral and the same offset written some
+other way — most of all, `x + ⌜k+1⌝` against `Nat.succ (x + ⌜k⌝)`. That is not an
+exotic term. `Char`'s bounds proofs are full of it: a lemma states
+`x + ⌜57344⌝ + ⌜1⌝ ≤ ⌜1114112⌝` and is used where `x + ⌜57345⌝ ≤ ⌜1114112⌝` is
+wanted; reduction gets the first side to `Nat.succ (x + ⌜57344⌝)`, because the
+outer `+ ⌜1⌝` is small enough to unfold, and stops. §7's offset rule is what
+relates the two, and it is stated only over held applications, so it gives back
+exactly what the hold took.
 
 ---
 
@@ -658,7 +666,7 @@ recurses the way the equations say, and unfolds it like anything else.
    same constant, first try argument-wise congruence, and only unfold both if
    that fails.
 7. When nothing can be unfolded, the **last resort** rules: projection
-   congruence, structure eta, and unit-like eta.
+   congruence, the numeral-offset rule (§7.6), structure eta, and unit-like eta.
 
 A round of step 6 that unfolds nothing is a round that ends the loop. This
 sounds like a restatement of step 7 and is in fact the only thing keeping the
@@ -825,6 +833,42 @@ constant answers for every arity.
 Everything here is one-sided in the sense of §7.3: a *yes* ("not a proof") must
 be right, and it is, being a chain of declared types and the `imax` rule; a *no*
 costs only the slow route, which is the rule as stated.
+
+### 7.6 The numeral-offset rule
+
+A last-resort rule for the pairs §6.5's held numeral leaves stuck:
+
+```
+t ≡ s   when   t = b + ⌜k⌝,  s = b' + ⌜k⌝,  k > 0,  b ≡ b'
+```
+
+Each side is read as a base and a numeral offset by walking down through at most
+256 layers of `Nat.succ e`, `Nat.add e ⌜k⌝` and `Nat.zero`, whnf'ing each layer
+first — the terms reaching this rule have had their heads normalised and nothing
+else, so the numeral is usually several unreduced instance projections down — and
+stopping at whatever is left. A literal `⌜v⌝` reached on the way is `0 + v`. The
+walk is bounded for the reason §6.5's `natShape` walk is: nothing stops a term
+from being a deeper successor tower than anyone wants to count, and giving up
+costs only this rule on this pair.
+
+Three conditions keep it honest:
+
+- **One of the two sides must be a held application.** That is the only way such
+  a pair reaches a stuck comparison at all, so the reading is not attempted on
+  every other last-resort pair, and the rule is doing nothing but undoing a
+  specific refusal in the one place that refusal shows.
+- **`Nat.add` must be licensed** in the sense of §6.5 — the file's own `Nat.add`
+  must satisfy `x + 0 ≡ x` and `x + succ y ≡ succ (x + y)`. Those two equations
+  are exactly the derivation this rule stands on. Without the licence `Nat.add`
+  is not held either, and ordinary reduction handles the pair.
+- **A zero offset is not a match.** Two terms with no arithmetic in them are
+  every other rule's business.
+
+Soundness is that derivation: given the two equations, `b + ⌜k⌝` and `b' + ⌜k⌝`
+reduce to the same `k`-fold successor of `b` and `b'`, which are convertible by
+assumption. The rule is *positive only*, like the rest of step 7 — a failure to
+read a side as an offset, or offsets that differ, falls through rather than
+concluding anything.
 
 ---
 
