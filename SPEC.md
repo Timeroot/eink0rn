@@ -1710,6 +1710,38 @@ required to be present and well-formed, and are then thrown away, because
 **Divergence.** Official Lean's reader is tolerant of extra and missing fields
 in places where the value does not change its behaviour.
 
+### 12.9 Redundant bookkeeping must be true
+
+Several fields restate something the kernel derives for itself. The format calls
+`isRec` and `isReflexive` "informational"; no rule in this kernel reads either
+off the file. They are checked anyway, on the principle of §1: a number or flag
+the export supplies and nobody verifies is a place where a file can say one thing
+and mean another, and the cost of closing it is one comparison.
+
+| field | derived from |
+| --- | --- |
+| `numParams`, `numIndices`, `numFields`, `numMotives`, `numMinors`, `nfields` | the telescopes of §8.3–§8.7 |
+| `all` | the members of the block |
+| `isRec` | some constructor of the block has a recursive field |
+| `isReflexive` | some constructor has a recursive field *under a binder*, as `Acc.intro`'s `forall y, r y x → Acc r y` does |
+| `k` | §8.6 |
+| the recursor's type and rules | re-derived outright (§8.8) |
+
+`isRec` and `isReflexive` are checked against **two bounds** rather than one
+value. The format does not say whether the flag describes the member or the
+block it belongs to, and on a mutual block the two readings can differ — a member
+with no recursive field of its own inside a block that has one. So the lower
+bound is what this member's own constructors force, the upper bound is what the
+block as a whole permits, and a value is rejected only when it is wrong under
+both readings. On a single-member block the bounds coincide and the check is
+exact.
+
+Agreement was confirmed on all 653 inductive declarations in the arena corpus.
+
+**Divergence.** Official Lean recomputes these fields and overwrites them rather
+than comparing, so a file whose bookkeeping is wrong is accepted there and
+rejected here.
+
 ### 12.10 Proof bodies are sealed
 
 A checked theorem normally enters the environment as a definition, and a
@@ -1788,35 +1820,3 @@ it has no answer for `abbrev`.
 
 **Divergence.** None possible. Two runs that differ only in this field accept and
 reject exactly the same files.
-
-### 12.9 Redundant bookkeeping must be true
-
-Several fields restate something the kernel derives for itself. The format calls
-`isRec` and `isReflexive` "informational"; no rule in this kernel reads either
-off the file. They are checked anyway, on the principle of §1: a number or flag
-the export supplies and nobody verifies is a place where a file can say one thing
-and mean another, and the cost of closing it is one comparison.
-
-| field | derived from |
-| --- | --- |
-| `numParams`, `numIndices`, `numFields`, `numMotives`, `numMinors`, `nfields` | the telescopes of §8.3–§8.7 |
-| `all` | the members of the block |
-| `isRec` | some constructor of the block has a recursive field |
-| `isReflexive` | some constructor has a recursive field *under a binder*, as `Acc.intro`'s `forall y, r y x → Acc r y` does |
-| `k` | §8.6 |
-| the recursor's type and rules | re-derived outright (§8.8) |
-
-`isRec` and `isReflexive` are checked against **two bounds** rather than one
-value. The format does not say whether the flag describes the member or the
-block it belongs to, and on a mutual block the two readings can differ — a member
-with no recursive field of its own inside a block that has one. So the lower
-bound is what this member's own constructors force, the upper bound is what the
-block as a whole permits, and a value is rejected only when it is wrong under
-both readings. On a single-member block the bounds coincide and the check is
-exact.
-
-Agreement was confirmed on all 653 inductive declarations in the arena corpus.
-
-**Divergence.** Official Lean recomputes these fields and overwrites them rather
-than comparing, so a file whose bookkeeping is wrong is accepted there and
-rejected here.
