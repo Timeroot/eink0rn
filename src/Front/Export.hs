@@ -37,7 +37,7 @@ import           Data.Char             (isDigit)
 import           Data.IntMap.Strict    (IntMap)
 import qualified Data.IntMap.Strict    as IM
 import           Front.Json
-import           Kernel.Env            (QuotKind (..))
+import           Kernel.Env            (Hint (..), QuotKind (..))
 import           Kernel.Expr
 import           Kernel.Level
 import           Kernel.Name
@@ -49,7 +49,7 @@ import           Kernel.Name
 -- derives them itself and requires agreement.
 data ExDecl
   = ExAxiom  !Bool !Name ![Name] !Expr
-  | ExDef    !Bool !Name ![Name] !Expr !Expr
+  | ExDef    !Bool !Name ![Name] !Expr !Expr !Hint
   | ExThm    !Name ![Name] !Expr !Expr
   | ExOpaque !Bool !Name ![Name] !Expr !Expr
   | ExQuot   !Name ![Name] !Expr !QuotKind
@@ -318,14 +318,15 @@ readSafety :: Json -> Either String Bool
 readSafety = enumOf "safety"
   [("safe", False), ("unsafe", True), ("partial", True)]
 
--- | @hints@ is scheduling advice for the elaborator's unfolder.  Validated and
--- dropped.
-checkHints :: Json -> Either String ()
-checkHints j = case j of
-  JStr _ -> enumOf "hints" [("opaque", ()), ("abbrev", ())] j
+-- | @hints@ is scheduling advice for the unfolder.  It is the only field of the
+-- export the kernel both keeps and never checks; see 'Hint' for why that costs
+-- nothing.
+readHints :: Json -> Either String Hint
+readHints j = case j of
+  JStr _ -> enumOf "hints" [("opaque", HOpaque), ("abbrev", HAbbrev)] j
   JObj _ -> do f <- record ["regular"] j
-               _ <- natOf =<< field f "regular"
-               pure ()
+               n <- natOf =<< field f "regular"
+               pure (HRegular n)
   _      -> Left "hints must be \"opaque\", \"abbrev\", or {\"regular\": n}"
 
 -- Declarations --------------------------------------------------------------------
@@ -339,9 +340,9 @@ readDecl ps t v = case t of
   "def" -> do
     f <- record ["name", "levelParams", "type", "value", "hints", "safety", "all"] v
     u <- readSafety =<< field f "safety"
-    checkHints     =<< field f "hints"
+    h <- readHints  =<< field f "hints"
     _ <- namesAt ps =<< field f "all"
-    ExDef u <$> nm f <*> lps f <*> ty f <*> val f
+    ExDef u <$> nm f <*> lps f <*> ty f <*> val f <*> pure h
   "thm" -> do
     f <- record ["name", "levelParams", "type", "value", "all"] v
     _ <- namesAt ps =<< field f "all"

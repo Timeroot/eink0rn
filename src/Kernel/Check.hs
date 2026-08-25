@@ -15,6 +15,7 @@ module Kernel.Check
   , checkType
   , inferSortOf
   , isDefEq
+  , proofErasable
   , whnf
   , whnfCore
   , ensurePi
@@ -60,6 +61,7 @@ data TCState = TCState
   , tcInferV      :: !Memo     -- ^ memo for 'inferM' @Verify@; see 'Memo'
   , tcInferA      :: !Memo     -- ^ memo for 'inferM' @Assume@
   , tcWhnf        :: !Memo     -- ^ memo for 'whnf'
+  , tcLevelInst   :: !LevelMemo -- ^ memo for 'instLevels'
   , tcNatOk       :: !(Maybe Bool)  -- ^ cached 'natShapeOk'; see 'expandLit'
   , tcStrOk       :: !(Maybe Bool)  -- ^ cached 'strShapeOk'
   , tcNatOps      :: !(Map Name Bool)  -- ^ cached 'natOpOk'; see 'reduceNatOp'
@@ -118,6 +120,37 @@ memoInsert ek k v =
   IM.insertWith (\new old -> head new : take 7 old)
                 (hashMix (exprHash k) ek) [(k, ek, v)]
 
+-- | A memo on (stored body, universe arguments) pairs; see 'instLevels'.
+type LevelMemo = IntMap [(Expr, [Level], Expr)]
+
+-- | 'instLevelsE', remembered for the length of one declaration.
+--
+-- Delta and iota both work by taking a body out of the environment and
+-- replacing that declaration's universe parameters with the ones at the
+-- occurrence.  A proof that unfolds the same polymorphic constant ten thousand
+-- times asks for the same instantiation ten thousand times, and rebuilding the
+-- body each time is most of what a large proof costs.
+--
+-- Keyed the same way as 'Memo': on the body's identity, matched by 'ptrEq'.
+-- The bodies come from the environment, so the pointer is stable for as long as
+-- the table lives; the universe arguments are compared properly, being short.
+-- Missing a hit only wastes time, so the bucket is capped.
+instLevels :: [Name] -> [Level] -> Expr -> TC Expr
+instLevels [] _  e = pure e
+instLevels ps ls e = TC $ \s ->
+  let key    = exprHash e
+      bucket = IM.findWithDefault [] key (tcLevelInst s)
+      hit ((b, ls', r) : rest) | ptrEq b e, ls' == ls = Just r
+                               | otherwise            = hit rest
+      hit []                                          = Nothing
+  in case hit bucket of
+       Just r  -> Right (r, s)
+       Nothing ->
+         let r = instLevelsE ps ls e
+         in Right (r, s { tcLevelInst =
+                            IM.insert key ((e, ls, r) : take 7 bucket)
+                                      (tcLevelInst s) })
+
 newtype TC a = TC { unTC :: TCState -> Either String (a, TCState) }
 
 instance Functor TC where
@@ -149,7 +182,8 @@ runTCLearn env lps (TC f) =
   fmap readLicences <$>
     f (seedLicences env
         (TCState env IM.empty 0 lps unmetered wasteBudget
-                 IM.empty IM.empty IM.empty Nothing Nothing M.empty M.empty))
+                 IM.empty IM.empty IM.empty IM.empty
+                 Nothing Nothing M.empty M.empty))
 
 throwTC :: String -> TC a
 throwTC msg = TC $ \_ -> Left msg
@@ -285,11 +319,15 @@ withEnv env act = do
   setEnv old
   pure a
 
--- | Every memo table is keyed on the term alone, so anything the answer also
--- depends on -- the environment a constant unfolds in, the declaration's
--- universe parameters -- has to invalidate them.  The licence answers are about
--- the environment rather than about a term, so they are not thrown away but
--- re-seeded from the incoming one: see 'seedLicences'.
+-- | The inference and whnf memos are keyed on the term alone, so anything the
+-- answer also depends on -- the environment a constant unfolds in, the
+-- declaration's universe parameters -- has to invalidate them.  The licence
+-- answers are about the environment rather than about a term, so they are not
+-- thrown away but re-seeded from the incoming one: see 'seedLicences'.
+--
+-- 'tcLevelInst' survives untouched, because what it remembers is a pure
+-- function of its key: substituting universes in a term does not consult the
+-- environment at all.
 setEnv :: Env -> TC ()
 setEnv env = TC $ \s ->
   Right ((), seedLicences env
@@ -423,7 +461,8 @@ unfoldDelta e = outOfFuel >>= \out -> if out then pure Nothing else do
       case lookupConst env n of
         Just (CDef d) | length ls == length (defLevels d) -> do
           spend
-          pure (Just (mkApps (instLevelsE (defLevels d) ls (defValue d)) args))
+          body <- instLevels (defLevels d) ls (defValue d)
+          pure (Just (mkApps body args))
         _ -> pure Nothing
     _ -> pure Nothing
 
@@ -481,8 +520,8 @@ reduceRec r ls args
           case mh of
             Const cn _ | Just rule <- find ((== cn) . rrCtor) (recRules r)
                        , length margs >= rrNumFields rule -> do
+              rhs <- instLevels (recLevels r) ls (rrRhs rule)
               let fields = drop (length margs - rrNumFields rule) margs
-                  rhs    = instLevelsE (recLevels r) ls (rrRhs rule)
                   before = take prefixLen args
                   after  = drop (majorIx + 1) args
               pure (Just (mkApps (mkApps rhs (before ++ fields)) after))
@@ -1056,6 +1095,58 @@ tryProofIrrel t s = outOfFuel >>= \out -> if out then pure False else do
     ts <- inferOnly s
     isDefEq tt ts
 
+-- | Given a proposition, may a proof of it be sealed once it has been checked?
+--
+-- A proof is used in exactly three ways.  It can be compared with another term,
+-- it can be the major premise of a recursor, or it can be the target of a
+-- projection.  The first never needs the proof's value: 'tryProofIrrel' settles
+-- any comparison between two proofs from their /types/ alone, and a proof can
+-- only ever be convertible with another proof.  So the question is whether iota
+-- or a projection could get stuck on it, and that is a question about the
+-- proposition, which is what this answers.
+--
+-- Three shapes of proposition are safe, and it is @Prop@ being what it is that
+-- makes them so.  Write @C@ for the head of the conclusion, an inductive type.
+--
+-- [@C@ has no constructors] There is no iota rule to fire and no field to
+--   project, so nothing can be waiting on the value.  (@False@, @Empty@.)
+--
+-- [@C@ does not admit large elimination] Then @C.rec@'s motive lands in @Prop@,
+--   so every term a stuck @C.rec@ blocks is itself a proof, and proof
+--   irrelevance answers for it.  A projection out of @C@ is in the same
+--   position: 'inferProj' only admits one whose field is a proof, and a type
+--   with a data field is exactly a type that does not eliminate largely.
+--   (@Or@, @Exists@, @Nonempty@, @Nat.le@.)
+--
+-- [@C@ gets K-like reduction] 'toCtorWhenK' rebuilds the constructor
+--   application from the major premise's /type/, so iota fires with the value
+--   untouched.  (@Eq@, @HEq@, @True@.)
+--
+-- Everything else is kept, and one case in particular has to be: a @Prop@ that
+-- eliminates largely /and/ has fields is one whose recursor needs to see a real
+-- constructor before it can produce the data it promises.  @Acc@ is the
+-- important one -- sealing a proof of @Acc r a@ would stop well-founded
+-- recursion from unfolding -- and @And@, @Iff@ and @WellFounded@ are the same
+-- shape.  Structure eta does not rescue them: it replaces the major premise
+-- with @C.mk h.0 .. h.n@, whose fields are projections that are themselves
+-- stuck on the value we would have thrown away.
+--
+-- Anything unrecognised -- a conclusion that is a variable, a quotient, a sort,
+-- or a constant that whnf could not resolve -- is kept.
+proofErasable :: Expr -> TC Bool
+proofErasable = go (0 :: Int)
+  where
+    -- A telescope long enough to hit this is not one we need to be clever about.
+    go k _ | k > 256 = pure False
+    go k ty = whnf ty >>= \ty' -> case ty' of
+      Pi n dom body -> withLocal n dom $ \x -> go (k + 1) (instantiateBody x body)
+      _ -> do
+        env <- getEnv
+        pure $ case fst (unApps ty') of
+          Const n _ | Just (CInd i) <- lookupConst env n ->
+            null (indCtors i) || not (indLargeElim i) || indK i
+          _ -> False
+
 -- | Congruence for a spine whose head cannot be unfolded -- a local constant, a
 -- projection, an axiom, a constructor, an inductive type, a stuck recursor.
 --
@@ -1090,6 +1181,11 @@ data Delta = DEq | DGo Expr Expr | DStuck | DStarved
 
 -- | Lazy delta reduction: unfold the taller definition first, and when both
 -- sides are the same constant try congruence before unfolding at all.
+--
+-- \"Taller\" is read off 'defPriority', which ranks a proof below every ordinary
+-- definition however tall it is.  Nothing about which terms are convertible
+-- depends on the order -- when neither side wins, both are unfolded -- but a
+-- great deal about how long finding out takes.
 tryDelta :: Expr -> Expr -> TC Delta
 tryDelta t s = outOfFuel >>= \out -> if out then pure DStarved else do
   ht <- headHeight t
@@ -1109,7 +1205,7 @@ tryDelta t s = outOfFuel >>= \out -> if out then pure DStarved else do
       Const n ls -> do
         env <- getEnv
         pure $ case lookupConst env n of
-          Just (CDef d) | length ls == length (defLevels d) -> Just (defHeight d)
+          Just (CDef d) | length ls == length (defLevels d) -> Just (defPriority d)
           _ -> Nothing
       _ -> pure Nothing
     forceUnfold e = unfoldDelta e >>= \case
@@ -1359,7 +1455,7 @@ inferCore m env e = case e of
           throwTC ("constant " ++ showName n ++ " expects " ++ show (length ps)
                    ++ " universe arguments, got " ++ show (length ls))
         when (m == Verify) (mapM_ checkLevel ls)
-        pure (instLevelsE ps ls (constType ci))
+        instLevels ps ls (constType ci)
   App f a -> do
     tf <- inferM m env f
     (dom, cod) <- ensurePi tf
@@ -1477,8 +1573,8 @@ inferProj m lenv tn i s0 = do
         throwTC ("projection: " ++ showName tn ++ " applied to the wrong number of arguments")
       unless (i < ctorNumFields ci) $
         throwTC ("projection index " ++ show i ++ " out of range for " ++ showName tn)
-      let cty0 = instLevelsE (ctorLevels ci) ls (ctorType ci)
-      cty   <- peelParams nps args cty0
+      cty0 <- instLevels (ctorLevels ci) ls (ctorType ci)
+      cty  <- peelParams nps args cty0
       let checkField j fty = when (m == Verify) $ do
             sortT <- ensureSort =<< inferOnly sTy
             sortF <- inferSortOf fty

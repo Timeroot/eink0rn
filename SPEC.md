@@ -34,9 +34,9 @@ design; the whole point is that the core has fewer cases to get wrong.
 | --- | --- | --- |
 | binder annotations (`implicit`, `strictImplicit`, `instImplicit`) | erased | elaboration hints; no logical content |
 | `mdata` | erased | ditto |
-| `thm` | becomes a definition, after checking the statement is in `Prop` | the core has no theorems; the `Prop` requirement is the only thing lost, so it is checked here |
+| `thm` | statement checked to be in `Prop`, proof checked, then **sealed as an axiom** where §12.10 says nothing can ever look inside it | the core has no theorems; the `Prop` requirement is the only thing lost, so it is checked here |
 | `opaque` | checked like a definition, then admitted as an **axiom** | it must not delta-unfold; an axiom is exactly a constant that does not |
-| reducibility hints | erased | scheduling advice for the elaborator; the kernel unfolds by its own rules |
+| reducibility hints | **kept**, as the delta-unfolding order of §7 step 6 (§12.11) | scheduling advice, and advice is all it can be: no ordering changes which terms are convertible |
 | safety flags (`isUnsafe`, `safety`) | **kept**: they select a quarantined fragment (§12.7) | an unsafe declaration skipped the termination check, so its type is not a claim the kernel can use |
 | nested inductives | compiled to mutual blocks (§9) | the core's positivity judgement has no rule for nesting |
 | exported recursors | **re-derived and required to match** (§8.7) | see below |
@@ -56,12 +56,15 @@ an extra eliminator cannot be parked alongside the justified ones.
 
 **Options.** Two flags move the verdict, and both default to the strictest
 setting that does not reject a faithful export. Everything else in this document
-describes the default configuration.
+describes the default configuration. `--keep-proofs` and `--progress` cannot
+change a verdict at all.
 
 | flag | default | effect |
 | --- | --- | --- |
 | `--nat-accel=off\|canonical\|verified\|always` | `canonical` | how much evidence the arithmetic shortcuts of §6.5 demand before firing. `always` is unsound and exists only to reproduce other kernels' behaviour. |
 | `--pin-std=off\|warn\|error` | `off` | audit the standard constants against their stored forms (§12.5). Never affects soundness; `error` can reject files that are perfectly consistent. |
+| `--keep-proofs` | off | retain every proof term instead of sealing it (§12.10). A pure performance switch: the sealed and unsealed kernels accept exactly the same files. |
+| `--progress[=SECS]` | off | report on stderr as the file is checked, naming each declaration that took at least `SECS` seconds. |
 
 ---
 
@@ -311,7 +314,7 @@ happens to be in head position.
 
 `whnf` alternates `whnfCore` with **delta**: unfold the head constant when it is a
 definition whose universe arity matches. Definitions declared `opaque` are
-axioms and never unfold.
+axioms and never unfold, and neither do proofs sealed under §12.10.
 
 ### 6.3 Iota for recursors
 
@@ -583,9 +586,10 @@ and `⌜k+1⌝` the same term as far as conversion is concerned.
    *Positive only*: failure falls through.
 5. **Proof irrelevance** — if `t`'s type is a proposition and `s`'s type is
    definitionally equal to it, `t ≡ s`.
-6. **Lazy delta** — unfold the side whose head definition has the greater height;
-   when heights are equal and both heads are the same constant, first try
-   argument-wise congruence, and only unfold both if that fails.
+6. **Lazy delta** — unfold the side whose head definition has the greater
+   unfolding priority (§12.11); when priorities are equal and both heads are the
+   same constant, first try argument-wise congruence, and only unfold both if
+   that fails.
 7. When nothing can be unfolded, the **last resort** rules: projection
    congruence, structure eta, and unit-like eta.
 
@@ -599,7 +603,7 @@ is what proof irrelevance would otherwise do.
 
 For a head that *is* a definition the same congruence *is* speculative, since the
 two sides may only agree after unfolding, so it is left to step 6 where it can be
-weighed against the heights.
+weighed against the priorities.
 
 ### 7.2 Structure eta and unit-like eta
 
@@ -1408,6 +1412,85 @@ required to be present and well-formed, and are then thrown away, because
 
 **Divergence.** Official Lean's reader is tolerant of extra and missing fields
 in places where the value does not change its behaviour.
+
+### 12.10 Proof bodies are sealed
+
+A checked theorem normally enters the environment as a definition, and a
+definition delta-unfolds. This kernel instead **discards the proof and admits an
+axiom** whenever it can show that no reduction rule could ever look inside it.
+`--keep-proofs` turns this off; it changes nothing but the timings.
+
+The argument is that a proof is used in exactly three ways, and each one can be
+ruled out from the *statement* alone.
+
+- **Compared with another term.** Never needs the value. A proof can only be
+  convertible with another proof, and §7 step 5 settles any comparison between
+  two proofs from their types. Sealing a proof does not even weaken step 4: an
+  axiom is a rigid head, so `thm ā ≡ thm b̄` still goes through congruence.
+- **Major premise of a recursor.** This is the case that can need the value, so
+  it is the one the test is about.
+- **Target of a projection.** Same, and it reduces to the same test.
+
+Write `C` for the head of the statement's conclusion, after stripping its
+`forall`s and head-normalising. The proof is sealed when `C` is an inductive type
+and any of:
+
+| condition | why nothing can be waiting on the value | examples |
+| --- | --- | --- |
+| `C` has no constructors | there is no iota rule to fire and no field to project | `False`, `Empty` |
+| `C` does not admit large elimination (§8.5) | `C.rec`'s motive lands in `Prop`, so every term a stuck `C.rec` blocks is *itself* a proof, and step 5 answers for it. A projection is in the same position: §5.3 only admits one whose field is a proof, and a type with a data field is exactly a type that does not eliminate largely | `Or`, `Exists`, `Nonempty`, `Nat.le` |
+| `C` has the `k` flag (§8.6) | K-like reduction rebuilds the constructor application from the major premise's *type*, so iota fires with the value untouched | `Eq`, `HEq`, `True` |
+
+Anything else is kept — including a conclusion that is a variable, a sort, a
+quotient, or a constant that head normalisation could not resolve.
+
+One class *must* be kept, and it is worth naming: a `Prop` that eliminates
+largely **and** has fields is one whose recursor needs to see a real constructor
+before it can produce the data it promised. `Acc` is the important one — sealing
+a proof of `Acc r a` would stop well-founded recursion from unfolding — and
+`And`, `Iff` and `WellFounded` have the same shape. Structure eta (§7.2) does not
+rescue them: it replaces the major premise with `C.mk h.[C,0] .. h.[C,n]`, whose
+fields are projections that are themselves stuck on the value we would have
+thrown away.
+
+This is a completeness claim, not a soundness one, and it is one-sided in the
+safe direction either way: a proof that should have been kept can only cause a
+reduction to get stuck, and a stuck reduction can only cause a rejection (§7.3).
+
+**Divergence.** None observed. Official Lean keeps theorem values, so a file that
+this kernel rejects for want of an unfolding it sealed away would be a
+divergence; none of the arena corpus, the pathological corpus, or `init`
+contains one.
+
+### 12.11 Reducibility hints are believed
+
+The `hints` field of a `def` is the one thing this kernel reads out of the file
+and does not check. It is safe to read precisely because there is nothing to
+check: it orders `isDefEq`'s step 6, and **the order in which two definitions are
+unfolded cannot change which terms are convertible**. When neither side wins,
+both are unfolded; when one wins, unfolding it still makes progress, and the
+environment is acyclic, so every ordering — including a deliberately perverse
+one — decides the same questions. It decides them at very different speeds, and
+that is the whole of what a hint is for.
+
+The order, greatest first:
+
+| hint | priority | meaning |
+| --- | --- | --- |
+| `abbrev` | highest | the elaborator judged this too thin to be worth keeping folded |
+| `regular n` | by `n` | `n` exceeds the height of everything the value mentions, so unfolding the taller of two constants is what lets the shorter be reached from both sides |
+| `opaque` | lowest | leave this one alone |
+
+A `thm` carries no `hints` field, and one that survives §12.10 is given `opaque`:
+a proof is the last thing worth looking inside.
+
+Earlier versions computed the height themselves, as `1 + max` over the
+definitions a value mentions. That agrees with `regular n` on every export
+`lean4export` produces, but it costs a traversal of every value in the file and
+it has no answer for `abbrev`.
+
+**Divergence.** None possible. Two runs that differ only in this field accept and
+reject exactly the same files.
 
 ### 12.9 Redundant bookkeeping must be true
 

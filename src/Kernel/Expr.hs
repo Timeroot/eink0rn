@@ -319,7 +319,16 @@ mkArrow a b = Pi (Binder anon) a (liftE 0 1 b)
 -- Nodes are matched by 'ptrEq' rather than '=='.  Structural equality is what
 -- we are trying not to pay for; a miss on a structurally-equal-but-distinct
 -- node only costs the recomputation we would have done anyway.
-type Memo s a = STRef s (IntMap [(Expr, Int, a)])
+-- | One slot per hash: a collision evicts rather than chains.
+--
+-- These tables are built and thrown away once per traversal, and every entry in
+-- them costs an insertion into the map.  Chaining would make a lookup complete
+-- -- it would find an entry whenever one exists -- but a memo does not have to
+-- be complete to be correct, only to be right when it answers.  Since a miss
+-- costs a recomputation and a hash collision between two nodes reached in the
+-- same traversal is rare, one slot per hash is the better trade, and it is the
+-- allocation of the chain that it saves.
+type Memo s a = STRef s (IntMap (Expr, Int, a))
 
 newMemo :: ST s (Memo s a)
 newMemo = newSTRef IM.empty
@@ -328,16 +337,12 @@ memoAt :: Memo s a -> Int -> Expr -> ST s a -> ST s a
 memoAt ref d ex mk = do
   m <- readSTRef ref
   let key = hashMix (exprHash ex) d
-  case hit (IM.findWithDefault [] key m) of
-    Just r  -> pure r
-    Nothing -> do
+  case IM.lookup key m of
+    Just (k, d', r) | d == d', ptrEq k ex -> pure r
+    _ -> do
       r <- mk
-      modifySTRef' ref (IM.insertWith (++) key [(ex, d, r)])
+      modifySTRef' ref (IM.insert key (ex, d, r))
       pure r
-  where
-    hit ((k, d', r) : rest) | d == d', ptrEq k ex = Just r
-                            | otherwise           = hit rest
-    hit []                                        = Nothing
 
 -- de Bruijn plumbing ----------------------------------------------------------
 

@@ -38,5 +38,5 @@ executable eink0rn
     hs-source-dirs:   app
     main-is:          Main.hs
     build-depends:    base, bytestring, containers, eink0rn
-    ghc-options:      -rtsopts "-with-rtsopts=-K512m"
+    ghc-options:      -rtsopts "-with-rtsopts=-K512m -A64m"
     default-language: Haskell2010

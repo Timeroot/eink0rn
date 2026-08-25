@@ -8,6 +8,7 @@
 module Kernel.Env
   ( ConstInfo (..)
   , DefInfo (..)
+  , Hint (..)
   , IndInfo (..)
   , CtorInfo (..)
   , RecInfo (..)
@@ -23,7 +24,7 @@ module Kernel.Env
   , constName
   , constLevels
   , constType
-  , computeHeight
+  , defPriority
   , isStructureLike
   , ctorOfStructure
   ) where
@@ -52,6 +53,10 @@ data IndInfo = IndInfo
   , indCtors       :: ![Name]     -- ^ in constructor-index order
   , indIsRecursive :: !Bool       -- ^ does some member of the block occur in a field?
   , indLargeElim   :: !Bool       -- ^ may the recursor eliminate into any @Sort@?
+  , indK           :: !Bool
+    -- ^ does its recursor get K-like reduction?  The same flag as 'recK', kept
+    -- here so that a question about a /type/ can be answered without first
+    -- finding the recursor that eliminates it; see 'Kernel.Check.proofErasable'.
   } deriving (Eq, Show)
 
 data CtorInfo = CtorInfo
@@ -82,11 +87,31 @@ data DefInfo = DefInfo
   , defLevels :: ![Name]
   , defType   :: !Expr
   , defValue  :: !Expr
-  , defHeight :: !Int
-    -- ^ Purely a heuristic: it decides which of two constants to delta-unfold
-    -- first.  It is computed from the environment, never read from the input,
-    -- and cannot affect which terms are convertible -- only how fast we notice.
+  , defHint   :: !Hint
+    -- ^ which of two constants to delta-unfold first; see 'Hint'.
   } deriving (Eq, Show)
+
+-- | Scheduling advice for delta reduction, taken from the export's @hints@
+-- field.  Ordered so that the /greater/ of two definitions is the one to unfold
+-- first.
+--
+-- This is the one thing the kernel reads out of the file that it does not
+-- check, and it is safe to read precisely because there is nothing to check:
+-- the order in which two definitions are unfolded cannot change which terms are
+-- convertible.  When neither side wins, 'Kernel.Check.tryDelta' unfolds both, so
+-- every ordering -- including a deliberately perverse one -- decides the same
+-- questions.  It decides them at very different speeds, and that is all a hint
+-- is for.
+--
+-- @abbrev@ is a definition the elaborator considered too thin to be worth
+-- keeping folded, so it goes first.  @regular n@ carries a height: @n@ exceeds
+-- the height of everything the value mentions, so unfolding the taller of two
+-- constants is what lets the shorter one be reached from both sides.  @opaque@
+-- is the elaborator asking for this one to be left alone, and it is also what a
+-- theorem gets: the export gives @thm@ no hints field, and a proof is the last
+-- thing worth looking inside.
+data Hint = HOpaque | HRegular !Int | HAbbrev
+  deriving (Eq, Ord, Show)
 
 data ConstInfo
   = CAxiom !Name ![Name] !Expr
@@ -124,11 +149,9 @@ constType ci = case ci of
   CRec   r       -> recType r
   CQuot  _ _ t _ -> t
 
--- | @1 + max@ of the heights of the definitions a value mentions.
-computeHeight :: Env -> Expr -> Int
-computeHeight env v =
-  1 + maximum (0 : [ defHeight d | n <- S.toList (constsOf v)
-                                 , Just (CDef d) <- [lookupConst env n] ])
+-- | Which of two definitions to delta-unfold first: the greater goes first.
+defPriority :: DefInfo -> Hint
+defPriority = defHint
 
 -- | How much the kernel is willing to believe about the arithmetic constants
 -- before it computes with them on bignums.  See SPEC.md §6.5.

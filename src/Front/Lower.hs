@@ -2,10 +2,13 @@
 --
 -- This is where the \"normalise aggressively up front\" half of the project
 -- lives.  Everything the export offers that the core does not have is either
--- erased (binder annotations, @mdata@, reducibility hints) or compiled away:
+-- erased (binder annotations, @mdata@) or compiled away:
 --
--- * @thm@ becomes a definition -- the kernel has no notion of a theorem;
+-- * @thm@ becomes a definition -- the kernel has no notion of a theorem -- and
+--   then, where 'proofErasable' allows, an axiom;
 -- * @opaque@ is checked and then becomes an axiom, since it must not unfold;
+-- * reducibility hints survive as the unfolding order of 'defPriority', which
+--   is advice and cannot be anything else;
 -- * a declaration's recursors are /re-derived/ from the inductive
 --   specification and the exported ones are required to match.
 --
@@ -20,7 +23,11 @@
 -- elimination, an extra reduction rule, a bogus @k@ flag -- because any of
 -- those show up as a mismatch.
 module Front.Lower
-  ( checkExport
+  ( Config (..)
+  , defaultConfig
+  , checkExport
+  , checkExportTrace
+  , Progress (..)
   , checkStdPins
   ) where
 
@@ -38,14 +45,58 @@ import           Kernel.Inductive
 import           Kernel.Level
 import           Kernel.Name
 
+-- | Everything about a run that is not the file being checked.
+data Config = Config
+  { cfgAccel :: !AccelMode
+  , cfgSealProofs :: !Bool
+    -- ^ Throw a theorem's value away once it has been checked, whenever
+    -- 'proofErasable' says no reduction could ever ask for it again.  On by
+    -- default: it takes the question of whether to unfold a proof off the table
+    -- entirely, for all but a handful of propositions.  See SPEC.md §12.10.
+  }
+
+defaultConfig :: Config
+defaultConfig = Config AccelCanonical True
+
 -- | Check a whole export, returning the resulting environment.
-checkExport :: AccelMode -> [ExDecl] -> Either String Env
-checkExport accel ds = do
-    st <- foldM step (LS emptyEnv { envAccel = accel } Nothing Nothing [] []) ds
-    checkQuotPackage (reverse (lsQuots st))
-    mapM_ (checkQuarantined (lsEnv st)) (reverse (lsUnsafe st))
-    pure (lsEnv st)
+checkExport :: Config -> [ExDecl] -> Either String Env
+checkExport cfg = verdict . checkExportTrace cfg
   where
+    verdict (Failed err : _) = Left err
+    verdict (Done env   : _) = Right env
+    verdict (Checked _  : r) = verdict r
+    verdict []               = Left "internal error: export trace ended"
+
+-- | What checking a declaration produced.  A trace is one 'Checked' per
+-- declaration accepted, in file order, ending in exactly one 'Done' or 'Failed'.
+data Progress
+  = Checked !(Maybe Name)  -- ^ this declaration went in; 'Nothing' for an empty block
+  | Done Env               -- ^ every declaration went in, and the file passed
+  | Failed String          -- ^ this is why it did not
+
+-- | 'checkExport', reporting as it goes.
+--
+-- The list is produced lazily and each 'Checked' is forced by the time it is
+-- emitted, so a consumer that reads the trace in 'IO' and looks at the clock
+-- between elements is timing that declaration and nothing else.  That is the
+-- entire reason this exists: on a large export the interesting question stops
+-- being /does it pass/ and becomes /which declaration is taking all afternoon/,
+-- and a trace answers it in one run instead of a bisection over prefixes.
+checkExportTrace :: Config -> [ExDecl] -> [Progress]
+checkExportTrace cfg =
+  go (LS emptyEnv { envAccel = cfgAccel cfg } (cfgSealProofs cfg)
+        Nothing Nothing [] [])
+  where
+    go st [] = [either Failed Done (finish st)]
+    go st (d : ds) = case step st d of
+      Left err  -> [Failed err]
+      Right st' -> Checked (declName d) : go st' ds
+
+    finish st = do
+      checkQuotPackage (reverse (lsQuots st))
+      mapM_ (checkQuarantined (lsEnv st)) (reverse (lsUnsafe st))
+      pure (lsEnv st)
+
     step st d = case declName d of
       Nothing -> checkDecl st d
       Just n  -> case checkDecl st d of
@@ -56,6 +107,7 @@ checkExport accel ds = do
 -- types of the later ones.
 data LS = LS
   { lsEnv     :: !Env
+  , lsSeal    :: !Bool                 -- ^ 'cfgSealProofs'
   , lsQuotTy  :: !(Maybe Name)
   , lsQuotMk  :: !(Maybe Name)
   , lsQuots   :: ![(QuotKind, Name)]   -- ^ reverse order of declaration
@@ -68,7 +120,7 @@ data LS = LS
 declName :: ExDecl -> Maybe Name
 declName d = case d of
   ExAxiom  _ n _ _   -> Just n
-  ExDef    _ n _ _ _ -> Just n
+  ExDef    _ n _ _ _ _ -> Just n
   ExThm      n _ _ _ -> Just n
   ExOpaque _ n _ _ _ -> Just n
   ExQuot     n _ _ _ -> Just n
@@ -86,9 +138,9 @@ checkDecl st d = case d of
         env' <- addConst (lsEnv st) (CAxiom n lps ty)
         pure st { lsEnv = env' }
 
-  ExDef u n lps ty val
+  ExDef u n lps ty val h
     | u         -> quarantine st n lps ty (Just val)
-    | otherwise -> defLike st n lps ty val False
+    | otherwise -> defLike st n lps ty val h Retain
   -- A theorem must be a /proof/: its statement has to live in @Prop@.  (The
   -- core has no theorems, so this is the one thing lost when we turn it into a
   -- definition, and it has to be checked here.)  There is no unsafe theorem:
@@ -101,12 +153,12 @@ checkDecl st d = case d of
       unless (levelEquiv l LZero) $
         throwTC ("theorem statement is not a proposition: it lives in Sort "
                  ++ showLevel l)
-    defLike st n lps ty val False
+    defLike st n lps ty val HOpaque SealIfSpent
   -- An opaque constant is checked exactly like a definition and then sealed:
   -- the kernel must not unfold it, so it enters the environment as an axiom.
   ExOpaque u n lps ty val
     | u         -> quarantine st n lps ty (Just val)
-    | otherwise -> defLike st n lps ty val True
+    | otherwise -> defLike st n lps ty val HOpaque Seal
 
   ExQuot n lps ty kind -> do
     checkLevelParams lps
@@ -136,17 +188,33 @@ checkDecl st d = case d of
   where
     run lps act = either Left (const (Right ())) (runTC (lsEnv st) lps act)
 
-defLike :: LS -> Name -> [Name] -> Expr -> Expr -> Bool -> Either String LS
-defLike st n lps ty val sealed = do
+-- | What becomes of a declaration's value once it has been checked.
+data Sealing
+  = Retain        -- ^ a definition: the value stays, and delta may unfold it
+  | Seal          -- ^ @opaque@: the value is checked and then thrown away
+  | SealIfSpent   -- ^ @thm@: thrown away unless reduction could still need it
+  deriving Eq
+
+defLike :: LS -> Name -> [Name] -> Expr -> Expr -> Hint -> Sealing
+        -> Either String LS
+defLike st n lps ty val hint sealing = do
   checkLevelParams lps
   barrier (lsEnv st) [ty, val]
-  (_, lic) <- runTCLearn (lsEnv st) lps (inferSortOf ty >> checkType val ty)
-  let info | sealed    = CAxiom n lps ty
+  (spent, lic) <- runTCLearn (lsEnv st) lps $ do
+    sort <- inferSortOf ty
+    checkType val ty
+    -- Asked in the same run as the check, so it reuses its memo tables; asked
+    -- of the /statement/, so it costs a head normalisation and nothing more.
+    if sealing == SealIfSpent && isDefinitelyZero sort
+      then proofErasable ty
+      else pure False
+  let sealed = sealing == Seal || (spent && lsSeal st)
+      info | sealed    = CAxiom n lps ty
            | otherwise = CDef DefInfo { defName   = n
                                       , defLevels = lps
                                       , defType   = ty
                                       , defValue  = val
-                                      , defHeight = computeHeight (lsEnv st) val }
+                                      , defHint   = hint }
   -- Carrying the licences forward is what stops every declaration that touches
   -- arithmetic from re-establishing the same facts about @Nat.add@; see
   -- 'Licences'.
