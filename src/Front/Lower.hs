@@ -969,6 +969,9 @@ flattenBlock env0 groups members paramTele lvls nps recs = do
                       , indK           = False
                       }
             | (m, ni) <- zip members nIdxs ]
+          -- and the same table read the other way, for 'Kernel.Check.unflatten'.
+        , envUnflat = M.insert (fnTy fn) (fnIdx fn, nps, declNames)
+                               (envUnflat envRec)
         }
     , brIndices = nIdxs
     , brFields  = regroup nCtors (map ctorNumFields ctorFs)

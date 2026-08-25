@@ -230,13 +230,20 @@ data Env = Env
     -- ^ what a flattened member of a mutual block (SPEC.md §9.3) would have been
     -- had it been admitted as an inductive type.  Read by 'inductiveAt' and by
     -- nothing else.
+  , envUnflat   :: !(M.Map Name (Name, Int, [Name]))
+    -- ^ the same table read the other way: a flat type, to its tag type, the
+    -- number of parameters it shares with it, and its members in tag order.
+    -- Read by "Kernel.Check"'s @unflatten@, which is how the rules that ask what
+    -- inductive type a /term/ belongs to -- projections and eta -- get told that
+    -- @F p (Idx.mk_j p a)@ is the type the file wrote as @T_j p a@.
   , envLicence  :: !Licences
     -- ^ what has already been established about this environment; a cache, in
     -- the sense that clearing it changes only how long the answer takes.
   }
 
 emptyEnv :: Env
-emptyEnv = Env IM.empty False AccelCanonical S.empty S.empty M.empty noLicences
+emptyEnv =
+  Env IM.empty False AccelCanonical S.empty S.empty M.empty M.empty noLicences
 
 lookupConst :: Env -> Name -> Maybe ConstInfo
 lookupConst env n = IM.lookup (nameHash n) (envConsts env) >>= go
@@ -248,14 +255,21 @@ lookupConst env n = IM.lookup (nameHash n) (envConsts env) >>= go
 -- | The inductive type a name stands for, seeing through the flattening of a
 -- mutual block.
 --
--- A flattened member is a definition, and every rule of the theory is entitled
--- to see it as one: it reduces to an application of the flat type, and nothing
--- in §5, §6 or §7 needs to know more than that.  The nesting compilation of §9
--- is the exception, because it does not /use/ a container, it /copies/ one: it
--- needs the arity and the constructors of the type the file declared, which the
--- flattening spent.  So those are kept, and this is the only lookup that finds
--- them.  A file that nests inside a member of a mutual block is then compiled
--- exactly as it would have been without the fork.
+-- A flattened member is a definition, and most of the theory is entitled to see
+-- it as one: it reduces to an application of the flat type, and the rules of §5,
+-- §6 and §7 that only ever ask a type to /reduce/ need to know nothing more.
+-- Three things ask more than that, and they are the callers of this lookup.
+--
+-- * §9.1's nesting compilation does not /use/ a container, it /copies/ one, so
+--   it needs the arity and the constructors of the type the file declared --
+--   which the flattening spent.
+-- * §5.3's projections and §7.2's eta ask whether a name is a structure: one
+--   constructor, no indices.  @F@ has an index (the tag) and as many
+--   constructors as the whole block, so asking it is asking the wrong type.
+--
+-- Both get the answer they would have had without the fork.  Note that
+-- @indIsRecursive@ here is the /block's/, not the member's, which costs
+-- 'isEtaReducible' -- and only it -- some precision; see SPEC.md §9.3.4.
 inductiveAt :: Env -> Name -> Maybe IndInfo
 inductiveAt env n = case lookupConst env n of
   Just (CInd i) -> Just i
@@ -279,9 +293,9 @@ addConst env ci
 -- a statement about what the fields may mention, and eta is a statement about
 -- the outermost constructor.
 isStructureLike :: Env -> Name -> Bool
-isStructureLike env n = case lookupConst env n of
-  Just (CInd i) -> length (indCtors i) == 1
-                && indNumIndices i == 0
+isStructureLike env n = case inductiveAt env n of
+  Just i -> length (indCtors i) == 1
+         && indNumIndices i == 0
   _ -> False
 
 -- | Structure-like, and safe to eta-expand /during reduction/: also not
@@ -294,13 +308,13 @@ isStructureLike env n = case lookupConst env n of
 -- no such problem, because it only fires against a side that already /is/ a
 -- constructor application and descends into it.
 isEtaReducible :: Env -> Name -> Bool
-isEtaReducible env n = isStructureLike env n && case lookupConst env n of
-  Just (CInd i) -> not (indIsRecursive i)
-  _             -> False
+isEtaReducible env n = isStructureLike env n && case inductiveAt env n of
+  Just i -> not (indIsRecursive i)
+  _      -> False
 
 ctorOfStructure :: Env -> Name -> Maybe CtorInfo
-ctorOfStructure env n = case lookupConst env n of
-  Just (CInd i) | [c] <- indCtors i
-                , indNumIndices i == 0
-                , Just (CCtor ci) <- lookupConst env c -> Just ci
+ctorOfStructure env n = case inductiveAt env n of
+  Just i | [c] <- indCtors i
+         , indNumIndices i == 0
+         , Just (CCtor ci) <- lookupConst env c -> Just ci
   _ -> Nothing

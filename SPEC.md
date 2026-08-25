@@ -1279,6 +1279,10 @@ member and bumped to `T_1._flat_i.*` until every one of them is free; and they a
 recorded in `envInternal`, which the barrier of §12.7 consults, so **no declaration
 in the file may mention one**. The construction is unreachable rather than absent.
 
+The other cost is that a member of the block is now a definition, and three rules
+of the theory care about the difference. That is §9.3.4's second bullet, and it is
+the larger half of the fork.
+
 #### 9.3.4 Deliberate divergences
 
 These are the ways a flattening kernel and a primitive-mutual kernel disagree. All
@@ -1295,21 +1299,45 @@ of them are consequences of `T_j` being a definition rather than an inductive ty
   the two terms it identifies are equal by proof irrelevance anyway. It is a
   divergence because it accepts strictly more.
 
-* **No eta, and no projections, for a member of a mutual block.** §7.2's structure
-  eta and §5.3's `Expr.proj` both ask whether a *type constant* is an inductive
-  with one constructor and no indices. `T_j` is not a type constant any more.
-  Lean's kernel would give eta to a single-constructor index-free member of a
-  mutual block; this one does not, so a file that needs that eta to typecheck is
-  rejected. No such file appears in any corpus — `structure` is not a mutual
-  command — but the divergence is real.
+* **A member of a mutual block can still be a structure — but only by a side
+  table.** This is the expensive one, and it is not hypothetical: cslib's
+  `Lean.Meta.Grind.AC.DiseqCnstr` is a one-constructor member of a mutual block
+  that the file then projects out of, and the first version of this fork rejected
+  the whole corpus over it. §5.3's `Expr.proj` and §7.2's eta both ask whether a
+  *type constant* is an inductive with one constructor and no indices, and after
+  flattening `T_j` is not a type constant, while `F` — one index, and as many
+  constructors as the whole block — is the wrong type to ask.
 
-* **Nesting inside a member still works, by a side table.** §9.1 needs the arity
-  and constructors of the container it is copying, and the flattening spent them.
-  They are kept in `envFlat` and read by `inductiveAt`, which is the only lookup
-  that sees through the flattening. Without it, a file that declares a mutual block
-  and then nests a later inductive inside one of its members is rejected — this
-  costs about fifteen lines and is the only place in the kernel where a definition
-  has to remember what it used to be.
+  So the flattening keeps a table of what it spent, in both directions:
+
+  - `envFlat` maps each member to the `IndInfo` it would have had. `inductiveAt`
+    consults it, and `isStructureLike`, `isEtaReducible` and `ctorOfStructure`
+    go through `inductiveAt`.
+  - `envUnflat` maps the flat type to its tag type, its parameter count, and its
+    members in tag order. `unflatten` uses it to turn a *type* `F p̄ (Idx.mk_j p̄ ā)`
+    back into `T_j p̄ ā`, and the four rules that ask what inductive type a term
+    inhabits — `inferProj`, `tryStructEta`, `tryUnitLike`, `toCtorWhenStruct` —
+    each call it once, after `whnf` and before looking at the head.
+
+  The tag is read off its own head constructor rather than inferred, because two
+  members of one block flatten to applications of the same `F` differing only in
+  the tag: anything weaker would hand a projection of `T_1` the fields of `T_2`.
+  For the same reason `toCtorWhenStruct` checks that the member it recovers is one
+  of the block the recursor belongs to, since `toCtorApp` does not check that the
+  constructor it finds is the recursor's.
+
+  One thing is still lost: `envFlat` records the *block's* recursiveness, not the
+  member's, so `isEtaReducible` — eta *during reduction*, §6.1 — is refused to a
+  non-recursive member of a recursive block. That can only make reduction get
+  stuck sooner, never fire wrongly.
+
+  All of this is machinery whose entire purpose is to remember what a definition
+  used to be. It is the honest price of the fork, and it is about seventy lines.
+
+* **Nesting inside a member still works, by the same table.** §9.1 needs the arity
+  and constructors of the container it is copying, and reads them through
+  `inductiveAt`. Without that, a file that declares a mutual block and then nests
+  a later inductive inside one of its members is rejected.
 
 * **What flattening cannot do.** §9.1's auxiliary members must come back out as
   *primitive* recursors over the real containers: `T.rec_1` eliminates

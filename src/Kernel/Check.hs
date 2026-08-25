@@ -872,19 +872,61 @@ toCtorWhenK r _ls major = withFuel $ do
 toCtorWhenStruct :: RecInfo -> Expr -> TC (Maybe Expr)
 toCtorWhenStruct r major = withFuel $ do
   env <- getEnv
-  case lookupConst env (recInduct r) of
-    Just (CInd ind)
-      | isEtaReducible env (indName ind)
-      , [cn] <- indCtors ind
-      , Just (CCtor ci) <- lookupConst env cn -> do
-          majorTy <- inferOnly major >>= whnf
-          let (h, targs) = unApps majorTy
-          case h of
-            Const tn tls | tn == indName ind, length targs == indNumParams ind ->
-              pure . Just $ mkApps (Const cn tls)
-                (targs ++ [ Proj tn i major | i <- [0 .. ctorNumFields ci - 1] ])
-            _ -> pure Nothing
-    _ -> pure Nothing
+  -- The types this recursor is allowed to eta-expand a major premise of: its
+  -- own, and -- if it is the recursor of a flattened block (SPEC.md §9.3) --
+  -- that block's members, since the major of @F.rec@ is whichever of them the
+  -- tag says.  Expanding a major of some /other/ structure would produce a
+  -- constructor application of a foreign type, and 'toCtorApp' does not check
+  -- that the constructor it finds belongs to the recursor it is reducing.
+  let ours = recInduct r : maybe [] (\(_, _, ms) -> ms)
+                                    (M.lookup (recInduct r) (envUnflat env))
+  if not (any (isEtaReducible env) ours) then pure Nothing else do
+    majorTy <- inferOnly major >>= whnf >>= unflatten
+    let (h, targs) = unApps majorTy
+    case h of
+      Const tn tls
+        | tn `elem` ours
+        , isEtaReducible env tn
+        , Just ind <- inductiveAt env tn
+        , [cn] <- indCtors ind
+        , Just (CCtor ci) <- lookupConst env cn
+        , length targs == indNumParams ind ->
+            pure . Just $ mkApps (Const cn tls)
+              (targs ++ [ Proj tn i major | i <- [0 .. ctorNumFields ci - 1] ])
+      _ -> pure Nothing
+
+-- | Undo the flattening of a mutual block (SPEC.md §9.3) on a /type/:
+-- @F p̄ (Idx.mk_j p̄ ā)@ is what the file wrote as @T_j p̄ ā@.
+--
+-- Reduction goes the other way -- @T_j@ is a definition and unfolds to the flat
+-- form -- and for every rule that only wants a weak head normal form that is the
+-- right direction and this function is never called.  The exceptions are the
+-- rules that ask which /inductive type/ a term inhabits: §5.3's projections and
+-- §7.2's eta both need a single constructor and no indices, and @F@ has neither.
+-- They ask this first, and then ask the type the file actually declared.
+--
+-- The tag is checked, not assumed.  Two members of one block flatten to
+-- applications of the same @F@ that differ only in their tag, so reading the
+-- member off anything less than the tag's own head constructor would confuse
+-- @T_1@ with @T_2@ -- and hand a projection of one the fields of the other.
+unflatten :: Expr -> TC Expr
+unflatten e = do
+  env <- getEnv
+  if M.null (envUnflat env) then pure e else case unApps e of
+    (Const f ls, args)
+      | Just (idxTy, nps, ms) <- M.lookup f (envUnflat env)
+      , length args == nps + 1 -> do
+          tag <- whnf (last args)
+          case unApps tag of
+            (Const c _, targs)
+              | Just (CCtor ci) <- lookupConst env c
+              , ctorInduct ci == idxTy
+              , ctorIdx ci < length ms
+              , length targs >= nps ->
+                  pure (mkApps (Const (ms !! ctorIdx ci) ls)
+                               (take nps args ++ drop nps targs))
+            _ -> pure e
+    _ -> pure e
 
 -- | @(T.mk params fields).i --> fields !! i@
 reduceProj :: Expr -> TC (Maybe Expr)
@@ -1934,7 +1976,7 @@ tryStructEta t s = withFuel $ do
       , isStructureLike env (ctorInduct ci)
       , length as == ctorNumParams ci + ctorNumFields ci
       , ctorNumFields ci > 0 -> do
-          sTy <- inferOnly s >>= whnf
+          sTy <- inferOnly s >>= whnf >>= unflatten
           case headOf sTy of
             Const tn _ | tn == ctorInduct ci -> do
               let fields = drop (ctorNumParams ci) as
@@ -1947,7 +1989,7 @@ tryStructEta t s = withFuel $ do
 tryUnitLike :: Expr -> Expr -> TC (Maybe Bool)
 tryUnitLike t s = withFuel $ do
   env <- getEnv
-  tTy <- inferOnly t >>= whnf
+  tTy <- inferOnly t >>= whnf >>= unflatten
   case headOf tTy of
     Const tn _
       | isStructureLike env tn
@@ -2208,16 +2250,16 @@ inferProj :: InferMode -> LEnv -> Name -> Int -> Expr -> TC Expr
 inferProj m lenv tn i s0 = do
   env <- getEnv
   when (i < 0) $ throwTC "negative projection index"
-  sTy <- inferM m lenv s0 >>= whnf
+  sTy <- inferM m lenv s0 >>= whnf >>= unflatten
   -- The field types are built from projections /of this term/, so here it does
   -- have to be materialised.
   s <- closeIn lenv s0
   let (h, args) = unApps sTy
   case h of
     Const tn' ls | tn' == tn -> do
-      ind <- case lookupConst env tn of
-        Just (CInd ind) -> pure ind
-        _               -> throwTC ("projection: " ++ showName tn ++ " is not an inductive type")
+      ind <- case inductiveAt env tn of
+        Just ind -> pure ind
+        _        -> throwTC ("projection: " ++ showName tn ++ " is not an inductive type")
       unless (isStructureLike env tn) $
         throwTC ("projection: " ++ showName tn ++ " is not a structure")
       ci <- case indCtors ind of
