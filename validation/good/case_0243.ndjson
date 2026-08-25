@@ -1,0 +1,16 @@
+{"meta":{"exporter":{"name":"lean4export","version":"3.1.0"},"format":{"version":"3.1.0"},"lean":{"githash":"f72c35b3f637c8c6571d353742168ab66cc22c00","version":"4.29.1"}}}
+{"in":1,"str":{"pre":0,"str":"A"}}
+{"ie":0,"sort":0}
+{"axiom":{"isUnsafe":false,"levelParams":[],"name":1,"type":0}}
+{"in":2,"str":{"pre":0,"str":"T1"}}
+{"in":3,"str":{"pre":0,"str":"u"}}
+{"in":4,"str":{"pre":0,"str":"v"}}
+{"il":1,"param":3}
+{"il":2,"param":4}
+{"il":3,"max":[1,2]}
+{"il":4,"succ":1}
+{"il":5,"imax":[4,0]}
+{"il":6,"imax":[3,5]}
+{"ie":1,"sort":6}
+{"const":{"name":1,"us":[]},"ie":2}
+{"def":{"all":[2],"hints":"abbrev","levelParams":[3,4],"name":2,"safety":"safe","type":1,"value":2}}

@@ -1,0 +1,13 @@
+# Build output
+dist-newstyle/
+*.hi
+*.o
+
+# Python scratch
+__pycache__/
+
+# External reference, cloned separately (see README)
+refs/lean-type-theory/
+
+# The arena tarball; refs/tests/ is its extraction
+refs/tests.tar.gz

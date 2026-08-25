@@ -1,0 +1,1442 @@
+# The eink0rn core theory
+
+This is the normative description of what `eink0rn` accepts. It is written to be
+audited: every rule the kernel implements should appear here, and nothing that
+does not appear here should be implemented. Where the code and this document
+disagree, that is a bug in one of them, and finding out which is the point of
+writing it down.
+
+**Provenance.** The theory is Carneiro, *The Type Theory of Lean* (`refs/`),
+specialised to the fragment the `lean4export` NDJSON format can express. No
+existing kernel implementation was consulted. Section references below are to
+the thesis. Where a rule is *not* in the thesis — because it is an artefact of
+the export format, or an efficiency device, or a place where the thesis leaves a
+choice open — this document says so explicitly and gives the justification.
+
+**Reading order.** §1 says what the front end throws away before the core sees
+anything. §2–§4 give the syntax and the level algebra. §5–§7 give the
+judgements. §8 gives inductive types, which is where the interesting content is.
+§9 gives the nesting compilation, §10 quotients. §11 states the implementation
+invariants the rules quietly depend on, and §12 lists the deliberate divergences
+from what official Lean would do.
+
+---
+
+## 1. Surface to core
+
+`eink0rn` consumes `lean4export` NDJSON v3.1.0. The file is a sequence of pool
+entries (`in` names, `il` levels, `ie` expressions) and declarations. Before the
+kernel proper sees anything, `Front.Export` and `Front.Lower` reduce the surface
+language to the core. This is the "normalise aggressively up front" half of the
+design; the whole point is that the core has fewer cases to get wrong.
+
+| Surface | Fate | Justification |
+| --- | --- | --- |
+| binder annotations (`implicit`, `strictImplicit`, `instImplicit`) | erased | elaboration hints; no logical content |
+| `mdata` | erased | ditto |
+| `thm` | becomes a definition, after checking the statement is in `Prop` | the core has no theorems; the `Prop` requirement is the only thing lost, so it is checked here |
+| `opaque` | checked like a definition, then admitted as an **axiom** | it must not delta-unfold; an axiom is exactly a constant that does not |
+| reducibility hints | erased | scheduling advice for the elaborator; the kernel unfolds by its own rules |
+| safety flags (`isUnsafe`, `safety`) | **kept**: they select a quarantined fragment (§12.7) | an unsafe declaration skipped the termination check, so its type is not a claim the kernel can use |
+| nested inductives | compiled to mutual blocks (§9) | the core's positivity judgement has no rule for nesting |
+| exported recursors | **re-derived and required to match** (§8.7) | see below |
+
+The last row is a load-bearing design decision. The export contains recursors
+with their reduction rules, and a kernel that took them on trust would accept
+whatever eliminator the file cared to write down. `eink0rn` instead builds the
+recursor its own way from the inductive specification, and then requires the
+exported one to agree with it: same universe count, same parameter/motive/minor/
+index counts, same `k` flag, definitionally equal type, and one definitionally
+equal reduction rule per constructor with no rules left over. An export cannot
+smuggle in an unwarranted large elimination, an extra iota rule, or a bogus `k`.
+
+The same holds for the block's *shape*: the set of recursor names in a block must
+be exactly `{T.rec | T declared}` plus the auxiliaries nesting introduced (§9), so
+an extra eliminator cannot be parked alongside the justified ones.
+
+**Options.** Two flags move the verdict, and both default to the strictest
+setting that does not reject a faithful export. Everything else in this document
+describes the default configuration.
+
+| flag | default | effect |
+| --- | --- | --- |
+| `--nat-accel=off\|canonical\|verified\|always` | `canonical` | how much evidence the arithmetic shortcuts of §6.5 demand before firing. `always` is unsound and exists only to reproduce other kernels' behaviour. |
+| `--pin-std=off\|warn\|error` | `off` | audit the standard constants against their stored forms (§12.5). Never affects soundness; `error` can reject files that are perfectly consistent. |
+
+---
+
+## 2. Syntax
+
+### 2.1 Names
+
+Hierarchical, built from the anonymous root by string and numeral components.
+Names are compared structurally and carry a cached hash. They have no meaning to
+the theory beyond identity — with the exception of §12.1.
+
+### 2.2 Levels
+
+```
+l ::= 0 | succ l | max l l | imax l l | u        (u a level parameter)
+```
+
+### 2.3 Expressions
+
+```
+e ::= #i                     bound variable (de Bruijn index)
+    | x!n                    local constant (checker-internal; never in the environment)
+    | Sort l
+    | c.{l̄}                  constant, with universe arguments
+    | e e                    application
+    | fun (b : e) => e
+    | forall (b : e), e
+    | let b : e := e; e
+    | e.[T, i]               projection: field i of a T-structure
+    | nat_lit n              natural-number literal
+    | str_lit s              string literal
+```
+
+Representation is locally nameless: a binder that has been entered is replaced by
+a fresh local constant `x!n` whose type lives in the local context. `b` ranges
+over binder display names, which are cosmetic and never affect any judgement.
+
+This is the *whole* term language. In particular the core has no `mdata`, no
+binder info, no metavariables, and no universe metavariables.
+
+---
+
+## 3. Universe levels
+
+A level denotes a function from assignments `ρ` of its parameters to naturals:
+
+```
+[[0]]ρ        = 0
+[[succ l]]ρ   = [[l]]ρ + 1
+[[max a b]]ρ  = max([[a]]ρ, [[b]]ρ)
+[[imax a b]]ρ = 0                        if [[b]]ρ = 0
+                max([[a]]ρ, [[b]]ρ)      otherwise
+[[u]]ρ        = ρ(u)
+```
+
+`l₁ ≤ l₂` means `[[l₁]]ρ ≤ [[l₂]]ρ` for **every** `ρ`; `l₁ ≈ l₂` is `l₁ ≤ l₂ ∧ l₂ ≤ l₁`.
+Lean has no cumulativity, so the typing rules only ever need `≈`, but `≈` is
+decided through `≤`.
+
+Two derived predicates are used by the inductive rules:
+
+- `isDefinitelyZero l` ⟺ `l ≤ 0` — i.e. `Sort l` is a proposition under every assignment;
+- `isDefinitelyNonZero l` ⟺ `1 ≤ l` — i.e. `Sort l` is never a proposition.
+
+Note these are not complements: `u` is neither.
+
+### 3.1 Deciding `≤`
+
+`levelLeq a b` normalises both sides and decides `a ≤ b + d` (`d ∈ ℤ`) by:
+
+```
+a ≡ b and d ≥ 0                        ⇒ true
+a = 0 and d ≥ 0                        ⇒ true
+a = succ a'                            ⇒ a' ≤ b + (d-1)
+b = succ b'                            ⇒ a  ≤ b' + (d+1)
+a = max a₁ a₂                          ⇒ a₁ ≤ b + d  and  a₂ ≤ b + d
+a has an irreducible `imax _ u`        ⇒ split on u
+b has an irreducible `imax _ u`        ⇒ split on u
+b = max b₁ b₂                          ⇒ a ≤ b₁ + d  or  a ≤ b₂ + d
+a = 0                                  ⇒ d ≥ 0
+b = 0                                  ⇒ false        (a is a parameter: unbounded)
+a = u, b = v                           ⇒ u = v and d ≥ 0
+otherwise                              ⇒ false
+```
+
+"Split on `u`" means: decide the goal with `u := 0` and with `u := succ u`, and
+require both. Each branch strictly reduces the number of irreducible `imax`
+nodes, so this terminates.
+
+Every rule above is an **equivalence** except `max`-on-the-right, which is only
+sufficient (`u ≤ max u v` is caught, but a genuinely disjunctive obligation could
+in principle be missed). It is applied *last*, after `imax` case-splitting has
+removed the shapes that would make the loss of information matter. Being
+one-sided in the sufficient direction, its failure mode is rejecting a well-typed
+file, never accepting an ill-typed one.
+
+The `imax` case split is what makes this procedure complete on the identities
+that Lean's own level normaliser is known to be incomplete on. See §12.2.
+
+---
+
+## 4. Environments
+
+The core admits exactly five kinds of constant, plus the quotient primitives:
+
+```
+axiom  c.{ū} : T
+def    c.{ū} : T := v
+ind    T.{ū}                 an inductive family, always flat (§8)
+ctor   c.{ū}                 a constructor of some family
+rec    T.rec.{ū}             the recursor of some family
+quot   one of the four quotient primitives (§10)
+```
+
+Declarations are **write-once**: re-declaring a name is a hard error. Every
+constant's type is checked to be a well-formed type (`inferSortOf`) before it is
+admitted, and every definition's value is checked against its type.
+
+Definitions carry a *height* (`1 + max` of the heights of the definitions their
+value mentions). This is computed from the environment, never read from the
+input, and is used only to decide which of two constants to unfold first. It
+cannot affect what is convertible — only how fast the kernel notices.
+
+---
+
+## 5. Typing
+
+### 5.1 Contexts
+
+A context assigns types to local constants. Because the representation is
+locally nameless, inference threads a *de Bruijn environment* `Δ` — the list of
+local constants the enclosing binders were opened with, innermost first, so that
+`#i` denotes `Δ!!i`. See §11.1 for the invariant this satisfies.
+
+### 5.2 Rules
+
+Written with substitution, as if `Δ` were applied eagerly. `Γ` is the local
+context and `Ū` the current declaration's universe parameters.
+
+```
+                    Γ(x) = T
+(local)          ─────────────────
+                  Γ ⊢ x : T
+
+
+                 params(l) ⊆ Ū
+(sort)        ────────────────────────
+               Γ ⊢ Sort l : Sort (succ l)
+
+
+              (c.{ū} : T) ∈ E     |l̄| = |ū|     params(l̄) ⊆ Ū
+(const)     ───────────────────────────────────────────────────
+                     Γ ⊢ c.{l̄} : T[ū := l̄]
+
+
+              Γ ⊢ f : T     T ⟶*ʷʰⁿᶠ forall (x : A), B     Γ ⊢ a : A
+(app)       ────────────────────────────────────────────────────────────
+                              Γ ⊢ f a : B[x := a]
+
+
+              Γ ⊢ A : Sort _        Γ, x : A ⊢ b : B
+(lam)       ─────────────────────────────────────────────
+              Γ ⊢ (fun (x : A) => b) : forall (x : A), B
+
+
+              Γ ⊢ A : Sort l₁       Γ, x : A ⊢ B : Sort l₂
+(pi)        ─────────────────────────────────────────────────
+              Γ ⊢ (forall (x : A), B) : Sort (imax l₁ l₂)
+
+
+              Γ ⊢ A : Sort _   Γ ⊢ v : A   Γ ⊢ b[x := v] : B
+(let)       ────────────────────────────────────────────────────
+                    Γ ⊢ (let x : A := v; b) : B
+
+
+(nat)         Γ ⊢ nat_lit n : Nat
+(str)         Γ ⊢ str_lit s : String
+```
+
+`(app)` requires `A` and the inferred type of `a` to be *definitionally* equal,
+not syntactically; likewise everywhere a rule writes a specific type.
+
+`(let)` **zeta-expands**: the body is typed with the value substituted, not with
+`x` in the context. So `let` has no independent typing content — it is a sharing
+device, and the kernel treats it as one everywhere.
+
+### 5.3 Projections
+
+`s.[T, i]` is the interesting rule.
+
+```
+   Γ ⊢ s : T p̄        T structure-like with unique ctor  mk : forall (p̄) (f₀ : F₀) … (f_{n-1} : F_{n-1}), T p̄
+   0 ≤ i < n
+   Fᵢ' = Fᵢ[p̄ := p̄][f₀ := s.[T,0], …, f_{i-1} := s.[T,i-1]]
+   Γ ⊢ Fᵢ' : Sort sortF        Γ ⊢ T p̄ : Sort sortT        sortF ≤ imax sortF sortT
+   and the same side condition for every earlier field whose projection actually
+   occurs in the remainder of the telescope
+──────────────────────────────────────────────────────────────────────────────────
+   Γ ⊢ s.[T, i] : Fᵢ'
+```
+
+"Structure-like" means: exactly one constructor, no indices, and not recursive.
+(The last clause is what stops eta expansion from diverging; see §7.4.)
+
+**The side condition.** If `T p̄` is a proposition then all of its inhabitants are
+convertible by proof irrelevance, so `(mk true).[T,0]` and `(mk false).[T,0]`
+would be convertible — a projection out of a proposition may therefore only land
+in a proposition. Quantified over all universe assignments, "`sortT = 0` implies
+`sortF = 0`" is exactly
+
+```
+sortF ≤ imax sortF sortT
+```
+
+The condition applies to the field being projected *and* to every earlier field
+whose projection is actually substituted into the rest of the telescope: reading
+`s.[T,i]`'s type off a telescope instantiated with an *illegal* projection would
+be reading it off a type that does not exist. An earlier field that nothing
+downstream mentions is skipped, so a data field may sit between two proof fields
+of a proposition without poisoning them.
+
+This is stated as `imax` rather than as a case split on `sortT`. Doing it that
+way, and having a `≤` that case-splits on `imax` (§3.1), is what closes the hole
+by construction rather than by patching a special case; see §12.2.
+
+---
+
+## 6. Reduction
+
+### 6.1 `whnfCore` — everything except delta
+
+Repeatedly, on the head of the spine:
+
+| rule | |
+| --- | --- |
+| **beta** | `(fun x => b) a ⟶ b[x := a]` (all leading lambdas peeled at once) |
+| **zeta** | `(let x : A := v; b) ā ⟶ b[x := v] ā` |
+| **proj** | `(mk p̄ f̄).[T, i] ⟶ fᵢ`, provided `mk`'s own inductive type is `T` |
+| **iota (rec)** | §6.3 |
+| **iota (quot)** | §6.4 |
+
+The `proj` rule's side condition (`ctorInduct mk = T`) matters: without it a
+projection could be reduced against a constructor of a *different* structure that
+happens to be in head position.
+
+### 6.2 `whnf` — with delta
+
+`whnf` alternates `whnfCore` with **delta**: unfold the head constant when it is a
+definition whose universe arity matches. Definitions declared `opaque` are
+axioms and never unfold.
+
+### 6.3 Iota for recursors
+
+```
+T_j.rec.{l̄} p̄ C̄ ē ī (c p̄ f̄)  ⟶  rule_c[l̄] p̄ C̄ ē f̄
+```
+
+where the major premise sits at position `|p̄| + |C̄| + |ē| + |ī|`. A mutual block
+shares one set of motives `C̄` and one set of minor premises `ē` across all its
+members, so the prefix a rule is applied to is the same for every recursor of the
+block; only the rules differ. Arguments after the major premise are re-applied.
+
+Three things can make a non-constructor major premise usable:
+
+**Literal expansion.** `nat_lit 0 ⟶ Nat.zero` and `nat_lit (n+1) ⟶ Nat.succ (nat_lit n)`.
+For strings, write `⟦s⟧` for the character list `[Char.ofNat (nat_lit k₀), …]` of the
+code points of `s` and `b` for `List.utf8Encode ⟦s⟧`; then
+
+    str_lit s ⟶ String.ofByteArray b (ByteArray.IsValidUTF8.intro b ⟦s⟧ (Eq.refl.{1} ByteArray b))
+
+A `String` is not a list of characters but the byte array a list of characters
+encodes, paired with the evidence that it is one; the literal names the character
+list and lets the file's own `List.utf8Encode` say what the bytes are. The evidence
+is `Eq.refl`, so the expansion is well typed whatever that function computes, and
+the kernel never has to have an opinion about UTF-8. Literals are abbreviations and
+nothing more, and they expand only once the constants they abbreviate are checked to
+be the ones they mean (§12.1).
+
+**K-like reduction** (only when `k` is set on the recursor, §8.5). If the major
+premise's type is `T p̄ ī`, then the canonical constructor application `mk p̄` has
+that same type, so the (possibly neutral) major premise may be replaced by it.
+The `isDefEq (majorTy, ctorTy)` guard is essential: without it `Eq.rec` would
+reduce at `Eq a b` for non-convertible `a` and `b`.
+
+**Structure eta on the major premise.** For a structure-like `T`, every element is
+convertible to `T.mk s.[T,0] … s.[T,n-1]`, so a neutral major premise of structure
+type still reduces.
+
+### 6.4 Iota for `Quot`
+
+```
+Quot.lift α r β f h (Quot.mk α r v)  ⟶  f v
+Quot.ind  α r β h   (Quot.mk α r v)  ⟶  h v
+```
+
+### 6.5 Arithmetic on numerals
+
+`Nat.ble 1114113 4294967296` is a single machine comparison and about a million
+iota steps. A kernel that only knows the second reading cannot check
+`Init.Prelude`, where bounds like `UInt32.size` are settled by `decide`. So the
+numerals are computed on:
+
+```
+f ⌜a⌝      ⟶  ⌜f a⌝                    f = Nat.pred
+f ⌜a⌝ ⌜b⌝  ⟶  ⌜f a b⌝                  f ∈ {Nat.add, Nat.sub, Nat.mul, Nat.pow,
+                                            Nat.div, Nat.mod}
+f ⌜a⌝ ⌜b⌝  ⟶  Bool.true / Bool.false   f ∈ {Nat.beq, Nat.ble, Nat.blt}
+```
+
+where `⌜n⌝` is *any* term the numeral reader (below) accepts, subtraction is
+truncated, and division by zero gives `a / 0 = 0`, `a % 0 = a`. `Nat.pow`
+declines when the answer would not fit in memory; that is not a correctness
+matter — the slow path cannot finish such a case either — but it decides *how*
+the kernel fails, by running out of time, which a caller can bound, rather than
+out of memory, which it cannot.
+
+None of these rules is on by default merely because it is listed here. Each one
+has to be *licensed*, per operation and per environment; the rest of this section
+is about what a licence costs. `div` and `mod` are licensed on weaker evidence
+than the rest, and that is set out separately below.
+
+**This rule is not keyed on the name.** `Nat.add` is a name, and a file that
+defined it as multiplication would be handed an equation the theory does not
+contain — `2 + 2 ≡ 5` — if the kernel were willing to say so on the strength of
+the name alone. Every soundness bug of this shape has that cause: a constant the
+kernel gives a meaning to without checking that the file gave it the same one.
+
+So the licence is *derived*, once per environment, from the definition's own
+declared type and defining equations. The stored specification each operation is
+held against lives in one file, `Kernel.Canon`, so that the whole of what the
+kernel believes about the standard library can be read in one sitting; nothing in
+it is believed, and everything in it is something the kernel will check.
+
+**What is stored is a specification, not a definition.** It is tempting to store
+the canonical *body* of `Nat.add` and compare against that. It does not work, and
+the reason is worth recording. An exported `Nat.add` is a `Nat.brecOn` over an
+auto-generated matcher, with binder names carrying a hash of the module they were
+elaborated in; two different recursion schemes over `Nat` compute the same
+function but are not definitionally equal as open terms, so even a `≡` comparison
+against a stored body would fail on a faithful export and would pin the
+elaborator's mood on the day rather than the arithmetic. The stored form of an
+operation is therefore its **type** together with its **defining equations**,
+which is both stable across compiler versions and, unlike a body, a direct
+statement of what the function computes.
+
+For `Nat.add`, with `x`, `y` fresh locals of type `Nat`, the kernel checks
+
+```
+add x 0        ≡ x
+add x (succ y) ≡ succ (add x y)
+```
+
+and nothing else. Both are ordinary conversion questions about open terms, and
+conversion is stable under substitution, so they may be instantiated at any
+closed terms. That settles every numeral case at the meta level, by induction
+on `b`:
+
+```
+  add ⌜a⌝ ⌜0⌝    ≡ add ⌜a⌝ 0           (numeral reading)
+                 ≡ ⌜a⌝                  (first equation at x := ⌜a⌝)
+  add ⌜a⌝ ⌜k+1⌝  ≡ add ⌜a⌝ (succ ⌜k⌝)  (numeral reading)
+                 ≡ succ (add ⌜a⌝ ⌜k⌝)  (second equation)
+                 ≡ succ ⌜a+k⌝          (induction hypothesis)
+                 ≡ ⌜a+k+1⌝             (numeral reading)
+```
+
+so `add ⌜a⌝ ⌜b⌝ ≡ ⌜a+b⌝` for all `a` and `b`, which is exactly what the rule
+asserts. The other operations go the same way, from these equations and no
+others:
+
+| operation | declared type | equations | needs |
+| --- | --- | --- | --- |
+| `Nat.pred` | `Nat → Nat` | `pred 0 ≡ 0`, `pred (succ x) ≡ x` | |
+| `Nat.add` | `Nat → Nat → Nat` | `add x 0 ≡ x`, `add x (succ y) ≡ succ (add x y)` | |
+| `Nat.sub` | `Nat → Nat → Nat` | `sub x 0 ≡ x`, `sub x (succ y) ≡ pred (sub x y)` | `pred` |
+| `Nat.mul` | `Nat → Nat → Nat` | `mul x 0 ≡ 0`, `mul x (succ y) ≡ add (mul x y) x` | `add` |
+| `Nat.pow` | `Nat → Nat → Nat` | `pow x 0 ≡ succ 0`, `pow x (succ y) ≡ mul (pow x y) x` | `mul` |
+| `Nat.beq` | `Nat → Nat → Bool` | the four constructor cases | |
+| `Nat.ble` | `Nat → Nat → Bool` | the four constructor cases | |
+| `Nat.blt` | `Nat → Nat → Bool` | `blt x y ≡ ble (succ x) y` | `ble` |
+| `Nat.div` | `Nat → Nat → Nat` | *none statable* — probed instead, below | |
+| `Nat.mod` | `Nat → Nat → Nat` | *none statable* — probed instead, below | |
+
+An operation whose equations are stated in terms of another additionally requires
+that one to have been licensed already, since the induction step appeals to its
+numeral case. `blt` is settled by a single equation rather than four because it
+says outright which comparison it is, and `ble` has by then been pinned to that
+comparison.
+
+**The declared type is checked too.** An equation is a conversion question, and
+conversion does not care what type its two sides have. Equations alone would
+therefore let a constant declared at `Foo → Foo → Foo` — whose two "equations"
+happened to check, `Foo` being whatever it likes — have the kernel replace a term
+of type `Foo` with a `Nat` numeral, which is a type error the kernel would have
+introduced itself. So the declared type is compared against the stored one, and
+an operation carrying universe parameters (the stored types have none) is
+declined outright.
+
+Two further properties make this safe rather than merely plausible. The equations
+are written with the very constants the rule will emit — `Nat.succ`, `Nat.zero`,
+`Bool.true` — so whatever those names happen to denote, the induction concludes
+something about the term actually produced; no name is believed, only related to
+itself. And failure is inert: an operation that does not check is not
+accelerated, and reduces the slow way.
+
+Checking the equations runs on a full budget (§7.4), since a conversion between
+open terms either gets stuck quickly or does not, and a licence that depended on
+what the asking caller had left would not be a property of the environment. The
+answer is a property of the environment. While it is being established the
+operation is recorded as *not* accelerated, so the conversion checks cannot appeal
+to the rule they are establishing.
+
+A licence, once granted, is remembered and carried forward to every later
+declaration in the file. That is sound because a licence is established by
+inspecting the declarations of finitely many named constants and declarations are
+write-once (§4): no later line can change what those names mean, so a *yes* stays
+a *yes* in every larger environment. A *no* is not carried forward — the constant
+some dependency needed may simply not have been declared yet — so it is asked
+again. Only the cost is affected either way; the verdict on a file is not.
+
+**`div` and `mod` have no statable equations, and are licensed by probing.** An
+exported `Nat.div` recurses on a fuel argument under a guard `0 < y`, so `div x y`
+with `x` and `y` open gets stuck on a comparison it cannot decide; no rewriting of
+the equation moves that, and there is nothing of the shape above for the kernel to
+check. What such a definition *does* do is compute. Handed two numerals it reduces
+to a numeral, by the file's own rules and with no help from the kernel. So instead
+of an equation these two are held against a **probe battery**: a fixed list of
+numeral pairs on which the file's own `div` and `mod` must reduce to the right
+answers.
+
+The battery is 169 exhaustive pairs — every `a`, `b` in `0 … 12`, so every relation
+the two arguments can stand in appears, including both zero cases — followed by a
+short irregular ladder past it, with dividends up to 128 chosen to include a
+divisor of one, a divisor exceeding the dividend, equal pairs, exact quotients,
+maximal remainders, powers of two and their neighbours, and a large zero divisor.
+The ceiling is low deliberately: a fuel recursion costs about the square of the
+dividend, so probing at the numerals this licence exists to make cheap would cost
+exactly what the licence saves. For the same reason the probes, unlike the
+equations, run on a *fixed* budget rather than a full one — they reduce closed
+terms, which have no guarantee of getting stuck, and a definition that does not
+compute must not be able to turn the attempt into an unbounded one. The budget is a
+constant, so the answer is still a property of the environment; a starved probe
+answers *no*, which only ever declines a shortcut.
+
+**This is weaker than an equation licence, and is marked as such in the code.** An
+equation between open terms settles every numeral case at once, by the induction
+displayed above. A probe settles the one case it names. What the kernel supplies is
+the extrapolation from the pairs tried to the rest, and that extrapolation is the
+whole of what this licence assumes — nothing else here rests on an unchecked step.
+Two things bound the risk. Every probe that passes is an equality the file's theory
+already had, so on a file whose `div` really is division the shortcut adds no
+definitional equality at all; and a file whose `div` differs from division
+anywhere in the battery is declined outright, so the shortcut can only be wrong for
+a definition contrived to agree on 185 named pairs and disagree elsewhere.
+
+`Nat.le` has no entry for a plainer reason — it is an inductive family in `Prop`,
+not a function, and has nothing to compute; the decidable comparisons that stand in
+for it, `Nat.decLe` and `Nat.decLt`, reduce through `ble` and `blt`, which do.
+
+**Modes.** `--nat-accel` selects how much evidence a licence requires. The
+default demands the most that can be demanded without rejecting a faithful
+export.
+
+| `--nat-accel=` | licence requires | sound |
+| --- | --- | --- |
+| `off` | — nothing is ever accelerated | yes |
+| `canonical` *(default)* | the stored type, the stored equations *or* probes, the dependencies, **and** that `Nat` and `Bool` are the standard inductive types | yes |
+| `verified` | the stored type, the stored equations *or* probes, the dependencies | yes |
+| `always` | the name | **no** |
+
+The extra condition in `canonical` is that `Nat` is a parameter-free, index-free
+inductive in `Type` whose constructors are exactly `Nat.zero : Nat` and
+`Nat.succ : Nat → Nat` in that order, and — for the comparisons — that `Bool` is
+likewise `Bool.false`, `Bool.true` in that order, each check being on arity,
+constructor names and order, and `≡` on every type involved. That is not needed
+for soundness, which the equations already carry, and it is what separates
+`canonical` from `verified`: it is a statement about what the kernel is willing
+to be *surprised* by. A file that reimplements `Nat` with a third constructor and
+an `add` that still satisfies both equations is doing something the author of
+this checker did not anticipate, and the default is to decline the shortcut and
+unfold, rather than to be clever about a situation nobody designed for. Soundness
+is unaffected either way; `verified` is available for anyone who wants the
+shortcut on that file anyway.
+
+`always` is the odd one out: it is the only mode that takes a name on trust, and
+it is provided so that `eink0rn` can be made bug-compatible with a kernel that
+does, for the purpose of *reproducing* a disagreement rather than resolving it.
+It is not sound and is not a supported way to check a proof. It is also the only
+mode that will accelerate an operation for which neither equations nor probes are
+stored, which at present is no operation at all.
+
+**Reading a numeral.** `⌜n⌝` is a `nat_lit`, or `Nat.zero`, or `Nat.succ`
+applied to a numeral — folded back to an integer, and read up to `whnf`. Folding
+is not a refinement: `Nat.decLt n m` is `Nat.decLe (Nat.succ n) m`, so a
+comparison against a bound reaches the rule with one constructor already peeled
+off, and accepting only bare literals would miss every `decide` in the prelude.
+This is sound for the same reason the expansion in §6.3 is: it is used only
+where §12.1's `Nat` shape check has passed, which is what makes `Nat.succ ⌜k⌝`
+and `⌜k+1⌝` the same term as far as conversion is concerned.
+
+---
+
+## 7. Definitional equality
+
+`isDefEq t s` first tries syntactic equality (cheap, hash-guarded), then
+`whnfCore`s both sides, then loops:
+
+1. **Binder congruence** — `Lam`/`Lam` and `Pi`/`Pi`: domains defeq and bodies
+   defeq under a fresh local. *Definitive*: nothing else applies to a binder in
+   whnf.
+2. **Function eta** — `f ≡ fun x => f x`, tried in both directions. *Definitive*
+   when either side is a lambda.
+3. **Sorts and literals** — `Sort a ≡ Sort b` iff `a ≈ b`; literals by value;
+   literal against constructor-headed term by expanding the literal.
+   *Definitive*.
+4. **Rigid spine congruence** — when the head is *not* a delta-unfoldable
+   definition (a local, an axiom, a constructor, an inductive type, a stuck
+   recursor, a stuck projection), compare heads and arguments pairwise.
+   *Positive only*: failure falls through.
+5. **Proof irrelevance** — if `t`'s type is a proposition and `s`'s type is
+   definitionally equal to it, `t ≡ s`.
+6. **Lazy delta** — unfold the side whose head definition has the greater height;
+   when heights are equal and both heads are the same constant, first try
+   argument-wise congruence, and only unfold both if that fails.
+7. When nothing can be unfolded, the **last resort** rules: projection
+   congruence, structure eta, and unit-like eta.
+
+### 7.1 Why this order
+
+Rigid-spine congruence is tried *before* proof irrelevance and before delta. It
+is not speculative (there is nothing else a rigid pair could reduce to), it costs
+nothing when the heads differ, and getting it in early is what keeps the kernel
+from inferring the type of every intermediate term of a long computation — which
+is what proof irrelevance would otherwise do.
+
+For a head that *is* a definition the same congruence *is* speculative, since the
+two sides may only agree after unfolding, so it is left to step 6 where it can be
+weighed against the heights.
+
+### 7.2 Structure eta and unit-like eta
+
+- **Structure eta**: if one side is `mk p̄ f̄` for a structure-like type and the
+  other has that type, compare each `fᵢ` with `other.[T, i]`.
+- **Unit-like eta**: a structure with *no* fields has exactly one element up to
+  conversion, so any two terms of that type are equal.
+
+### 7.3 The one-sided invariant
+
+**Every call to `isDefEq` in the kernel is in a positive position.** A `False`
+can only cause a rejection or a missed reduction; it can never cause an
+acceptance. This is what licenses the incompleteness in steps 4 and 7, the
+sufficient-only `max` rule in §3.1, and the budget in §7.4.
+
+### 7.4 Fuel, waste, and `DStarved`
+
+This is an efficiency device, not part of the theory, and it is the part most
+worth being suspicious of — so, precisely:
+
+Some comparisons are *speculative*: the caller is going to unfold and ask again if
+the answer is no. Argument-wise congruence under equal heads (step 6) is the
+example. The arguments the two sides disagree on may be exactly the ones that
+unfolding the head is about to discard, and normalising them can cost arbitrarily
+more than the comparison the caller actually wants.
+
+So a speculative comparison runs under a step budget (`tcFuel`), drawn from a
+per-declaration allowance for *wasted* work (`tcWaste`, 20000 steps). When the
+budget runs out, reduction stops where it stands and the comparison answers
+`False`.
+
+This is sound because **every rule that answers `True` is sound no matter how much
+reduction preceded it**. A starved comparison can therefore only ever answer
+`False`, and in a speculative position `False` means "not this way", not "not
+equal". Nothing that is a proof stops being one; a speculation that would have
+succeeded costs one unfolding and gets asked again with a fresh budget on the
+next pass.
+
+Two consequences are handled explicitly:
+
+- Speculation that *pays off* is not charged against `tcWaste`; work that decided
+  a comparison is work the checker would have had to do anyway. The budget bounds
+  dead ends, not congruence.
+- Rules that have to *infer a type* (K-like reduction, structure eta, unit-like
+  eta, proof irrelevance) are skipped when the budget is exhausted. With no fuel
+  left, reduction has stopped early, so the types they would read off are not the
+  real ones; the honest answer is "no opinion" rather than a wrong one.
+- `DStarved` is returned when the budget ran out before *anything* could be
+  unfolded. It is not a statement about the terms — it says the round made no
+  progress, so the loop must stop rather than ask the same question forever.
+
+The budget is therefore a completeness knob with no soundness content. Raising it
+can only turn rejections into acceptances of things that were already provable;
+lowering it can only turn acceptances into rejections.
+
+---
+
+## 8. Inductive types
+
+The core primitive is a **flat mutual block**: a finite, non-empty set of families
+over a *shared* parameter telescope, each a plain telescope of indices ending in a
+sort. A single inductive type is the one-member case. Nesting is not part of the
+core (§9).
+
+### 8.1 Why a mutual block, and not a single indexed type
+
+The project's stated ambition was to compile mutual inductives away into a single
+indexed type with projections. That was tried and rejected as a design, for
+reasons worth recording:
+
+- The encoding needs an index type (a finite enumeration of the block's members)
+  that may not exist yet — mutual blocks appear in the prelude *before* anything
+  to index them with;
+- eliminating into `Sort u` from that index type requires it to large-eliminate,
+  which is another obligation to discharge before the prelude has the machinery;
+- the members of a block may sit at *heterogeneous* universe levels, and a single
+  type has one level; reconciling them means inserting universe lifts, which
+  changes the types the export wrote down and so breaks the recursor-matching
+  check of §1.
+
+A mutual block is already the primitive the thesis treats (§2.9), and treating it
+directly costs one extra index (`which member?`) in the bookkeeping and nothing in
+the metatheory. The genuinely aggressive normalisation — the transformation that
+*does* buy a simpler core — is nesting, which is compiled away completely (§9).
+
+### 8.2 Notation
+
+Following the thesis, with parameters as ordinary context variables (the outer
+`forall params` is put back at the very end):
+
+```
+t_j : forall a::α_j, Sort l_j          the j-th family
+c   : forall b::β, t_j p̄[b]            a constructor of the j-th family
+b_i : forall x::ξ_i, t_k π_i[b,x]      a recursive field, landing in the k-th family
+```
+
+### 8.3 Admitting a block
+
+1. Every declared arity is a well-formed type, and they agree on the shared
+   parameter telescope (the first member's is definitive; the rest are checked
+   against it, up to definitional equality of each binder type). Each must end in
+   a `Sort`.
+2. Every member is added to a scratch environment as an **axiom** of exactly its
+   declared arity, and the constructors are checked against that. So a
+   constructor may only see its own block's types as opaque constants of the right
+   arity — it cannot exploit anything about their contents.
+3. Constructor analysis (§8.4).
+4. Derived attributes (§8.5, §8.6).
+5. Recursor construction (§8.7), whose derived type is itself type-checked as an
+   audit.
+
+### 8.4 The `ctor` judgement
+
+Walking a constructor's type left to right, after peeling the shared parameters:
+
+For each field `dom` with sort `l'`, where `l` is the sort of the member being
+constructed:
+
+- **Universe condition**: `imax(l', l) ≤ l`. When `l = 0` this holds always — a
+  proposition may quantify over anything. Otherwise it amounts to `l' ≤ l`.
+- **Classification**: if no member of the block occurs in `dom`, the field is
+  non-recursive. Otherwise `dom` must have the strictly positive shape
+  `forall x::ξ, t_k p̄ π̄` where:
+  - no member of the block occurs anywhere in `ξ` (no occurrence to the left of an
+    arrow),
+  - `t_k` is applied to the block's own parameter locals, unchanged,
+  - `t_k`'s universe arguments are exactly the block's own,
+  - no member occurs in the indices `π̄`.
+
+  Anything else — a negative occurrence, or a member under some other type
+  constructor — is rejected. Nested occurrences never reach here; §9 has already
+  turned them into extra members.
+
+The result type must be `t_owner p̄ ī` for the member the constructor was declared
+for, with the same parameter and universe conditions, and with no member
+occurring in `ī`. A *recursive field* may land in any member of the block; the
+*result* may not.
+
+Field types are whnf'd before being peeled, so a field whose type is a definition
+that only unfolds to a function type is still analysed correctly.
+
+### 8.5 Large elimination
+
+A block eliminates into an arbitrary `Sort` when **every** member does, since they
+share the motives. A member does when either:
+
+1. `isDefinitelyNonZero l_j` — it is provably not a proposition under any
+   assignment; **or**
+2. it is a *subsingleton*: at most one constructor, each of whose fields is
+   either a proof or is recovered from the result's indices. Formally, with the
+   single constructor's shape `sh`, every field `f` satisfies
+
+   ```
+   isDefinitelyZero (sort of f)   ∨   f ∈ resultIndices(sh)
+   ```
+
+Case 2 is what makes `Eq.rec`, `And.rec` and `Acc.rec` large-eliminating while
+`Exists.rec` is not: `Exists.intro`'s witness is data that the result type
+`Exists p` does not mention, so it must not be allowed to escape.
+
+**"Is a proof" is read absolutely.** The field's sort must be zero under every
+assignment, not merely whenever the member itself lands in `Prop`. The weaker,
+relative reading `l' ≤ imax l' l` is tempting — it is what one reaches for to
+justify a universe-polymorphic structure with fields at `u` and `v` — but it is
+not the rule, and `refs/tests/good/tutorial/093_MaybeProp.mk.ndjson` settles it:
+
+```
+MaybeProp.{u} : Sort u
+MaybeProp.mk  : PUnit.{u} → (PUnit.{u} = PUnit.{u}) → True → MaybeProp.{u}
+MaybeProp.rec : one universe parameter, motive into Sort 0
+```
+
+The first field sits at `u`, and the exported recursor has no elimination
+universe. The relative reading would grant one, since `u ≤ imax u u`.
+
+Nothing is lost by the strict reading: the polymorphic structures one worries
+about are covered by case 1. `PProd` and `PSigma` are declared at
+`Sort (max 1 (max u v))`, which is provably non-zero, so they never reach the
+subsingleton test.
+
+### 8.6 The `k` flag
+
+K-like reduction (§6.3) is available exactly when the block has **one** member,
+that member is `isDefinitelyZero`, and it has exactly **one** constructor with
+**zero** fields. This is the shape of `Eq`.
+
+### 8.7 Recursors
+
+One recursor per member:
+
+```
+T_j.rec.{u, l̄} : forall params,
+                 forall C::κ,           -- one motive per member of the block
+                 forall e::ε,           -- one minor premise per constructor of the block
+                 forall a::α_j,         -- the j-th member's indices
+                 forall (z : T_j params a),
+                 C_j a z
+```
+
+with
+
+```
+κ_j = forall a::α_j, T_j params a -> Sort u
+ε_c = forall b::β, forall v::δ, C_owner(c) p̄[b] (c params b)
+```
+
+where the induction hypotheses `v` come after *all* the fields, one per recursive
+field, each stated with the motive of the member **that field lands in**:
+
+```
+v_i : forall x::ξ_i, C_k π_i[b,x] (b_i x)
+```
+
+`u` is a fresh universe parameter under large elimination and `0` otherwise. Its
+*name* is taken from the export when the export has one, purely so that the
+derived type is literally the same term and comparisons are cheap; the name is
+cosmetic.
+
+The iota rule for constructor `c` of member `j`:
+
+```
+T_j.rec params C̄ ē p̄[b] (c params b)  ⟶  e_c b v̄
+    where  v_i = fun x::ξ_i => T_k.rec params C̄ ē π_i[b,x] (b_i x)
+```
+
+Note that an induction hypothesis calls the recursor of **its own** member, which
+is what makes a mutual block recurse across its types — and note that the prefix
+`params C̄ ē` is identical for every recursor of the block, which is why §6.3 can
+use one arithmetic for all of them.
+
+Right-hand sides are stored abstracted over `params, C̄, ē, fields`, in that order.
+
+### 8.8 What the export must then agree with
+
+Per §1: `all` lists exactly the block's declared types (not the recursors, and not
+the nesting auxiliaries); the parameter, motive, index and minor counts match; the
+`k` flag matches; the universe-parameter count matches; the type is definitionally
+equal; every rule matches a derived one with the same field count and a
+definitionally equal right-hand side; and there are no extra rules. Constructor
+bookkeeping (`induct`, `idx`, `numParams`, `numFields`, universe parameters) is
+checked the same way.
+
+A declared recursor's universe parameters must also be *distinct*. They are
+matched to the derived recursor's positionally, so a repeated name would make
+that substitution ambiguous — `rec.{u,u}` could be read as either projection —
+and the comparison would be deciding a question the file did not ask.
+
+---
+
+## 9. Nested inductives
+
+A nested inductive mentions itself underneath some *other*, already admitted, type
+constructor:
+
+```
+inductive Syntax | node : SyntaxNodeKind -> Array Syntax -> Syntax | ...
+```
+
+The core has no rule for this: strict positivity (§8.4) only recognises an
+occurrence as the head of a field's result. The standard reading is that
+`Array Syntax` is a copy of `Array` specialised at `Syntax`, mutually recursive
+with it — so that is literally what `Front.Lower` builds.
+
+### 9.1 The transformation
+
+1. **Discover.** Scan the block's constructor types (opened at the parameter
+   locals) for subterms `C p̄ ī` where `C` is an already-admitted inductive type,
+   `C` is applied to at least its parameters, the parameters are closed with
+   respect to bound variables, and some member of the block occurs in them. Then
+   scan the *specialised constructor types* of each container found, and repeat
+   until nothing new appears. Every step moves to a container declared strictly
+   earlier, so this terminates; the file's own `numNested` is used as a cap, and
+   a mismatch is an error rather than a surprise.
+
+   The scan stops *at* an occurrence: having reported `C p̄`, it looks only inside
+   the indices `ī`, never inside `p̄`. Nothing is lost, because whatever is nested
+   in `p̄` and actually matters reappears in `C`'s own constructor types once they
+   are specialised at `p̄` — one round later rather than immediately. The queue of
+   terms to scan is first in, first out, so the copies come out **breadth first**:
+   the containers wrapping the block itself, then the containers wrapping those,
+   and so on. Order is not cosmetic. It is the order of the auxiliary members,
+   hence of the motives and minor premises of every recursor the block yields, and
+   §8.8 requires the export's recursors to be the ones the kernel derived.
+
+   A consequence of stopping at an occurrence is that a member buried in a
+   parameter the container never uses gets no copy — correctly, since no
+   constructor of the copy could mention it.
+
+   An occurrence whose parameters mention a *bound* variable is deliberately
+   skipped: the copy would have to depend on it and there is no such member. The
+   block's own name is then left where it is, and strict positivity rejects it.
+
+2. **Build.** Each distinct occurrence becomes an extra member of the block under
+   an internal name `T._nested.k`, with the container's arity specialised at those
+   arguments, and the container's constructors specialised likewise under names
+   `T._nested.k.ctor.j`. The block is required to be nested only in the
+   container's *parameters*: an index is not a positive position, and a member
+   occurring in one would silently be dropped by the specialisation.
+
+3. **Rewrite.** Every occurrence in the block's own constructor types is replaced
+   by the corresponding auxiliary member applied to the block's parameters.
+
+4. **Admit.** What remains is an ordinary flat mutual block, and §8 handles it
+   with no special cases.
+
+5. **Unnest.** After the recursors are derived, the internal names are replaced by
+   the containers they stood for. An auxiliary is always applied to the block's
+   parameters first, so the substitution beta-reduces on the spot and what comes
+   back out is exactly the term the export wrote. The auxiliary members, their
+   constructors, and their recursors are dropped; **nothing internal ever reaches
+   the environment**.
+
+6. **Re-audit.** Unnesting rebuilds terms behind the kernel's back, so for a
+   nested block every surviving recursor type is type-checked again in the final
+   environment before the export is compared against it.
+
+### 9.2 Why this is the right shape
+
+Because the specialised copies go through the *same* positivity and universe
+checks as everything else. Unsound nesting is caught by those checks and not by a
+special case: nesting inside `fun a => a -> False` turns into a member with a
+negative field, and the `ctor` judgement of §8.4 rejects it. There is no separate
+"is this container acceptable to nest in?" predicate to get wrong.
+
+---
+
+## 10. Quotients
+
+`Quot` is the one piece of the theory that is neither an inductive type nor an
+axiom: its eliminator computes, but only on `Quot.mk`, and unlike a derived
+recursor it demands a proof that the function respects the relation. That extra
+argument is exactly what keeps `Quot.sound` consistent, so the four primitives are
+pinned down rather than taken on trust. Each declared primitive's type must be
+definitionally equal to:
+
+```
+Quot.{u}   : forall (α : Sort u) (r : α → α → Prop), Sort u
+Quot.mk.{u}: forall (α : Sort u) (r : α → α → Prop), α → Quot α r
+Quot.lift.{u,v}
+           : forall (α : Sort u) (r : α → α → Prop) (β : Sort v) (f : α → β),
+             (forall a b, r a b → f a = f b) → Quot α r → β
+Quot.ind.{u}
+           : forall (α : Sort u) (r : α → α → Prop) (β : Quot α r → Prop),
+             (forall a, β (Quot.mk α r a)) → forall q, β q
+```
+
+`Quot.sound` is *not* here. It is an ordinary axiom in the export and is admitted
+as one; the kernel synthesises nothing for it. Only the four kinds above are
+recognised, and only their stated types are accepted.
+
+Note that the expected types refer to the names the file itself gave to `Quot` and
+`Quot.mk`. `Quot.lift`'s statement additionally mentions `Eq` — a name the file
+owns and the kernel does not synthesise — so before `Quot.lift` is admitted, `Eq`
+is checked to be equality. Without that check the congruence premise is whatever
+the file wants it to be, and the quotient is unsound; see §12.1.
+
+---
+
+## 11. Implementation invariants
+
+These are not part of the theory, but the rules above are only correctly
+implemented if they hold.
+
+### 11.1 The `LEnv` invariant
+
+Inference threads a de Bruijn environment instead of substituting at every
+binder. The invariant is asymmetric:
+
+- `inferM m Δ e` may be given an `e` that is *open* with respect to `Δ`;
+- the type it returns is always *closed* — every variable in it is a local
+  constant with an entry in the local context.
+
+That is what makes the environment cheap: it is threaded down through `Lam` and
+`Pi` without touching the body, and materialised only where a subterm has to be
+handed to something that needs a real term (a binder type entering the context, an
+argument being substituted into a dependent codomain, the structure of a
+projection). Substituting instead, as §5.2 is written, is quadratic: a telescope
+of `n` binders copies its body `n` times.
+
+A term needing more variables than the environment supplies is rejected as a loose
+bound variable, not silently renumbered.
+
+### 11.2 The `InferMode` invariant
+
+`Verify` is the real judgement of §5.2: every premise of every rule is checked.
+`Assume` computes the *same type* but takes the premises on trust, walking only
+the head spine and the binders.
+
+`Assume` is sound to use exactly when the term is already known to typecheck,
+because then the premises it skips are known to hold. That is a standing
+invariant of `whnf` and `isDefEq`: a term only reaches them after `checkType` has
+been through it — a subterm of a checked term is checked, and the types
+`ensurePi`/`ensureSort` hand around are the types of checked terms. The
+conversion checker leans on this heavily; proof irrelevance asks for the type of
+both sides of every stuck comparison, and re-verifying those turns a linear check
+into a quadratic one.
+
+Note which premises are *not* skipped in `Assume`: the two sorts in `(pi)` are part
+of the result, not a premise, so they are computed in either mode.
+
+### 11.3 Terms are graphs
+
+The export shares subterms, and so do lifting, instantiation and universe
+instantiation. A term whose printed form is astronomically large routinely fits
+in a few thousand nodes. Two caches keep the kernel working on the graph rather
+than on its tree unfolding:
+
+- every node caches its `looseBVarRange`, so de Bruijn plumbing can leave a closed
+  subterm alone in constant time;
+- every node caches a structural hash, which decides most inequalities in constant
+  time.
+
+Both are maintained by pattern synonyms, so nothing outside `Kernel.Expr` can set
+a cache to a lie.
+
+### 11.4 Memoisation keys
+
+Inference and `whnf` are memoised on `(node, local environment)`, keyed by hash and
+matched by **pointer equality**, never by structural equality: asking whether two
+same-hash nodes are structurally equal can cost exponentially more than
+recomputing the answer. A lookup therefore finds an entry only when it is
+literally the same node — which is exactly the case that matters, since what makes
+a shared subterm expensive is being visited once per path to it.
+
+The environment half of the key is just the innermost local, which identifies the
+whole list: fresh locals are handed out from a counter that only ever grows and
+are immediately consed onto one particular environment, so no id is ever the head
+of two different ones. `whnf` takes no local environment — by §11.1 it is only
+ever called on closed terms — so its half of the key is constant.
+
+All three tables are invalidated when the global environment or the declaration's
+universe parameters change, since both the inferred type and what a constant
+unfolds to depend on them. Buckets are capped so a hash collision cannot turn the
+table into a leak. Missing a hit only wastes time.
+
+The `whnf` memo has one extra condition: an entry is recorded only when the
+reduction ran *outside* a speculation (§7.4). A starved reduction stops where it
+stands and returns a term that is correct to **use** — a speculation reads a
+failure to reduce as "not this way", never as "not equal" — but not correct to
+**remember**, since a later caller with a real budget would be handed the
+half-reduced term as if it were the normal form and could fail a comparison that
+holds. Outside a speculation the fuel is unmetered and stays so for the whole
+call — `spend` leaves it alone and `speculate` puts it back — so testing it once
+on entry is enough.
+
+That leaves the waste allowance, which a nested speculation *can* exhaust, and
+which therefore also affects how far an unmetered reduction gets. It needs no
+guard: the allowance only ever decreases within a declaration, and resets
+between them, so the first encounter with a node is the one with the most budget
+and no later caller is handed a result computed with less than it had itself.
+(In the other direction there is nothing to protect against. A cached result
+that is *more* reduced than a caller could have managed is still reached by
+reduction steps, so it is a correct answer, just a better one.)
+
+Without these memos, inference and reduction run over the term's tree unfolding,
+which for a shared term is exponentially larger than the term. In practice the
+`whnf` memo is what makes arithmetic proofs finish at all: the same dictionary —
+`instHMul`, `instOfNat` — is reached from every operation in the expression.
+
+The memos above are keyed on a term and so are discarded between declarations.
+The §6.5 licences are not: they are facts about the *environment*, they are
+expensive to establish — the `div` probe battery is the whole of §6.5's ladder —
+and a positive one stays true as the environment grows, so they are stored in the
+environment and travel with it. Only positive answers travel; see §6.5 for why
+that is what makes it sound.
+
+---
+
+## 12. The name surface, and deliberate divergences
+
+Recorded so that a disagreement with official Lean can be diagnosed rather than
+patched. §12.1 is the part of the kernel that is *not* name-blind, and how each
+name is earned; §12.2 onwards are places where `eink0rn` knowingly answers
+differently from official Lean, in both directions: §12.2 and half of §12.6
+accept more, §12.3, §12.4 and §12.7–§12.9 accept less.
+
+### 12.1 Names with meaning
+
+Four rules reach for a constant by *name* — a name the file chose, and could
+have attached to something else. Each is therefore pinned: the shape is checked
+before the rule fires, and if the check fails the rule is simply not available.
+A name is never evidence.
+
+| rule | names | pinned by |
+| --- | --- | --- |
+| literal typing (§5.2) and expansion (§6.3) | `Nat`, `Nat.zero`, `Nat.succ` | `Nat` is an inductive whose two constructors are nullary and unary, and `Nat.succ (nat_lit 0)` typechecks at `Nat` |
+| string expansion (§6.3) | `String`, `String.ofByteArray`, `ByteArray`, `ByteArray.IsValidUTF8.intro`, `List.utf8Encode`, `Eq.refl`, `List`, `List.nil`, `List.cons`, `Char`, `Char.ofNat` | the `Nat` check, plus the constructor arities of `String.ofByteArray`, `List.nil` and `List.cons`, plus: the expansion of a one-character string typechecks at `String` |
+| arithmetic (§6.5) | `Nat.pred`, `Nat.add`, `Nat.sub`, `Nat.mul`, `Nat.pow`, `Nat.beq`, `Nat.ble`, `Nat.blt`, `Bool.true`, `Bool.false` | the operation's own declared type and defining equations, per operation; under the default mode also the standard shape of `Nat` and `Bool` |
+| arithmetic (§6.5), probed | `Nat.div`, `Nat.mod` | the same, but with the equations — which for these two cannot be stated — replaced by a fixed battery of numeral pairs the file's own definition must reduce correctly on |
+| `Quot.lift`'s congruence premise (§10) | `Eq` | `Eq` is an inductive family of the shape of equality, with a single field-free constructor |
+
+The stored forms all three rules compare against are collected in one module,
+`Kernel.Canon`, so that the complete list of things `eink0rn` has an opinion about
+can be audited without reading the checker. Nothing in that module is trusted:
+it is a table of *claims to be checked*, and every entry is reached only through
+a comparison whose failure disables a rule rather than accepting a file.
+
+One witness suffices for the literal cases because every numeral's expansion has
+the same shape — `Nat.succ` applied to a numeral — and differs only in the
+numeral; likewise a one-character string exercises every constant of the string
+expansion at exactly the types any string's expansion uses them at, since strings
+differ only in the length of the character list and the numerals in it. A literal
+over constants that are not the right shape keeps its type and stays opaque, which
+is sound: an uninterpreted constant proves nothing.
+
+Of the string constants only three are required to be *constructors*, and for one
+reason: an expansion whose head is not a constructor is inert, so nothing that
+wanted to see a constructor gets shown the wrong thing. The rest need only have the
+right type. In particular the kernel forms no opinion about what `List.utf8Encode`
+computes: the byte array is whatever that function says, and the evidence field is
+the expansion's own `Eq.refl`, which is a proof, so no rule below can depend on the
+answer. A file that defines `List.utf8Encode` as a constant function makes all its
+string literals convertible to each other — and to nothing else, since §7 step 3
+still holds two distinct `str_lit`s apart. That direction only ever refuses a
+conversion, never grants one, so the file is checked against a weaker theory rather
+than a wrong one.
+
+The `Eq` check is the one with teeth, and it is worth spelling out why it is
+needed. `Quot.lift`'s congruence premise is `forall a b, r a b → f a = f b`, and
+that `=` resolves by name against whatever the file declared. So the file
+chooses how strong its own obligation is. Declaring
+
+```
+Eq.refl : forall (α : Sort u) (x y : α), Eq α x y     -- second point a *field*
+```
+
+makes `Eq` the total relation, the premise vacuous, and every function liftable
+across every relation; combined with a `Quot.sound` stated over a second,
+faithful equality, it collapses `Bool` and proves `False`. So before `Quot.lift`
+is admitted, `Eq` must be an inductive with two parameters, one index, one
+universe parameter and a single constructor, and both its type and its
+constructor's type must be definitionally equal to
+
+```
+Eq.{u}      : forall (α : Sort u), α → α → Prop
+Eq.refl.{u} : forall (α : Sort u) (a : α), Eq α a a
+```
+
+What iota for `Quot.lift` actually needs is that `Eq α x y` be inhabited only
+when `x ≡ y`, and that follows from the shape alone: the sole introduction form
+takes no fields, so any inhabitant of `Eq α x y` whnfs to `Eq.refl α a` for some
+`a`, and matching its type against `Eq α x y` forces `x ≡ a ≡ y`.
+
+The constructor is found by *position* — the unique constructor of `Eq` — and
+pinned by its *type*. Its name is not load-bearing and is not checked: an
+equality whose constructor is called something else is still an equality, and
+rejecting it would be a divergence with no soundness content behind it. (§12.5
+is an opt-in audit that does check the name, on the different ground that a file
+in which it differs is not the file it is claiming to be.)
+
+`Eq` is the only constant the kernel *borrows* in this way; every other name in
+the table above belongs to a rule that could in principle be dropped, whereas
+the quotient package cannot state its own premise without it.
+
+### 12.2 Level-algebra completeness
+
+`levelLeq` case-splits fully on `imax` (§3.1) and so decides identities that
+official Lean's normaliser does not. `eink0rn` will therefore *accept* files that
+official Lean rejects on universe grounds. This is a deliberate,
+thesis-faithful divergence in the permissive direction, and it is safe here
+because the projection side condition of §5.3 is stated as an `imax` inequality
+that the same complete procedure decides — so the extra power is used to close a
+hole rather than to open one.
+
+### 12.3 The quotient package is atomic
+
+Quotient primitives are *checked* one at a time — each against the type §10
+demands of its kind, stated over the type and constructor the file itself
+declared earlier. But the package is *admitted* whole or not at all: at the end
+of the file, if any `quot` declaration appeared then there must be exactly one
+of each of the four kinds `type`, `ctor`, `lift`, `ind`.
+
+This is a conformance rule, not a soundness rule, and the distinction matters
+for auditing. Every proper fragment of the package is sound on its own — the
+model of §10 interprets `Quot α r` as the set of equivalence classes and the two
+eliminators as the functions that factor through it, and dropping an eliminator
+only makes the type harder to use. Nothing is synthesised for a missing
+primitive; a file with three of them proves strictly less than one with four.
+The reason to reject it anyway is that the elaborator introduces the four
+together and every real export carries them together, so three is a file
+assembled by something that is not an exporter, and the cheapest honest response
+is to say so rather than to proceed on a guess about the fourth.
+
+The rule is stated on **kinds, not names**. Nothing in the theory cares what the
+primitives are called: §10's expected types are built from the file's own
+`type`- and `ctor`-kind declarations, so a package spelled `Q`, `Q.mk`, `Q.lift`,
+`Q.ind` is still the package. What "exactly one" forbids is a *second* package,
+or a second constructor for the same quotient type — the iota rule of §6.4 is
+stated for one `ctor`, and two would make it ambiguous.
+
+`Quot.sound` is deliberately outside this rule. It reaches the file as an
+ordinary `axiom` line rather than a `quot` line, seven of the nine arena exports
+that use quotients omit it entirely, and omitting it is a weakening. `--pin-std`
+(§12.5) additionally audits the four *names*, which this rule does not.
+
+### 12.4 Recursor names
+
+The set of recursors a block may declare is pinned to `{T.rec}` plus the nesting
+auxiliaries (§1). A block that named its recursor anything else would be
+rejected even if the recursor were otherwise correct.
+
+### 12.5 The standard-form audit (`--pin-std`)
+
+Everything above is a rule about what the kernel is entitled to *do*. This one is
+not: it decides nothing, it enables nothing, and with it off the checker's
+verdicts are exactly what §1–§11 say they are. It answers a different question —
+not "is this file consistent?" but "is this file about the things it appears to
+be about?"
+
+The motivation is that the three axioms Lean's mathematics rests on —
+`Classical.choice`, `propext`, `Quot.sound` — are *asserted*, not proved. A kernel
+cannot check them; it can only check that they are well-typed. But each is stated
+over constants the file itself owns, so the way to weaken one is not to touch the
+axiom at all. Leave it verbatim and redefine what it quantifies over. `propext`
+over an `Iff` that is not bi-implication says nothing; `Classical.choice` over a
+`Nonempty` that is not inhabitation says nothing; `Quot.sound` over an `Eq` that
+is not equality says everything. Each such file is perfectly consistent and
+perfectly sound — it is simply not about what its axiom names suggest.
+
+`--pin-std` audits the transitive support of those three axioms, plus `False`
+itself as the thing a smuggled definition would be aiming at:
+
+| pinned | required to be |
+| --- | --- |
+| `False` | an inductive in `Prop`, no parameters, no indices, **no constructors** |
+| `Eq` | `Eq.{u} : ∀ (α : Sort u), α → α → Prop`, two parameters and one index, with the single field-free constructor `Eq.refl.{u} : ∀ (α : Sort u) (a : α), Eq α a a` |
+| `Iff` | `Iff : Prop → Prop → Prop` with the single constructor `Iff.intro`, two fields |
+| `Nonempty` | `Nonempty.{u} : Sort u → Prop` with the single constructor `Nonempty.intro`, one field |
+| `Quot`, `Quot.mk`, `Quot.lift`, `Quot.ind` | quotient primitives of exactly those four kinds |
+| `propext` | an axiom, no universe parameters, `∀ (a b : Prop), Iff a b → Eq.{1} Prop a b` |
+| `Classical.choice` | an axiom, one universe parameter, `∀ {α : Sort u}, Nonempty α → α` |
+| `Quot.sound` | an axiom, one universe parameter, `∀ {α : Sort u} {r : α → α → Prop} {a b : α}, r a b → Eq (Quot r) (Quot.mk r a) (Quot.mk r b)` |
+
+For an inductive the audit checks the universe-parameter count, parameter and
+index counts, the constructor names *in order*, and `≡` on the type of the
+inductive and of every constructor — that is, it checks strictly more than §12.1
+does, and the extra it checks is exactly the identity information §12.1 rightly
+declines to require. A name absent from the file is not audited; the audit is
+about what a file says, not about what it omits.
+
+The one thing checked that is not a per-name comparison: if a file declares any
+of `Quot`, `Quot.mk`, `Quot.lift`, `Quot.ind`, it must declare all four. Note
+that `Quot.sound` is *not* in that group. It is exported as an ordinary axiom
+rather than as a quotient primitive, and appears only when something in the file
+reaches it, so most exports that use quotients at all do not have it; requiring
+it here would fire on perfectly ordinary files. The other four are introduced
+together by the elaborator and exported together by every real export, and a file
+with three of them has been edited by hand, whatever else is true of it.
+
+Levels: `off` (the default) skips the audit entirely, `warn` reports mismatches on
+stderr and accepts anyway, `error` rejects. `off` is the default because a
+mismatch is not unsoundness — a file may legitimately define its own `Iff` for
+reasons of its own — and a checker that conflated the two would be making a
+claim it cannot support.
+
+**Divergence.** Official Lean does not do this at all, so `--pin-std=error` can
+reject files official Lean accepts. That is the intended behaviour of an opt-in
+audit and not a claim about those files' consistency.
+
+### 12.6 Arithmetic, in both directions
+
+The licence discipline of §6.5 is the largest deliberate divergence in this
+document, and it goes both ways. `eink0rn` computes on numerals when, and only
+when, the file's own definitions say it may; a kernel that keys the same shortcut
+on the name computes in a strictly different set of cases. Neither containment
+holds.
+
+*`eink0rn` accepts what a name-keyed kernel rejects.* Take a file that declares
+`Nat.add` as something other than addition and then proves a theorem about it.
+Its own definition is what `eink0rn` checks against, so the theorem goes through
+if it is true of that definition. A kernel that substitutes machine addition for
+the name is checking a different statement, and will report a contradiction that
+is not in the file. Here `eink0rn` is not being lax: it is refusing to invent a
+definitional equality the file never asserted.
+
+*`eink0rn` rejects what a name-keyed kernel accepts.* Here the divergence is a
+timeout rather than a verdict. An operation whose licence does not check is not
+accelerated and is unfolded instead, so a proof that a name-keyed kernel disposes
+of in a machine multiplication is checked the slow way, and on the numerals such
+proofs actually use it does not finish. `div` and `mod` are the interesting case,
+because they are licensed on the weaker evidence of §6.5's probe battery: a file
+whose `div` disagrees with division on any of the 185 probed pairs loses the
+shortcut entirely, even for the pairs it gets right.
+
+Both directions are mechanically reproducible. `--nat-accel=always` gives the
+name-keyed behaviour exactly, so a file on which the two settings disagree
+isolates the divergence to this rule and nothing else, and the disagreement can be
+inspected rather than argued about. That is the entire reason an unsound mode is
+shipped.
+
+### 12.7 The unsafe fragment
+
+The export format marks a declaration exempt from termination checking in two
+places: `isUnsafe : bool` on `axiom`, `opaque`, `inductive` and its constructors
+and recursors, and `safety : "safe" | "unsafe" | "partial"` on `def`. (`partial`
+is `unsafe` with a friendlier surface syntax; the two are the same thing here.
+`thm` has no such field: there is no unsafe theorem.) A declaration so marked was
+accepted by the elaborator *without* the check that makes its type mean anything:
+
+```
+unsafe def loop : False := loop
+```
+
+is a well-formed input to the elaborator, and a proof of `False` to anything that
+reads its type and ignores the flag.
+
+So the flag is not erased with the other elaboration hints. It decides which of
+two fragments the declaration joins.
+
+**The unsafe fragment.** An unsafe declaration is admitted like this:
+
+1. its declared type is checked to be a type;
+2. it enters the environment as an **axiom** — so no rule of §6 ever unfolds it,
+   and it contributes no definitional equalities;
+3. its name is recorded in the environment's unsafe set;
+4. its value, if it has one, is set aside and checked against its declared type
+   **after the last line of the file**.
+
+Step 4 is what makes the exemption precise. The exemption `unsafe` buys is
+termination and nothing else, so the value is typechecked exactly as a safe one
+would be — the only difference is *when*. By the end of the file every unsafe
+constant is present as an axiom of its declared type, so `loop`'s body
+typechecks (the `loop` on the right is the axiom), and so does a mutual group in
+which `m01` calls `m02` and `m02` calls `m01`, for which no declaration order
+works at all. Deferring is what stands in for the well-founded recursion the
+elaborator did not demand. The check catches a call with the wrong number of
+universe arguments, a reference to a constant the file never declares, and every
+other way a body can be wrong that is not about termination.
+
+An unsafe **inductive block** is admitted as a set of axioms: each type former,
+each constructor and each recursor becomes an uninterpreted constant of its
+declared type. Positivity is not checked — `UI.mk : (UI → UI) → UI` is exactly
+what the marker exists to allow — no recursor is derived, and the declared
+`rules`, `numParams`, `cidx` and `k` are discarded, because there is nothing left
+to consult them. A recursor for a non-positive type is a proof of `False`
+waiting to happen; here it is a name with a type and no reduction behaviour.
+
+A block is unsafe *as a whole* or not at all: if the flags on its types,
+constructors and recursors disagree, the file is rejected. There is no coherent
+reading of a mixture. A safe constructor of an unsafe type is a safe way into the
+unsafe fragment, and an unsafe constructor of a safe type would have the kernel
+derive a recursor whose minor premises quantify over a constructor it has
+quarantined.
+
+**The barrier.** One rule connects the two fragments, and everything rests on it:
+
+> A safe declaration may not mention an unsafe constant — not in its type, not
+> in its value.
+
+An unsafe constant is an axiom whose witness nobody checked, so it is exactly as
+strong as its own statement: `loop : False` *is* a proof of `False` to anything
+allowed to write it down. The unsafe fragment is therefore a separate,
+presumed-inconsistent environment that the safe one cannot see, and the safe
+fragment's soundness argument is unchanged from §5–§11.
+
+Transitivity is free. If safe `A` mentions safe `B` which mentions unsafe `C`,
+then `B` was rejected when it was read and `A` never gets its turn — so one
+non-recursive scan of each declaration's own type and value is a complete check.
+The scan covers `Expr.proj`, whose structure name is a reference to a declaration
+just as a `const` node is. It does not need to cover numerals and string
+literals: their typing and expansion rules (§5.2, §6.3) fire only against
+constants that match a stored canonical *inductive* shape, and an unsafe `Nat` is
+an axiom, which fails that test before the barrier is reached.
+
+This costs nothing on faithful input. Every declaration in all 186 arena exports
+carries `isUnsafe: false` and `safety: "safe"`.
+
+**Divergence.** Official Lean keeps unsafe declarations in a separate
+environment extension and enforces the same barrier, so a well-formed file
+behaves the same way. Two differences remain: `eink0rn` requires an inductive
+block's flags to be uniform, and it permits an unsafe declaration to refer
+forward to a constant declared later in the file. The second is a consequence of
+deferring, and restricting it would need the mutual group's membership taken on
+trust from the `all` field while buying nothing — the safe fragment cannot see
+any of these names either way.
+
+### 12.8 The line schema is exact
+
+Every line of the file is validated against the format before anything reads it.
+A line is one JSON object; it carries exactly one *tag* naming what it is
+(`str`, `num`, a level or expression constructor, `meta`, or one of the six
+declaration kinds), pool lines carry exactly one index key (`in`, `il`, `ie`) and
+declaration lines carry none, and the object under the tag has **exactly** the
+key set the format defines for it — every key present, no key twice, and no key
+besides. Enumerated fields (`binderInfo`, `safety`, `kind`, `hints`) must be one
+of the spelled-out values. Every number is a natural: there is no field in the
+format for which a negative has a reading.
+
+This is stricter than a reader needs to be to get the right answer on a
+well-formed file, and that is the point. A line carrying a field the format does
+not define was not written by an exporter, and a reader that ignores it is
+deciding on its own what the line meant. A *missing* field is worse, because then
+every reader downstream invents a default — and the fields most likely to go
+missing (`isUnsafe`, `binderInfo`, `safety`) are exactly the ones whose default a
+forger would like to choose. Accepting a file has to mean accepting the file that
+was written, not the largest sublanguage of it this checker happens to
+understand.
+
+The one exception is the `meta` header. Its sub-objects vary between real
+exports and the kernel has no stake in any of them, so it is checked only to be a
+lone well-formed `meta` line and is then discarded.
+
+The erasures of §1 happen *after* this. `binderInfo`, `hints` and `mdata` are
+required to be present and well-formed, and are then thrown away, because
+"absent" and "present and irrelevant" are different claims about a file.
+
+**Divergence.** Official Lean's reader is tolerant of extra and missing fields
+in places where the value does not change its behaviour.
+
+### 12.9 Redundant bookkeeping must be true
+
+Several fields restate something the kernel derives for itself. The format calls
+`isRec` and `isReflexive` "informational"; no rule in this kernel reads either
+off the file. They are checked anyway, on the principle of §1: a number or flag
+the export supplies and nobody verifies is a place where a file can say one thing
+and mean another, and the cost of closing it is one comparison.
+
+| field | derived from |
+| --- | --- |
+| `numParams`, `numIndices`, `numFields`, `numMotives`, `numMinors`, `nfields` | the telescopes of §8.3–§8.7 |
+| `all` | the members of the block |
+| `isRec` | some constructor of the block has a recursive field |
+| `isReflexive` | some constructor has a recursive field *under a binder*, as `Acc.intro`'s `forall y, r y x → Acc r y` does |
+| `k` | §8.6 |
+| the recursor's type and rules | re-derived outright (§8.8) |
+
+`isRec` and `isReflexive` are checked against **two bounds** rather than one
+value. The format does not say whether the flag describes the member or the
+block it belongs to, and on a mutual block the two readings can differ — a member
+with no recursive field of its own inside a block that has one. So the lower
+bound is what this member's own constructors force, the upper bound is what the
+block as a whole permits, and a value is rejected only when it is wrong under
+both readings. On a single-member block the bounds coincide and the check is
+exact.
+
+Agreement was confirmed on all 653 inductive declarations in the arena corpus.
+
+**Divergence.** Official Lean recomputes these fields and overwrites them rather
+than comparing, so a file whose bookkeeping is wrong is accepted there and
+rejected here.

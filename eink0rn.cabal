@@ -1,0 +1,42 @@
+cabal-version:      2.4
+name:               eink0rn
+version:            0.1.0
+synopsis:           A minimal Lean 4 proof checker over a reduced core type theory
+description:        Consumes lean4export .ndjson files and accepts or rejects them.
+                    Everything the export format offers is normalised down to a small
+                    core calculus (see SPEC.md) before any type checking happens.
+license:            Apache-2.0
+build-type:         Simple
+
+common warnings
+    ghc-options: -Wall -Wcompat -Wincomplete-record-updates
+                 -Wincomplete-uni-patterns -Wno-name-shadowing
+                 -O2
+
+library
+    import:           warnings
+    hs-source-dirs:   src
+    exposed-modules:  Kernel.Name
+                      Kernel.Level
+                      Kernel.Expr
+                      Kernel.Env
+                      Kernel.Canon
+                      Kernel.Check
+                      Kernel.Inductive
+                      Front.Json
+                      Front.Export
+                      Front.Lower
+    build-depends:    base >=4.16 && <5
+                    , bytestring
+                    , containers
+                    , array
+                    , mtl
+    default-language: Haskell2010
+
+executable eink0rn
+    import:           warnings
+    hs-source-dirs:   app
+    main-is:          Main.hs
+    build-depends:    base, bytestring, containers, eink0rn
+    ghc-options:      -rtsopts "-with-rtsopts=-K512m"
+    default-language: Haskell2010

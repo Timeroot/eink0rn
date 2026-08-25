@@ -1,0 +1,1508 @@
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE LambdaCase #-}
+-- | Reduction, definitional equality and type inference for the core calculus.
+--
+-- The rules implemented here are exactly the ones written out in SPEC.md.  If
+-- you change one, change the other.
+module Kernel.Check
+  ( TC
+  , TCState (..)
+  , runTC
+  , runTCLearn
+  , throwTC
+  -- * The judgements
+  , infer
+  , checkType
+  , inferSortOf
+  , isDefEq
+  , whnf
+  , whnfCore
+  , ensurePi
+  , ensureSort
+  -- * Helpers used by the inductive module
+  , withLocal
+  , withLocals
+  , freshFVar
+  , localType
+  , localInfo
+  , checkLevel
+  , getEnv
+  , withEnv
+  , setLevelParams
+  , expandLit
+  , canonIndMatches
+  ) where
+
+import           Control.Monad          (unless, when)
+import qualified Data.ByteString.Char8  as B
+import           Data.IntMap.Strict     (IntMap)
+import qualified Data.IntMap.Strict     as IM
+import           Data.List              (find)
+import           Data.Map.Strict        (Map)
+import qualified Data.Map.Strict        as M
+import           Kernel.Canon
+import           Kernel.Env
+import           Kernel.Expr
+import           Kernel.Level
+import           Kernel.Name
+
+-- The checking monad ----------------------------------------------------------
+
+data TCState = TCState
+  { tcEnv         :: !Env
+  , tcLocals      :: !(IntMap (Binder, Expr))
+  , tcNextFVar    :: !Int
+  , tcLevelParams :: ![Name]   -- ^ universe parameters the current decl may use
+  , tcFuel        :: !Int      -- ^ reduction steps left in the current
+                               --   speculation; 'unmetered' outside one
+  , tcWaste       :: !Int      -- ^ reduction steps still available to be
+                               --   /wasted/ on speculation; see 'speculate'
+  , tcInferV      :: !Memo     -- ^ memo for 'inferM' @Verify@; see 'Memo'
+  , tcInferA      :: !Memo     -- ^ memo for 'inferM' @Assume@
+  , tcWhnf        :: !Memo     -- ^ memo for 'whnf'
+  , tcNatOk       :: !(Maybe Bool)  -- ^ cached 'natShapeOk'; see 'expandLit'
+  , tcStrOk       :: !(Maybe Bool)  -- ^ cached 'strShapeOk'
+  , tcNatOps      :: !(Map Name Bool)  -- ^ cached 'natOpOk'; see 'reduceNatOp'
+  , tcCanonOk     :: !(Map Name Bool)  -- ^ cached 'canonIndMatches'
+  }
+
+-- | Start the four licence caches off from what the environment already knows,
+-- and read back what this run added to them.
+--
+-- Only the @True@ entries travel, in either direction: see 'Licences'.  The
+-- caches themselves keep both answers, because within one run a @no@ is worth
+-- not asking twice.
+seedLicences :: Env -> TCState -> TCState
+seedLicences env s = s
+  { tcNatOk   = if licNatShape l then Just True else Nothing
+  , tcStrOk   = if licStrShape l then Just True else Nothing
+  , tcNatOps  = M.fromSet (const True) (licNatOps l)
+  , tcCanonOk = M.fromSet (const True) (licCanonInd l)
+  }
+  where l = envLicence env
+
+readLicences :: TCState -> Licences
+readLicences s = Licences
+  { licNatShape = tcNatOk s == Just True
+  , licStrShape = tcStrOk s == Just True
+  , licNatOps   = yeses (tcNatOps s)
+  , licCanonInd = yeses (tcCanonOk s)
+  }
+  where yeses = M.keysSet . M.filter id
+
+-- | A memo table on (term node, local environment) pairs.
+--
+-- Keyed by 'exprHash' and matched by 'ptrEq', never by structural equality: a
+-- term is a graph, and asking whether two same-hash nodes are equal can cost
+-- exponentially more than recomputing the answer.  So a lookup finds an entry
+-- only when it is literally the same node -- which is exactly the case that
+-- matters, since what makes a shared subterm expensive is being visited once
+-- per path to it.
+--
+-- The second component of the key is the environment the node is read in; see
+-- 'envKey'.
+--
+-- Missing a hit only wastes time.  Buckets are capped so that a hash collision
+-- cannot turn the table into a leak.
+type Memo = IntMap [(Expr, Int, Expr)]
+
+memoLookup :: Memo -> Int -> Expr -> Maybe Expr
+memoLookup m ek e = IM.lookup (hashMix (exprHash e) ek) m >>= go
+  where
+    go ((k, ek', v) : rest) | ek == ek', ptrEq k e = Just v
+                            | otherwise            = go rest
+    go []                                          = Nothing
+
+memoInsert :: Int -> Expr -> Expr -> Memo -> Memo
+memoInsert ek k v =
+  IM.insertWith (\new old -> head new : take 7 old)
+                (hashMix (exprHash k) ek) [(k, ek, v)]
+
+newtype TC a = TC { unTC :: TCState -> Either String (a, TCState) }
+
+instance Functor TC where
+  fmap f (TC g) = TC $ \s -> case g s of
+    Left e        -> Left e
+    Right (a, s') -> Right (f a, s')
+
+instance Applicative TC where
+  pure a = TC $ \s -> Right (a, s)
+  TC f <*> TC g = TC $ \s -> case f s of
+    Left e        -> Left e
+    Right (h, s') -> case g s' of
+      Left e         -> Left e
+      Right (a, s'') -> Right (h a, s'')
+
+instance Monad TC where
+  TC g >>= k = TC $ \s -> case g s of
+    Left e        -> Left e
+    Right (a, s') -> unTC (k a) s'
+
+runTC :: Env -> [Name] -> TC a -> Either String a
+runTC env lps act = fst <$> runTCLearn env lps act
+
+-- | 'runTC', also handing back the licences established along the way so that
+-- the caller can store them in the environment it carries to the next
+-- declaration.  See 'Licences' for why that is sound, and 'seedLicences'.
+runTCLearn :: Env -> [Name] -> TC a -> Either String (a, Licences)
+runTCLearn env lps (TC f) =
+  fmap readLicences <$>
+    f (seedLicences env
+        (TCState env IM.empty 0 lps unmetered wasteBudget
+                 IM.empty IM.empty IM.empty Nothing Nothing M.empty M.empty))
+
+throwTC :: String -> TC a
+throwTC msg = TC $ \_ -> Left msg
+
+-- Work budgets ------------------------------------------------------------------
+
+-- | The value of 'tcFuel' outside any speculative comparison.
+unmetered :: Int
+unmetered = maxBound
+
+-- | How much reduction one declaration may /waste/ on speculation.
+--
+-- Purely a time/completeness trade-off, with no effect on what counts as a
+-- proof: see 'speculate'.  Speculation that pays off is not charged, so this is
+-- a bound on dead ends, not on congruence.  Big enough that a comparison
+-- needing real but bounded normalisation still gets settled the cheap way;
+-- small enough that a few failures cannot run away with an evaluation the
+-- caller was about to make unnecessary.
+wasteBudget :: Int
+wasteBudget = 20000
+
+-- | Charge one reduction step.
+spend :: TC ()
+spend = TC $ \s -> Right ((), if tcFuel s == unmetered
+                                then s
+                                else s { tcFuel = tcFuel s - 1 })
+
+-- | Has the current speculative comparison run out of budget?  When it has,
+-- reduction stops where it stands and conversion answers @False@.
+outOfFuel :: TC Bool
+outOfFuel = TC $ \s -> Right (tcFuel s <= 0, s)
+
+-- | Run a comparison whose /negative/ answer is not conclusive -- the caller
+-- will unfold and ask again -- under a budget.
+--
+-- This is what makes stopping early legitimate.  Every rule that answers
+-- @True@ is sound no matter how much reduction preceded it, so a starved
+-- comparison can only ever answer @False@, and here @False@ merely means "not
+-- this way".  Nothing that is a proof stops being one; a speculation that would
+-- have succeeded just costs an unfolding and gets asked again with a fresh
+-- budget on the next pass round 'defEqLoop'.
+speculate :: TC Bool -> TC Bool
+speculate (TC act) = TC $ \s ->
+  let fuel0 = tcFuel s
+      allow = if fuel0 == unmetered then tcWaste s else min fuel0 (tcWaste s)
+  in if allow <= 0 then Right (False, s) else
+     case act s { tcFuel = allow } of
+       Left e        -> Left e
+       Right (b, s') ->
+         let used  = allow - tcFuel s'
+             fuel' | fuel0 == unmetered = unmetered
+                   | otherwise          = max 0 (fuel0 - used)
+             -- Only a dead end is charged: work that decided the comparison is
+             -- work the checker would have had to do anyway.
+             waste' | b         = tcWaste s'
+                    | otherwise = max 0 (tcWaste s' - used)
+         in Right (b, s' { tcFuel = fuel', tcWaste = waste' })
+
+-- | Run an action on a full budget, whatever the caller has left of theirs.
+--
+-- Only for checks whose answer is cached for a whole environment.  Those must
+-- not depend on how much reduction the caller happened to have spent already:
+-- a verification starved by an unlucky caller would be remembered as a refusal
+-- and switch its rule off for the rest of the file.  The caller's own budget is
+-- restored afterwards, so nothing it is entitled to is consumed.
+unmeteredly :: TC a -> TC a
+unmeteredly (TC act) = TC $ \s ->
+  case act s { tcFuel = unmetered, tcWaste = wasteBudget } of
+    Left e        -> Left e
+    Right (a, s') -> Right (a, s' { tcFuel = tcFuel s, tcWaste = tcWaste s })
+
+-- | Run an action on a fixed budget, whatever the caller has left of theirs.
+--
+-- 'unmeteredly' is right for a check that reduces /open/ terms: those get stuck
+-- quickly, and a full budget is what makes the answer a property of the
+-- environment.  A check that reduces /closed/ terms has no such guarantee -- a
+-- definition by well-founded recursion, handed a numeral, can unfold its
+-- accessibility proof for as long as there is memory -- so the probes of
+-- 'nocProbes' get a budget of their own.  It is a fixed one, so the answer is
+-- still a property of the environment and not of the caller; and a starved probe
+-- answers @False@, which only ever declines a shortcut.
+onBudget :: Int -> TC a -> TC a
+onBudget n (TC act) = TC $ \s ->
+  case act s { tcFuel = n, tcWaste = n } of
+    Left e        -> Left e
+    Right (a, s') -> Right (a, s' { tcFuel = tcFuel s, tcWaste = tcWaste s })
+
+-- | What the whole probe battery of one operation may spend.
+--
+-- Generous next to what a faithful export needs -- the largest probe is a
+-- division of a two-digit numeral -- and small enough that a definition which
+-- does not compute cannot turn the attempt into the checker's whole afternoon.
+probeBudget :: Int
+probeBudget = 5000000
+
+-- | Skip a rule that has to infer a type.  With no budget left reduction has
+-- stopped where it stands, so the types it would read off are not the real
+-- ones; the honest answer is "no opinion".
+withFuel :: TC (Maybe a) -> TC (Maybe a)
+withFuel act = outOfFuel >>= \out -> if out then pure Nothing else act
+
+getEnv :: TC Env
+getEnv = TC $ \s -> Right (tcEnv s, s)
+
+setLevelParams :: [Name] -> TC ()
+setLevelParams lps = TC $ \s ->
+  Right ((), s { tcLevelParams = lps
+               , tcInferV = IM.empty, tcInferA = IM.empty, tcWhnf = IM.empty })
+
+freshFVar :: Binder -> Expr -> TC Int
+freshFVar n t = TC $ \s ->
+  let i = tcNextFVar s
+  in Right (i, s { tcNextFVar = i + 1
+                 , tcLocals   = IM.insert i (n, t) (tcLocals s) })
+
+localType :: Int -> TC Expr
+localType i = snd <$> localInfo i
+
+-- | The binder name and type a local constant was introduced with.
+localInfo :: Int -> TC (Binder, Expr)
+localInfo i = TC $ \s -> case IM.lookup i (tcLocals s) of
+  Just nt -> Right (nt, s)
+  Nothing -> Left ("unbound local constant x!" ++ show i)
+
+-- | Run an action against a temporarily different environment.  Local
+-- constants are unaffected: they are indexed by a counter that only ever grows,
+-- so a local made under one environment stays valid under another.
+withEnv :: Env -> TC a -> TC a
+withEnv env act = do
+  old <- getEnv
+  setEnv env
+  a <- act
+  setEnv old
+  pure a
+
+-- | Every memo table is keyed on the term alone, so anything the answer also
+-- depends on -- the environment a constant unfolds in, the declaration's
+-- universe parameters -- has to invalidate them.  The licence answers are about
+-- the environment rather than about a term, so they are not thrown away but
+-- re-seeded from the incoming one: see 'seedLicences'.
+setEnv :: Env -> TC ()
+setEnv env = TC $ \s ->
+  Right ((), seedLicences env
+               s { tcEnv    = env
+                 , tcInferV = IM.empty
+                 , tcInferA = IM.empty
+                 , tcWhnf   = IM.empty })
+
+-- | Introduce a local constant of the given type and run an action with it.
+withLocal :: Binder -> Expr -> (Int -> TC a) -> TC a
+withLocal n t k = freshFVar n t >>= k
+
+-- | Open a telescope, introducing one local per binder.  The telescope's types
+-- are in de Bruijn form relative to the preceding binders.
+withLocals :: [(Binder, Expr)] -> ([Int] -> TC a) -> TC a
+withLocals tele k = go [] tele
+  where
+    go acc []            = k (reverse acc)
+    go acc ((n, t) : ts) = do
+      let t' = instN (map FVar acc) t
+      x <- freshFVar n t'
+      go (x : acc) ts
+
+-- | Every universe parameter mentioned must have been declared.
+checkLevel :: Level -> TC ()
+checkLevel l = TC $ \s ->
+  case [ p | p <- levelParamsOf l, p `notElem` tcLevelParams s ] of
+    []      -> Right ((), s)
+    (p : _) -> Left ("undeclared universe parameter " ++ showName p)
+
+-- Weak head normalisation -----------------------------------------------------
+
+-- | Full weak head normal form: 'whnfCore' interleaved with delta unfolding.
+--
+-- Memoised on the node, for the reason 'inferM' is: a term is a graph, and a
+-- subterm reachable along many paths would otherwise be normalised once per
+-- path.  That is the whole cost of evaluating an arithmetic proof, where the
+-- same instance -- @instHMul@, @instOfNat@ -- is reached from every operation
+-- in the expression.
+--
+-- The entry is recorded only outside a speculation.  A starved reduction stops
+-- where it stands and returns a term that is correct to /use/ -- 'speculate'
+-- reads a failure to reduce as "not this way", never as "not equal" -- but not
+-- correct to remember, since a later caller with a real budget would be handed
+-- the half-reduced term as if it were the normal form and could fail a
+-- comparison that holds.  Outside a speculation 'tcFuel' is 'unmetered' and
+-- stays so for the whole call: 'spend' leaves it alone and 'speculate' puts it
+-- back, so testing it once, on entry, is enough.
+--
+-- 'tcWaste', which a nested speculation can exhaust, needs no guard: it only
+-- decreases within a declaration and resets between them, so the first
+-- encounter with a node is the one with the most budget and no later caller is
+-- handed a result computed with less than it had itself.  The other direction
+-- is not a hazard -- a result reduced further than the caller could have
+-- managed is still reached by reduction steps.
+whnf :: Expr -> TC Expr
+whnf e
+  | not (reducible e) = whnfRaw e
+  | otherwise         = lookupWhnf e >>= \case
+      Just v  -> pure v
+      Nothing -> do
+        real <- unmeteredNow
+        v    <- whnfRaw e
+        when real (insertWhnf e v)
+        pure v
+  where
+    -- A head that no rule applies to is its own normal form, and looking that
+    -- up costs more than rediscovering it.
+    reducible ex = case ex of
+      App{} -> True; Const{} -> True; Let{} -> True; Proj{} -> True
+      _     -> False
+
+whnfRaw :: Expr -> TC Expr
+whnfRaw e = do
+  e1 <- whnfCore e
+  unfoldDelta e1 >>= \case
+    Just e2 -> whnf e2
+    Nothing -> pure e1
+
+-- | Is this the real reduction, rather than one under a speculative budget?
+unmeteredNow :: TC Bool
+unmeteredNow = TC $ \s -> Right (tcFuel s == unmetered, s)
+
+lookupWhnf :: Expr -> TC (Maybe Expr)
+lookupWhnf e = TC $ \s -> Right (memoLookup (tcWhnf s) whnfKey e, s)
+
+insertWhnf :: Expr -> Expr -> TC ()
+insertWhnf k v = TC $ \s -> Right ((), s { tcWhnf = memoInsert whnfKey k v (tcWhnf s) })
+
+-- | 'whnf' takes no 'LEnv' -- it is only ever called on closed terms, since the
+-- types inference hands out are closed -- so the environment half of the key is
+-- the same for every entry.
+whnfKey :: Int
+whnfKey = envKey []
+
+-- | Everything except delta: beta, zeta, iota (recursors and @Quot@), and
+-- projection reduction.
+whnfCore :: Expr -> TC Expr
+whnfCore = go
+  where
+    go e = outOfFuel >>= \out -> if out then pure e else do
+      let (h, args) = unApps e
+      case h of
+        Lam{} | not (null args) -> step (betaApply h args)
+        Let _ _ v b             -> step (mkApps (inst1 v b) args)
+        Proj{}                  -> reduceProj h >>= \case
+                                     Just h' -> step (mkApps h' args)
+                                     Nothing -> pure e
+        Const n ls              -> reduceConstApp n ls args >>= \case
+                                     Just e' -> step e'
+                                     Nothing -> pure e
+        _                       -> pure e
+    step e = spend >> go e
+
+-- | Beta: peel as many leading lambdas as there are arguments and substitute
+-- them all at once.  The accumulator ends up in exactly the order 'instN'
+-- wants, innermost binder first.
+betaApply :: Expr -> [Expr] -> Expr
+betaApply = go []
+  where
+    go acc (Lam _ _ b) (a : as) = go (a : acc) b as
+    go acc body        args     = mkApps (instN acc body) args
+
+-- | Unfold the head constant if it is a definition.
+unfoldDelta :: Expr -> TC (Maybe Expr)
+unfoldDelta e = outOfFuel >>= \out -> if out then pure Nothing else do
+  let (h, args) = unApps e
+  case h of
+    Const n ls -> do
+      env <- getEnv
+      case lookupConst env n of
+        Just (CDef d) | length ls == length (defLevels d) -> do
+          spend
+          pure (Just (mkApps (instLevelsE (defLevels d) ls (defValue d)) args))
+        _ -> pure Nothing
+    _ -> pure Nothing
+
+-- | Iota for recursors and for @Quot.lift@ / @Quot.ind@, plus arithmetic on
+-- numerals.
+reduceConstApp :: Name -> [Level] -> [Expr] -> TC (Maybe Expr)
+reduceConstApp n ls args = do
+  env <- getEnv
+  case lookupConst env n of
+    Just (CRec r)            -> reduceRec r ls args
+    Just (CQuot _ _ _ QLift) -> reduceQuot 6 5 3 args
+    Just (CQuot _ _ _ QInd)  -> reduceQuot 5 4 3 args
+    -- No guard on the kind of constant: what licenses the shortcut is
+    -- 'natOpOk', and an operation that is not a definition cannot satisfy the
+    -- equations it asks about.  Leaving the kind out of it is what makes
+    -- 'AccelAlways' the honest name for a mode that trusts the name alone.
+    Just _ | Just op <- lookup n natOps -> reduceNatOp n op args
+    _                        -> pure Nothing
+
+-- | @Quot.lift a r b f h (Quot.mk a r v) --> f v@ (and likewise @Quot.ind@).
+--
+-- @arity@ is the number of arguments the eliminator takes, @majorIx@ the
+-- position of the quotient argument and @fnIx@ the position of the function.
+reduceQuot :: Int -> Int -> Int -> [Expr] -> TC (Maybe Expr)
+reduceQuot arity majorIx fnIx args
+  | length args < arity = pure Nothing
+  | otherwise = do
+      major <- whnf (args !! majorIx)
+      let (mh, margs) = unApps major
+      case mh of
+        Const cn _ -> do
+          env <- getEnv
+          case lookupConst env cn of
+            Just (CQuot _ _ _ QCtor) | length margs == 3 ->
+              pure (Just (mkApps (App (args !! fnIx) (margs !! 2)) (drop arity args)))
+            _ -> pure Nothing
+        _ -> pure Nothing
+
+-- | @T.rec params motives minors indices (c params fields) --> rule_c params motives minors fields@
+--
+-- A mutual block shares one set of motives and one set of minor premises across
+-- all its members, so the prefix a rule is applied to is the same for every
+-- recursor in the block; only the rules themselves differ.
+reduceRec :: RecInfo -> [Level] -> [Expr] -> TC (Maybe Expr)
+reduceRec r ls args
+  | length ls /= length (recLevels r) = pure Nothing
+  | length args <= majorIx            = pure Nothing
+  | otherwise = do
+      major0 <- whnf (args !! majorIx)
+      mmajor <- toCtorApp r ls major0
+      case mmajor of
+        Nothing    -> pure Nothing
+        Just major -> do
+          let (mh, margs) = unApps major
+          case mh of
+            Const cn _ | Just rule <- find ((== cn) . rrCtor) (recRules r)
+                       , length margs >= rrNumFields rule -> do
+              let fields = drop (length margs - rrNumFields rule) margs
+                  rhs    = instLevelsE (recLevels r) ls (rrRhs rule)
+                  before = take prefixLen args
+                  after  = drop (majorIx + 1) args
+              pure (Just (mkApps (mkApps rhs (before ++ fields)) after))
+            _ -> pure Nothing
+  where
+    prefixLen = recNumParams r + recNumMotives r + recNumMinors r
+    majorIx   = prefixLen + recNumIndices r
+
+-- | Try to see the major premise as a constructor application.  Beyond the
+-- literal case this is where K-like reduction and structure eta live.
+toCtorApp :: RecInfo -> [Level] -> Expr -> TC (Maybe Expr)
+toCtorApp r ls major = do
+  env <- getEnv
+  m1 <- expandLit major
+  let (h, _) = unApps m1
+  case h of
+    Const cn _ | Just (CCtor _) <- lookupConst env cn -> pure (Just m1)
+    _ | recK r          -> toCtorWhenK r ls m1
+      | otherwise       -> toCtorWhenStruct r m1
+
+-- | K-like reduction.  Only for a @Prop@ with a single field-less constructor:
+-- if the major premise's type is @T params indices@ then the /canonical/
+-- constructor application has that same type, so we may replace the (possibly
+-- neutral) major premise by it.
+--
+-- The @isDefEq@ guard below is essential: without it @Eq.rec@ would reduce at
+-- @Eq a b@ for @a@ and @b@ that are not convertible.
+toCtorWhenK :: RecInfo -> [Level] -> Expr -> TC (Maybe Expr)
+toCtorWhenK r _ls major = withFuel $ do
+  env <- getEnv
+  majorTy <- inferOnly major >>= whnf
+  let (h, targs) = unApps majorTy
+  case h of
+    Const tn tls | tn == recInduct r
+                 , Just (CInd ind) <- lookupConst env tn
+                 , [cn] <- indCtors ind
+                 , Just (CCtor ci) <- lookupConst env cn
+                 , ctorNumFields ci == 0
+                 , length targs >= indNumParams ind -> do
+      let ctorApp = mkApps (Const cn tls) (take (indNumParams ind) targs)
+      ctorTy <- inferOnly ctorApp
+      ok <- isDefEq majorTy ctorTy
+      pure (if ok then Just ctorApp else Nothing)
+    _ -> pure Nothing
+
+-- | Structure eta on the major premise: for a structure-like @T@ every element
+-- is convertible to @T.mk s.0 .. s.(n-1)@.
+toCtorWhenStruct :: RecInfo -> Expr -> TC (Maybe Expr)
+toCtorWhenStruct r major = withFuel $ do
+  env <- getEnv
+  case lookupConst env (recInduct r) of
+    Just (CInd ind)
+      | isStructureLike env (indName ind)
+      , [cn] <- indCtors ind
+      , Just (CCtor ci) <- lookupConst env cn -> do
+          majorTy <- inferOnly major >>= whnf
+          let (h, targs) = unApps majorTy
+          case h of
+            Const tn tls | tn == indName ind, length targs == indNumParams ind ->
+              pure . Just $ mkApps (Const cn tls)
+                (targs ++ [ Proj tn i major | i <- [0 .. ctorNumFields ci - 1] ])
+            _ -> pure Nothing
+    _ -> pure Nothing
+
+-- | @(T.mk params fields).i --> fields !! i@
+reduceProj :: Expr -> TC (Maybe Expr)
+reduceProj (Proj tn i s) = do
+  env <- getEnv
+  s1 <- whnf s >>= expandLit
+  let (h, args) = unApps s1
+  case h of
+    Const cn _ | Just (CCtor ci) <- lookupConst env cn
+               , ctorInduct ci == tn
+               , let fields = drop (ctorNumParams ci) args
+               , i < length fields -> pure (Just (fields !! i))
+    _ -> pure Nothing
+reduceProj _ = pure Nothing
+
+-- | Unfold a literal one step into constructor form, when something needs to
+-- see a constructor.  @NatLit@ and @StrLit@ are abbreviations, nothing more.
+--
+-- The catch is that the abbreviation is written in terms of /names/ -- @Nat.succ@,
+-- @String.mk@ and so on -- and a name is not evidence.  Expanding unconditionally
+-- would hand the file a definitional equality it never justified: declare
+-- @Nat.succ@ with some other argument type and iota on @nat_lit 1@ produces a
+-- minor premise applied to an argument of the wrong type.  It is the same trust
+-- violation as computing @Nat.add@ on bignums because of what it is called; see
+-- the arithmetic section below, where that licence is earned rather than assumed.
+--
+-- So the constants a literal denotes are checked to be the ones it means, and a
+-- literal over constants that are not simply does not reduce.  It keeps its type
+-- and stays opaque, which is sound: an uninterpreted constant proves nothing.
+-- The answers are cached per environment, since a literal-heavy file asks
+-- constantly and the shapes cannot change under it.
+expandLit :: Expr -> TC Expr
+expandLit e@(NatLit n)
+  | n < 0     = pure e
+  | otherwise = natShapeOk >>= \ok -> pure $ if not ok then e else
+      if n == 0 then Const nameNatZero []
+                else App (Const nameNatSucc []) (NatLit (n - 1))
+expandLit e@(StrLit s) =
+  strShapeOk >>= \ok -> pure (if not ok then e else stringOf (utf8Chars s))
+expandLit e = pure e
+
+-- | The string whose characters are these code points, in constructor form.
+--
+-- A @String@ is not a list of characters but the /byte array a list of
+-- characters encodes/, together with the evidence that it is such an encoding:
+--
+-- > structure String where
+-- >   ofByteArray ::
+-- >   toByteArray : ByteArray
+-- >   isValidUTF8 : ByteArray.IsValidUTF8 toByteArray
+-- >
+-- > inductive ByteArray.IsValidUTF8 (b : ByteArray) where
+-- >   | intro (m : List Char) (hm : b = List.utf8Encode m)
+--
+-- So the literal's meaning is written by handing @List.utf8Encode@ the character
+-- list and taking the evidence from the character list itself, where the equation
+-- the constructor asks for holds by reflexivity.  The result is well typed
+-- whatever @List.utf8Encode@ happens to compute, which is the point: the kernel
+-- says what a literal /is/, not what its bytes are, and leaves the encoding to
+-- the file that defined it.
+stringOf :: [Integer] -> Expr
+stringOf cps = mkApps (Const nameStringOfByteArray []) [bytes, valid]
+  where
+    char  = Const nameChar []
+    chars = foldr (\c acc -> mkApps (Const nameListCons [LZero])
+                                    [char, App (Const nameCharOfNat []) (NatLit c), acc])
+                  (App (Const nameListNil [LZero]) char)
+                  cps
+    bytes = App (Const nameUtf8Encode []) chars
+    valid = mkApps (Const nameValidUtf8Intro [])
+                   [ bytes, chars
+                   , mkApps (Const nameEqRefl [LSucc LZero])
+                            [Const nameByteArray [], bytes] ]
+
+-- | @Nat@ really is an inductive type whose @zero@ and @succ@ are constructors
+-- of the shape a numeral is spelt in.
+--
+-- The field /types/ are not spelt out here; instead a canonical expansion is
+-- type-checked, which pins them without anyone having to write a de Bruijn term
+-- by hand.  One witness suffices because every numeral's expansion has this same
+-- shape -- @Nat.succ@ applied to a numeral -- and differs only in the numeral.
+natShapeOk :: TC Bool
+natShapeOk = cached tcNatOk (\b s -> s { tcNatOk = b }) $ do
+  env <- getEnv
+  if not (all (isCtorOf env nameNat) [(nameNatZero, 0, 0), (nameNatSucc, 0, 1)])
+    then pure False
+    else wellTyped (App (Const nameNatSucc []) (NatLit 0)) (Const nameNat [])
+
+-- | @String@ really is the byte-array-plus-evidence structure 'stringOf' builds,
+-- and the pieces a string literal is spelt with fit together.
+--
+-- Again one witness does it: a one-character string exercises every constant of
+-- the expansion -- @String.ofByteArray@, @ByteArray.IsValidUTF8.intro@,
+-- @List.utf8Encode@, @Eq.refl@, @List.cons@, @List.nil@, @Char.ofNat@ -- at
+-- exactly the types any longer string uses them at, since strings differ only in
+-- the length of the character list and the numerals in it.
+--
+-- Only @String.ofByteArray@, @List.nil@ and @List.cons@ are /required/ to be
+-- constructors, and for the same reason: an expansion whose head is not one is
+-- inert, so nothing that wanted to see a constructor gets to see the wrong thing.
+-- The rest may be anything of the right type; the witness pins that much, and no
+-- rule below reads them.  In particular the kernel does not check what
+-- @List.utf8Encode@ computes -- it need not, because the evidence field is
+-- 'stringOf'\'s own @Eq.refl@ and the field is a proof, so nothing downstream can
+-- depend on the answer being UTF-8.
+strShapeOk :: TC Bool
+strShapeOk = cached tcStrOk (\b s -> s { tcStrOk = b }) $ do
+  env <- getEnv
+  n <- natShapeOk
+  if not n || not (isCtorOf env nameString (nameStringOfByteArray, 0, 2))
+             || not (all (isCtorOf env nameList) [(nameListNil, 1, 0), (nameListCons, 1, 2)])
+    then pure False
+    else wellTyped (stringOf [0]) (Const nameString [])
+
+-- Arithmetic on numerals ---------------------------------------------------------
+--
+-- @Nat.ble 1114113 4294967296@ is a single machine comparison and about a
+-- million iota steps.  A kernel that only knows the second reading cannot check
+-- @Init.Prelude@, where bounds like @UInt32.size@ are settled by @decide@; so
+-- the numerals have to be computed on, not just unfolded.
+--
+-- The danger is precisely the one 'expandLit' guards against.  @Nat.add@ is a
+-- name, and a file that defines it as, say, multiplication would be handed an
+-- equation the theory does not contain -- @2 + 2 ≡ 5@ if the kernel is willing
+-- to say so on the strength of the name alone.  Every soundness bug of this
+-- shape has the same cause: a constant the kernel gives a meaning to without
+-- checking that the file gave it the same one.
+--
+-- So the shortcut is not taken on trust; it is /derived/, once per environment,
+-- from the definition's own defining equations.  For @Nat.add@ the kernel checks
+--
+-- > add x 0       ≡ x                            (x, y fresh locals of type Nat)
+-- > add x (succ y) ≡ succ (add x y)
+--
+-- and nothing else.  Both are ordinary conversion questions about open terms,
+-- and conversion is stable under substitution, so they may be instantiated at
+-- any closed terms.  That is enough to settle every numeral case at the meta
+-- level, by induction on @b@:
+--
+-- >   add ⌜a⌝ ⌜0⌝       ≡ add ⌜a⌝ 0            (natShapeOk)
+-- >                     ≡ ⌜a⌝                   (first equation at x := ⌜a⌝)
+-- >   add ⌜a⌝ ⌜k+1⌝     ≡ add ⌜a⌝ (succ ⌜k⌝)   (natShapeOk)
+-- >                     ≡ succ (add ⌜a⌝ ⌜k⌝)   (second equation)
+-- >                     ≡ succ ⌜a+k⌝           (induction hypothesis)
+-- >                     ≡ ⌜a+k+1⌝              (natShapeOk)
+--
+-- so @add ⌜a⌝ ⌜b⌝ ≡ ⌜a+b⌝@ for all @a@ and @b@, which is exactly what the
+-- shortcut asserts.  The other operations go the same way; those whose equations
+-- are stated in terms of another operation (@sub@ via @pred@, @mul@ via @add@,
+-- @pow@ via @mul@) additionally need that one verified, since the induction step
+-- appeals to its numeral case.
+--
+-- Two properties make this safe rather than merely plausible.  The equations are
+-- written with the very constants the shortcut will emit -- @Nat.succ@,
+-- @Nat.zero@, @Bool.true@ -- so whatever those names happen to denote, the
+-- induction concludes something about the term actually produced; no name is
+-- believed, only related to itself.  And failure is inert: an operation whose
+-- equations do not check simply is not accelerated, and reduces the slow way.
+--
+-- The equations do not, on their own, say the operation has the right /type/.
+-- They are conversion questions, and conversion does not typecheck what it is
+-- given; an @Nat.add@ declared at @Foo -> Foo -> Foo@ whose equations somehow
+-- went through would have the kernel replace a term of type @Foo@ with a
+-- numeral.  So the declared type is compared against the stored one too, in
+-- every mode that checks anything.
+--
+-- On top of that, 'AccelCanonical' -- the default -- requires @Nat@, and for
+-- the comparisons @Bool@, to be exactly the inductive types "Kernel.Canon" says
+-- they are: same arity, same constructors in the same order, same types.  That
+-- is not needed for soundness, which the equations already carry.  It is a
+-- statement about what the kernel is willing to be surprised by: an environment
+-- in which @Nat@ has a third constructor is one where the fast path and the
+-- slow path agree on every numeral and nobody has thought about anything else,
+-- and the cheap thing to do is decline.  'AccelVerified' keeps the equations
+-- and drops that requirement, for a file that is deliberately unusual.
+
+-- | An operation the kernel offers to compute directly on bignums.
+data NatOp
+  = Nat1 (Integer -> Integer)             -- ^ @Nat -> Nat@
+  | Nat2 (Integer -> Integer -> Maybe Integer)
+    -- ^ @Nat -> Nat -> Nat@; @Nothing@ declines this particular instance
+  | Cmp2 (Integer -> Integer -> Bool)     -- ^ @Nat -> Nat -> Bool@
+
+-- | The operations the kernel knows how to compute, and what it computes.
+--
+-- Being listed here is an /offer/, not a licence: 'natOpOk' decides whether the
+-- offer is taken up, against the stored specification in "Kernel.Canon".  Every
+-- name here must have an entry there, or it can never fire outside
+-- 'AccelAlways'.
+natOps :: [(Name, NatOp)]
+natOps =
+  [ (nameNatPred, Nat1 (\a -> max 0 (a - 1)))
+  , (nameNatAdd,  Nat2 (\a b -> Just (a + b)))
+  , (nameNatSub,  Nat2 (\a b -> Just (max 0 (a - b))))
+  , (nameNatMul,  Nat2 (\a b -> Just (a * b)))
+  , (nameNatPow,  Nat2 powBounded)
+    -- Division by zero is total in this theory: @a / 0 = 0@ and @a % 0 = a@.
+    -- Only reachable under 'AccelAlways'; see 'natOpCanon'.
+  , (nameNatDiv,  Nat2 (\a b -> Just (if b == 0 then 0 else a `div` b)))
+  , (nameNatMod,  Nat2 (\a b -> Just (if b == 0 then a else a `mod` b)))
+  , (nameNatBEq,  Cmp2 (==))
+  , (nameNatBLe,  Cmp2 (<=))
+  , (nameNatBLt,  Cmp2 (<))
+  ]
+
+-- | @a ^ b@, unless the answer would not fit anywhere useful.
+--
+-- Declining is not a correctness matter -- the slow path cannot finish such a
+-- case either -- but it decides /how/ the kernel fails on it: by running out of
+-- time, which a caller can bound, rather than out of memory, which it cannot.
+powBounded :: Integer -> Integer -> Maybe Integer
+powBounded a b
+  | a <= 1 || b <= 1                 = Just (a ^ b)
+  | b > limit                        = Nothing
+  | b * toInteger (bitLen a) > limit = Nothing
+  | otherwise                        = Just (a ^ b)
+  where
+    limit = 1000000
+    bitLen = go (0 :: Integer)
+      where go acc 0 = acc
+            go acc v = go (acc + 1) (v `div` 2)
+
+-- | @f ⌜a⌝ ⌜b⌝ --> ⌜f a b⌝@, once 'natOpOk' says this @f@ computes that.
+reduceNatOp :: Name -> NatOp -> [Expr] -> TC (Maybe Expr)
+reduceNatOp n op args = natOpOk n >>= \ok -> if not ok then pure Nothing else
+  case (op, args) of
+    (Nat1 f, a : rest) -> withLits [a] $ \case
+      [x] -> Just (mkApps (NatLit (f x)) rest)
+      _   -> Nothing
+    (Nat2 f, a : b : rest) -> withLits [a, b] $ \case
+      [x, y] -> (\v -> mkApps (NatLit v) rest) <$> f x y
+      _      -> Nothing
+    (Cmp2 f, a : b : rest) -> withLits [a, b] $ \case
+      [x, y] -> Just (mkApps (boolOf (f x y)) rest)
+      _      -> Nothing
+    _ -> pure Nothing
+  where
+    boolOf b = Const (if b then nameBoolTrue else nameBoolFalse) []
+    withLits es k = do
+      vs <- mapM natValueOf es
+      pure (maybe Nothing k (sequence vs))
+
+-- | Read a term as a numeral: a literal, or @Nat.succ@ applied to one, or a
+-- chain of those bottoming out at @Nat.zero@.
+--
+-- Reached only with 'natShapeOk' already established, since 'reduceNatOp' asks
+-- 'natOpOk' first; that is what makes @Nat.succ ⌜k⌝@ and @⌜k+1⌝@ the same term
+-- as far as conversion is concerned, and so lets the chain be folded away.
+--
+-- Folding is not a refinement.  @Nat.decLt n m@ is @Nat.decLe (Nat.succ n) m@,
+-- so a comparison against a bound reaches the shortcut with one constructor
+-- already peeled off; reading only bare literals would miss every @decide@ in
+-- the prelude and leave the numeral to be counted down by hand.
+natValueOf :: Expr -> TC (Maybe Integer)
+natValueOf = go 0
+  where
+    go !acc e = whnf e >>= \e' -> case e' of
+      NatLit v | v >= 0 -> pure (Just (acc + v))
+      _ -> case unApps e' of
+        (Const c [], [])  | c == nameNatZero -> pure (Just acc)
+        (Const c [], [a]) | c == nameNatSucc -> go (acc + 1) a
+        _                                    -> pure Nothing
+
+-- | May this operation be computed on bignums?
+--
+-- 'AccelOff' and 'AccelAlways' answer without looking at anything -- the second
+-- is the whole soundness bug, reproduced on request.  The other two put the
+-- declaration up against the stored specification in "Kernel.Canon".
+--
+-- Verified on a full budget and remembered for the environment: the answer is a
+-- property of the environment, not of whatever the asking caller had left.  The
+-- entry is parked at @False@ for the duration, so the conversion checks below
+-- reduce the operation the ordinary way and cannot appeal to the shortcut they
+-- are establishing.
+natOpOk :: Name -> TC Bool
+natOpOk n = do
+  mode <- envAccel <$> getEnv
+  case mode of
+    AccelOff    -> pure False
+    AccelAlways -> pure True
+    _           -> cachedName tcNatOps (\m s -> s { tcNatOps = m }) n
+                     (attempt (unmeteredly (verify mode)))
+  where
+    verify mode = case natOpCanon n of
+      Nothing -> pure False
+      Just c
+        -- An operation with neither equations nor probes has no licence to be
+        -- derived; only 'AccelAlways' reaches it, and that never gets here.
+        | null (nocLaws c dummy dummy), null (nocProbes c) -> pure False
+        | otherwise -> do
+            shape <- natShapeOk
+            inds  <- if mode == AccelCanonical
+                       then and <$> mapM canonIndMatches (nocInds c)
+                       else pure True
+            ty    <- declaredTypeIs n (nocType c)
+            deps  <- and <$> mapM natOpOk (nocDeps c)
+            if not (shape && inds && ty && deps) then pure False else do
+              laws <- withLocal (Binder (str "x")) nat $ \x ->
+                      withLocal (Binder (str "y")) nat $ \y ->
+                        allM (uncurry isDefEq) (nocLaws c (FVar x) (FVar y))
+              if not laws then pure False else
+                onBudget probeBudget (allM (uncurry isDefEq) (nocProbes c))
+    nat   = Const nameNat []
+    dummy = Const nameNatZero []
+
+-- | Is this constant declared, with no universe parameters, at this type?
+declaredTypeIs :: Name -> Expr -> TC Bool
+declaredTypeIs n ty = do
+  env <- getEnv
+  case lookupConst env n of
+    Just ci | null (constLevels ci) -> isDefEq (constType ci) ty
+    _                               -> pure False
+
+-- | Is the inductive type of this name the one "Kernel.Canon" describes?
+--
+-- Arity, constructor names, constructor order and every type, the last up to
+-- conversion.  Constructor names /are/ checked here, unlike in the @Eq@ shape
+-- test that guards @Quot.lift@: there the name carries no weight, whereas the
+-- literal expansion and the arithmetic shortcuts both emit @Nat.zero@ and
+-- @Nat.succ@ by name, so the names are part of what is being relied on.
+--
+-- Universe parameters are compared by position, under the file's own names, so
+-- a type that differs only in what it calls its parameter still matches.
+canonIndMatches :: CanonInd -> TC Bool
+canonIndMatches c =
+  cachedName tcCanonOk (\m s -> s { tcCanonOk = m }) (ciName c)
+             (attempt (unmeteredly go))
+  where
+    go = do
+      env <- getEnv
+      case lookupConst env (ciName c) of
+        Just (CInd ind)
+          | length (indLevels ind) == ciNumLevels c
+          , indNumParams ind  == ciNumParams c
+          , indNumIndices ind == ciNumIdx c
+          , length (indCtors ind) == length (ciCtors c)
+          , and (zipWith (\cn cc -> cn == ccName cc) (indCtors ind) (ciCtors c))
+          -> do
+            let us = indLevels ind
+            okTy <- isDefEq (indType ind) (ciType c us)
+            oks  <- mapM (ctorMatches env us) (zip (indCtors ind) (ciCtors c))
+            pure (okTy && and oks)
+        _ -> pure False
+
+    ctorMatches env us (cn, cc) = case lookupConst env cn of
+      Just (CCtor ci)
+        | ctorInduct ci    == ciName c
+        , ctorLevels ci    == us
+        , ctorNumParams ci == ciNumParams c
+        , ctorNumFields ci == ccNumFields cc
+        -> isDefEq (ctorType ci) (ccType cc us)
+      _ -> pure False
+
+-- | Run a check, reading a failure as a "no".
+--
+-- The equations above mention constants that need not exist, so inferring a type
+-- while checking them can fail outright.  For a question of the form "may this
+-- shortcut be taken?" that is an answer.  State is rolled back on failure.
+attempt :: TC Bool -> TC Bool
+attempt (TC act) = TC $ \s -> case act s of
+  Left _ -> Right (False, s)
+  ok     -> ok
+
+-- | Is @cn@ a constructor of the inductive type @tn@, with no universe
+-- parameters of its own beyond that type's, this many parameters and this many
+-- fields?
+isCtorOf :: Env -> Name -> (Name, Int, Int) -> Bool
+isCtorOf env tn (cn, nps, nf) = case (lookupConst env tn, lookupConst env cn) of
+  (Just (CInd ind), Just (CCtor ci)) ->
+    ctorInduct ci == tn
+      && ctorLevels ci == indLevels ind
+      && ctorNumParams ci == nps
+      && ctorNumFields ci == nf
+      && indNumParams ind == nps
+      && indNumIndices ind == 0
+  _ -> False
+
+-- | Does this closed term check against this type?  A failure is an answer, not
+-- an error: the caller is asking whether an assumption holds, not relying on it.
+wellTyped :: Expr -> Expr -> TC Bool
+wellTyped e t = TC $ \s -> Right (either (const False) (const True)
+                                         (unTC (checkType e t) s), s)
+
+-- | Run a check once per environment and remember the answer.
+--
+-- The slot is set to @False@ for the duration, so a check that somehow reached
+-- 'expandLit' again would find literals inert and terminate rather than loop.
+-- (Nothing currently does: the witnesses reduce only literal-free types.)
+cached :: (TCState -> Maybe Bool) -> (Maybe Bool -> TCState -> TCState)
+       -> TC Bool -> TC Bool
+cached get put act = TC (\s -> Right (get s, s)) >>= \case
+  Just b  -> pure b
+  Nothing -> do
+    TC $ \s -> Right ((), put (Just False) s)
+    b <- act
+    TC $ \s -> Right ((), put (Just b) s)
+    pure b
+
+-- | 'cached', for a question asked about one name out of many.  Parking at
+-- @False@ matters more here: the checks these guard reduce the very operations
+-- they are establishing, and would otherwise ask themselves.
+cachedName :: (TCState -> Map Name Bool) -> (Map Name Bool -> TCState -> TCState)
+           -> Name -> TC Bool -> TC Bool
+cachedName get put n act = TC (\s -> Right (M.lookup n (get s), s)) >>= \case
+  Just b  -> pure b
+  Nothing -> do
+    note False
+    b <- act
+    note b
+    pure b
+  where note b = TC $ \s -> Right ((), put (M.insert n b (get s)) s)
+
+-- | Decode a UTF-8 byte string into code points.
+utf8Chars :: B.ByteString -> [Integer]
+utf8Chars = go . map fromEnum . B.unpack
+  where
+    go [] = []
+    go (c : cs)
+      | c < 0x80  = toInteger c : go cs
+      | c < 0xE0  = cont 1 (c - 0xC0) cs
+      | c < 0xF0  = cont 2 (c - 0xE0) cs
+      | otherwise = cont 3 (c - 0xF0) cs
+    cont k acc cs =
+      let (bs, rest) = splitAt k cs
+          v = foldl (\a b -> a * 64 + (b - 0x80)) acc bs
+      in toInteger v : go rest
+
+-- Definitional equality -------------------------------------------------------
+
+isDefEq :: Expr -> Expr -> TC Bool
+isDefEq t0 s0
+  | t0 == s0  = pure True
+  | otherwise = outOfFuel >>= \out -> if out then pure False else do
+      t <- whnfCore t0
+      s <- whnfCore s0
+      if t == s then pure True else defEqLoop t s
+
+defEqLoop :: Expr -> Expr -> TC Bool
+defEqLoop t s = do
+  m <- firstJustM [ tryBinders t s, tryEta t s, tryEta s t, trySortLit t s ]
+  case m of
+    Just b  -> pure b
+    Nothing -> do
+      cong <- tryRigidSpine t s
+      case cong of
+        Just True -> pure True
+        _ -> do
+          irrel <- tryProofIrrel t s
+          if irrel then pure True else
+            tryDelta t s >>= \case
+              DEq       -> pure True
+              DGo t' s' -> do
+                t2 <- whnfCore t'
+                s2 <- whnfCore s'
+                if t2 == s2 then pure True else defEqLoop t2 s2
+              -- Both heads are rigid, so 'tryRigidSpine' has already had its go.
+              DStuck    -> lastResort t s
+              DStarved  -> pure False
+
+firstJustM :: [TC (Maybe a)] -> TC (Maybe a)
+firstJustM []       = pure Nothing
+firstJustM (a : as) = a >>= \case
+  Just x  -> pure (Just x)
+  Nothing -> firstJustM as
+
+-- | Congruence for the two binders.  Definitive: if the domains or bodies
+-- differ the terms are not convertible (nothing else can apply to a @Pi@ or a
+-- @Lam@ in whnf).
+tryBinders :: Expr -> Expr -> TC (Maybe Bool)
+tryBinders (Lam n t1 b1) (Lam _ t2 b2) = Just <$> binderEq n t1 b1 t2 b2
+tryBinders (Pi  n t1 b1) (Pi  _ t2 b2) = Just <$> binderEq n t1 b1 t2 b2
+tryBinders _ _                         = pure Nothing
+
+binderEq :: Binder -> Expr -> Expr -> Expr -> Expr -> TC Bool
+binderEq n t1 b1 t2 b2 = do
+  okT <- isDefEq t1 t2
+  if not okT then pure False else
+    withLocal n t1 $ \x -> isDefEq (instantiateBody x b1) (instantiateBody x b2)
+
+-- | Function eta: @f = fun x => f x@.
+tryEta :: Expr -> Expr -> TC (Maybe Bool)
+tryEta (Lam n dom body) s = do
+  let s' = Lam n dom (App (liftE 0 1 s) (BVar 0))
+  Just <$> isDefEq (Lam n dom body) s'
+tryEta _ _ = pure Nothing
+
+-- | @Sort@s, literals, and literal-versus-constructor.
+trySortLit :: Expr -> Expr -> TC (Maybe Bool)
+trySortLit (Sort a)   (Sort b)   = pure (Just (levelEquiv a b))
+trySortLit (NatLit a) (NatLit b) = pure (Just (a == b))
+trySortLit (StrLit a) (StrLit b) = pure (Just (a == b))
+trySortLit a b
+  | isLit a, headIsCtorish b = do a' <- expandLit a; Just <$> isDefEq a' b
+  | isLit b, headIsCtorish a = do b' <- expandLit b; Just <$> isDefEq a b'
+  where
+    isLit NatLit{} = True
+    isLit StrLit{} = True
+    isLit _        = False
+    headIsCtorish e = case fst (unApps e) of Const{} -> True; _ -> False
+trySortLit _ _ = pure Nothing
+
+-- | Proof irrelevance: any two proofs of the same proposition are equal.
+tryProofIrrel :: Expr -> Expr -> TC Bool
+tryProofIrrel t s = outOfFuel >>= \out -> if out then pure False else do
+  tt <- inferOnly t
+  l  <- ensureSort =<< inferOnly tt
+  if not (isDefinitelyZero l) then pure False else do
+    ts <- inferOnly s
+    isDefEq tt ts
+
+-- | Congruence for a spine whose head cannot be unfolded -- a local constant, a
+-- projection, an axiom, a constructor, an inductive type, a stuck recursor.
+--
+-- Tried early, and only for such heads.  It is not speculative (there is
+-- nothing else the pair could reduce to), it costs nothing when the heads
+-- differ, and getting it in before 'tryProofIrrel' is what keeps the kernel
+-- from inferring the type of every intermediate term of a long computation.
+-- For a head that /is/ a definition the same congruence is speculative -- the
+-- two sides may only agree after unfolding -- so it is left to 'tryDelta',
+-- which weighs it against the definition heights.
+tryRigidSpine :: Expr -> Expr -> TC (Maybe Bool)
+tryRigidSpine t s = do
+  unfoldable <- isUnfoldableHead t
+  if unfoldable then pure Nothing else trySpine t s
+
+-- | Is the head of this application a definition the kernel may delta-unfold?
+isUnfoldableHead :: Expr -> TC Bool
+isUnfoldableHead e = case fst (unApps e) of
+  Const n ls -> do
+    env <- getEnv
+    pure $ case lookupConst env n of
+      Just (CDef d) -> length ls == length (defLevels d)
+      _             -> False
+  _ -> pure False
+
+-- | The outcome of one round of lazy delta unfolding.
+--
+-- @DStarved@ is not a statement about the terms: it says the budget ran out
+-- before anything could be unfolded, so this round made no progress and the
+-- loop must stop rather than ask the same question again.
+data Delta = DEq | DGo Expr Expr | DStuck | DStarved
+
+-- | Lazy delta reduction: unfold the taller definition first, and when both
+-- sides are the same constant try congruence before unfolding at all.
+tryDelta :: Expr -> Expr -> TC Delta
+tryDelta t s = outOfFuel >>= \out -> if out then pure DStarved else do
+  ht <- headHeight t
+  hs <- headHeight s
+  case (ht, hs) of
+    (Nothing, Nothing) -> pure DStuck
+    (Just _,  Nothing) -> DGo <$> forceUnfold t <*> pure s
+    (Nothing, Just _)  -> DGo t <$> forceUnfold s
+    (Just a,  Just b)
+      | a > b     -> DGo <$> forceUnfold t <*> pure s
+      | b > a     -> DGo t <$> forceUnfold s
+      | otherwise -> do
+          same <- sameHeadCongr t s
+          if same then pure DEq else DGo <$> forceUnfold t <*> forceUnfold s
+  where
+    headHeight e = case fst (unApps e) of
+      Const n ls -> do
+        env <- getEnv
+        pure $ case lookupConst env n of
+          Just (CDef d) | length ls == length (defLevels d) -> Just (defHeight d)
+          _ -> Nothing
+      _ -> pure Nothing
+    forceUnfold e = unfoldDelta e >>= \case
+      Just e' -> pure e'
+      Nothing -> pure e
+
+-- | If both sides are the same constant applied to the same number of
+-- arguments, try comparing arguments pairwise.  A failure here is /not/
+-- conclusive -- the terms may still be equal after unfolding -- so the caller
+-- falls through rather than reporting inequality.
+--
+-- Which is also why it runs on a budget.  The arguments the two sides disagree
+-- on may be exactly the ones unfolding the head is about to throw away, and
+-- normalising them can cost arbitrarily more than the comparison the caller
+-- actually wants.  See 'speculate'.
+sameHeadCongr :: Expr -> Expr -> TC Bool
+sameHeadCongr t s = case (unApps t, unApps s) of
+  ((Const n1 l1, as1), (Const n2 l2, as2))
+    | n1 == n2, length l1 == length l2, length as1 == length as2
+    , and (zipWith levelEquiv l1 l2) ->
+        speculate (allM (uncurry isDefEq) (zip as1 as2))
+  _ -> pure False
+
+-- | Everything that only makes sense once no more unfolding is possible.
+lastResort :: Expr -> Expr -> TC Bool
+lastResort t s = do
+  m <- firstJustM
+    [ tryProjCongr t s
+    , tryStructEta t s
+    , tryStructEta s t
+    , tryUnitLike t s
+    ]
+  pure (maybe False id m)
+
+-- | Congruence for a neutral spine (local constant, axiom, constructor,
+-- inductive type, stuck recursor, stuck projection, ...).
+--
+-- Sound but incomplete, so a failure only means \"try something else\".
+trySpine :: Expr -> Expr -> TC (Maybe Bool)
+trySpine t s = case (unApps t, unApps s) of
+  ((h1, as1), (h2, as2))
+    | length as1 == length as2 -> do
+        heads <- headEq (null as1) h1 h2
+        if heads then yesOrPass =<< allM (uncurry isDefEq) (zip as1 as2)
+                 else pure Nothing
+  _ -> pure Nothing
+  where
+    yesOrPass b = pure (if b then Just True else Nothing)
+    headEq _ (FVar i) (FVar j) = pure (i == j)
+    headEq _ (Const n1 l1) (Const n2 l2) =
+      pure (n1 == n2 && length l1 == length l2 && and (zipWith levelEquiv l1 l2))
+    -- A stuck projection can head an application too -- @(x.1) y@ -- and then
+    -- the two projected structures may still need unfolding to be compared.
+    -- Only recurse when there really are arguments: with none, this /is/ the
+    -- call 'tryProjCongr' is about to make, and we would loop.
+    headEq False p@Proj{} q@Proj{} = isDefEq p q
+    headEq _ _ _ = pure False
+
+tryProjCongr :: Expr -> Expr -> TC (Maybe Bool)
+tryProjCongr (Proj n1 i1 s1) (Proj n2 i2 s2)
+  | n1 == n2, i1 == i2 = do
+      b <- isDefEq s1 s2
+      pure (if b then Just True else Nothing)
+tryProjCongr _ _ = pure Nothing
+
+-- | If one side is a constructor application of a structure, expand the other
+-- side into one via projections.
+tryStructEta :: Expr -> Expr -> TC (Maybe Bool)
+tryStructEta t s = withFuel $ do
+  env <- getEnv
+  case unApps t of
+    (Const cn _, as)
+      | Just (CCtor ci) <- lookupConst env cn
+      , isStructureLike env (ctorInduct ci)
+      , length as == ctorNumParams ci + ctorNumFields ci
+      , ctorNumFields ci > 0 -> do
+          sTy <- inferOnly s >>= whnf
+          case fst (unApps sTy) of
+            Const tn _ | tn == ctorInduct ci -> do
+              let fields = drop (ctorNumParams ci) as
+              b <- allM (\(i, f) -> isDefEq f (Proj tn i s)) (zip [0 ..] fields)
+              pure (if b then Just True else Nothing)
+            _ -> pure Nothing
+    _ -> pure Nothing
+
+-- | A structure with no fields has exactly one element up to conversion.
+tryUnitLike :: Expr -> Expr -> TC (Maybe Bool)
+tryUnitLike t s = withFuel $ do
+  env <- getEnv
+  tTy <- inferOnly t >>= whnf
+  case fst (unApps tTy) of
+    Const tn _
+      | isStructureLike env tn
+      , Just ci <- ctorOfStructure env tn
+      , ctorNumFields ci == 0 -> do
+          sTy <- inferOnly s
+          b <- isDefEq tTy sTy
+          pure (if b then Just True else Nothing)
+    _ -> pure Nothing
+
+allM :: (a -> TC Bool) -> [a] -> TC Bool
+allM _ []       = pure True
+allM f (x : xs) = f x >>= \b -> if b then allM f xs else pure False
+
+-- Inference -------------------------------------------------------------------
+
+-- | How hard 'inferM' works.
+--
+-- @Verify@ is the real typing judgement: every premise of every rule is
+-- checked.  @Assume@ computes the /same/ type but takes the premises on trust,
+-- so it only walks the term's head spine and binders instead of the whole term.
+--
+-- @Assume@ is sound to use exactly when the term is already known to typecheck,
+-- because then the premises it skips are known to hold.  That is a standing
+-- invariant of 'whnf' and 'isDefEq': a term only reaches them after 'checkType'
+-- has been through it (a subterm of a checked term is checked, and the types
+-- 'ensurePi' / 'ensureSort' hand around are types of checked terms).  The
+-- conversion checker leans on this heavily -- 'tryProofIrrel' asks for the type
+-- of both sides of every stuck comparison, and re-verifying those terms turns a
+-- linear check into a quadratic one.
+data InferMode = Verify | Assume deriving Eq
+
+-- | The local environment an /open/ term is read in: the local constants the
+-- enclosing binders were opened with, innermost first, so that @BVar i@ denotes
+-- @FVar (env !! i)@.
+--
+-- Inference carries one of these instead of substituting at every binder.  The
+-- invariant is asymmetric, and worth stating precisely:
+--
+-- * @inferM m env e@ may be given an @e@ that is open with respect to @env@;
+-- * the type it returns is always /closed/ -- every variable in it is an
+--   'FVar' with an entry in the local context.
+--
+-- That is what makes the environment cheap: it is threaded down through
+-- 'Lam' and 'Pi' without touching the body, and materialised (by 'closeIn')
+-- only where a subterm has to be handed to something that needs a real term --
+-- a binder type going into the local context, an argument being substituted
+-- into a dependent codomain, the structure of a projection.
+--
+-- Substituting instead, as the rules are written in SPEC.md, is quadratic: a
+-- telescope of @n@ binders copies its whole body @n@ times.
+type LEnv = [Int]
+
+-- | The environment half of a 'Memo' key, for a term with loose bound
+-- variables.
+--
+-- Just the innermost local, which identifies the whole list: 'freshFVar' hands
+-- out an id that has never been used before and inference immediately conses it
+-- onto one particular environment, so no id is ever the head of two different
+-- ones.  @-1@ is not an id, so it can stand for the empty environment.
+envKey :: LEnv -> Int
+envKey []      = -1
+envKey (x : _) = x
+
+-- | The environment half of a 'Memo' key for @e@.
+--
+-- The answer depends on the environment only through the entries the term's
+-- loose bound variables name, so a term that has none is read the same way
+-- everywhere and every environment shares one entry -- the same one the empty
+-- environment uses.  A term that has some names the innermost, so its whole
+-- environment is pinned by 'envKey' and nothing is gained by looking further.
+--
+-- Sharing that entry is not a refinement, it is the difference between linear
+-- and exponential.  A binder infers its body under a /fresh/ local, so keying on
+-- the environment alone gives a subterm reached under @n@ binders @n@ distinct
+-- keys -- and a subterm reached along @2^n@ paths, @2^n@ of them, each with its
+-- own chain of fresh locals to allocate.  A closed term under a binder is the
+-- common case (@∀ x : A, B@ with @B@ not mentioning @x@ is one), so this is not
+-- a corner: it is what stops a deeply shared type from being unfolded into the
+-- tree it denotes.
+memoKey :: LEnv -> Expr -> Int
+memoKey env e | looseBVarRange e == 0 = -1
+              | otherwise             = envKey env
+
+-- | Replace the loose bound variables of a term by what @vs@ says they stand
+-- for, leaving a closed term.  A term needing more than @vs@ supplies is
+-- out of scope, and is rejected here rather than silently renumbered.
+substIn :: [Expr] -> Expr -> TC Expr
+substIn vs e
+  | k == 0    = pure e
+  | otherwise = let pre = take k vs
+                in if length pre == k then pure (instN pre e)
+                   else throwTC ("loose bound variable #" ++ show (k - 1))
+  where k = looseBVarRange e
+
+-- | 'substIn' for the variables an environment binds.
+closeIn :: LEnv -> Expr -> TC Expr
+closeIn env e | looseBVarRange e == 0 = pure e
+              | otherwise             = substIn (map FVar env) e
+
+infer :: Expr -> TC Expr
+infer = inferM Verify []
+
+-- | The type of a term that is already known to typecheck.  See 'InferMode'.
+inferOnly :: Expr -> TC Expr
+inferOnly = inferM Assume []
+
+-- | The typing judgement, memoised on the node and its environment.
+--
+-- The memo is not an optimisation of a linear traversal: without it inference
+-- runs over the term's /tree unfolding/, which for a shared term is
+-- exponentially larger than the term.  Two nodes get the same type whenever
+-- they are the same node read in the same environment, because with those and
+-- the global environment and the declaration's universe parameters fixed the
+-- judgement is a function of the term -- see 'Memo', 'memoKey' and 'setEnv'.
+inferM :: InferMode -> LEnv -> Expr -> TC Expr
+inferM m env e
+  | trivial e = inferCore m env e
+  | otherwise = lookupInfer m ek e >>= \case
+      Just t  -> pure t
+      Nothing -> do
+        t <- inferCore m env e
+        insertInfer m ek e t
+        pure t
+  where
+    ek = memoKey env e
+    -- Leaves cost less to infer than to look up.
+    trivial ex = case ex of
+      App{} -> False; Lam{} -> False; Pi{} -> False
+      Let{} -> False; Proj{} -> False; _ -> True
+
+lookupInfer :: InferMode -> Int -> Expr -> TC (Maybe Expr)
+lookupInfer m ek e = TC $ \s ->
+  Right (memoLookup (if m == Verify then tcInferV s else tcInferA s) ek e, s)
+
+insertInfer :: InferMode -> Int -> Expr -> Expr -> TC ()
+insertInfer m ek k v = TC $ \s -> Right ((), case m of
+  Verify -> s { tcInferV = memoInsert ek k v (tcInferV s) }
+  Assume -> s { tcInferA = memoInsert ek k v (tcInferA s) })
+
+inferCore :: InferMode -> LEnv -> Expr -> TC Expr
+inferCore m env e = case e of
+  BVar i      -> case drop i env of
+    (x : _) -> localType x
+    []      -> throwTC ("loose bound variable #" ++ show i)
+  FVar i      -> localType i
+  Sort l      -> do when (m == Verify) (checkLevel l); pure (Sort (LSucc l))
+  NatLit _    -> pure (Const nameNat [])
+  StrLit _    -> pure (Const nameString [])
+  Const n ls  -> do
+    genv <- getEnv
+    case lookupConst genv n of
+      Nothing -> throwTC ("unknown constant " ++ showName n)
+      Just ci -> do
+        let ps = constLevels ci
+        unless (length ls == length ps) $
+          throwTC ("constant " ++ showName n ++ " expects " ++ show (length ps)
+                   ++ " universe arguments, got " ++ show (length ls))
+        when (m == Verify) (mapM_ checkLevel ls)
+        pure (instLevelsE ps ls (constType ci))
+  App f a -> do
+    tf <- inferM m env f
+    (dom, cod) <- ensurePi tf
+    when (m == Verify) (checkTypeIn env a dom)
+    -- The argument is only needed as a term when the codomain looks at it.
+    if looseBVarRange cod == 0 then pure cod
+                               else do a' <- closeIn env a
+                                       pure (inst1 a' cod)
+  Lam n t b -> do
+    when (m == Verify) (() <$ inferSortOfIn env t)
+    t' <- closeIn env t
+    withLocal n t' $ \x -> do
+      tb <- inferM m (x : env) b
+      pure (Pi n t' (abstractFVars [x] tb))
+  Pi n t b -> do
+    -- Both sorts are part of the /result/, not a premise, so they are computed
+    -- in either mode; only the recursive verification of @t@ and @b@ is dropped.
+    l1 <- ensureSort =<< inferM m env t
+    t' <- closeIn env t
+    withLocal n t' $ \x -> do
+      l2 <- ensureSort =<< inferM m (x : env) b
+      pure (Sort (mkIMax l1 l2))
+  Let _ t v b -> do
+    t' <- closeIn env t
+    when (m == Verify) $ do
+      _ <- inferSortOf t'
+      checkTypeIn env v t'
+    v' <- closeIn env v
+    -- Zeta: the body is read with the value in place of the let-bound variable.
+    b' <- substIn (v' : map FVar env) b
+    inferM m [] b'
+  Proj tn i s -> inferProj m env tn i s
+
+-- | @checkType e t@ fails unless @e : t@.
+checkType :: Expr -> Expr -> TC ()
+checkType = checkTypeIn []
+
+-- | @checkTypeIn env e t@ checks a term open with respect to @env@ against a
+-- closed type.
+checkTypeIn :: LEnv -> Expr -> Expr -> TC ()
+checkTypeIn env e t = do
+  te <- inferM Verify env e
+  ok <- isDefEq te t
+  unless ok $ do
+    e'  <- closeIn env e
+    te' <- whnf te
+    t'  <- whnf t
+    throwTC ("type mismatch:\n  term     " ++ brief e'
+             ++ "\n  has type " ++ brief te'
+             ++ "\n  expected " ++ brief t')
+
+-- | Terms in error messages are for a human; a term the size of a proof term is
+-- not.
+brief :: Expr -> String
+brief e = case splitAt 400 (showExpr e) of
+  (s, [])  -> s
+  (s, _)   -> s ++ " ..."
+
+-- | Infer a type and require it to be a @Sort@, returning its level.
+inferSortOf :: Expr -> TC Level
+inferSortOf = inferSortOfIn []
+
+inferSortOfIn :: LEnv -> Expr -> TC Level
+inferSortOfIn env e = inferM Verify env e >>= ensureSort
+
+ensureSort :: Expr -> TC Level
+ensureSort t = whnf t >>= \case
+  Sort l -> pure l
+  t'     -> throwTC ("expected a sort, got " ++ showExpr t')
+
+ensurePi :: Expr -> TC (Expr, Expr)
+ensurePi t = whnf t >>= \case
+  Pi _ dom cod -> pure (dom, cod)
+  t'           -> throwTC ("expected a function type, got " ++ showExpr t')
+
+-- | Projection typing.
+--
+-- @s.i@ requires @s : T params@ for a structure-like @T@, and the type of the
+-- field is read off the constructor's telescope with earlier fields replaced by
+-- earlier projections of @s@.
+--
+-- The side condition is the interesting one.  If @T params@ is a proposition
+-- then all its inhabitants are convertible, so a projection out of it may only
+-- land in a proposition -- otherwise @(mk true).0@ and @(mk false).0@ would be
+-- convertible.  Stated over all universe assignments the condition
+-- @sortT = 0 -> sortF = 0@ is exactly @sortF <= imax sortF sortT@.
+--
+-- It applies to the field being projected, and also to every earlier field
+-- whose projection actually turns up in the rest of the telescope: reading
+-- @s.i@ off a telescope that was instantiated with an /illegal/ projection
+-- would be reading it off a type that does not exist.  An earlier field that
+-- nothing downstream mentions is simply skipped, so a data field may sit
+-- between two proof fields of a proposition without poisoning them.
+inferProj :: InferMode -> LEnv -> Name -> Int -> Expr -> TC Expr
+inferProj m lenv tn i s0 = do
+  env <- getEnv
+  when (i < 0) $ throwTC "negative projection index"
+  sTy <- inferM m lenv s0 >>= whnf
+  -- The field types are built from projections /of this term/, so here it does
+  -- have to be materialised.
+  s <- closeIn lenv s0
+  let (h, args) = unApps sTy
+  case h of
+    Const tn' ls | tn' == tn -> do
+      ind <- case lookupConst env tn of
+        Just (CInd ind) -> pure ind
+        _               -> throwTC ("projection: " ++ showName tn ++ " is not an inductive type")
+      unless (isStructureLike env tn) $
+        throwTC ("projection: " ++ showName tn ++ " is not a structure")
+      ci <- case indCtors ind of
+        [cn] | Just (CCtor ci) <- lookupConst env cn -> pure ci
+        _ -> throwTC ("projection: " ++ showName tn ++ " has no unique constructor")
+      let nps = indNumParams ind
+      unless (length args == nps) $
+        throwTC ("projection: " ++ showName tn ++ " applied to the wrong number of arguments")
+      unless (i < ctorNumFields ci) $
+        throwTC ("projection index " ++ show i ++ " out of range for " ++ showName tn)
+      let cty0 = instLevelsE (ctorLevels ci) ls (ctorType ci)
+      cty   <- peelParams nps args cty0
+      let checkField j fty = when (m == Verify) $ do
+            sortT <- ensureSort =<< inferOnly sTy
+            sortF <- inferSortOf fty
+            unless (levelLeq sortF (LIMax sortF sortT)) $
+              throwTC ("projection out of a proposition into " ++ showLevel sortF
+                       ++ ": " ++ showName tn ++ "." ++ show j)
+          peelFields j ty
+            | j == i    = do
+                (dom, _) <- ensurePi ty
+                checkField i dom
+                pure dom
+            | otherwise = do
+                (dom, cod) <- ensurePi ty
+                -- @s.j@ is about to be substituted into the rest of the
+                -- telescope; if it actually turns up there then it has to be a
+                -- legal projection itself, or the type we finally read off is
+                -- built from a term that does not typecheck.
+                when (hasLooseBVars cod) (checkField j dom)
+                peelFields (j + 1) (inst1 (Proj tn j s) cod)
+      peelFields 0 cty
+    _ -> throwTC ("projection: expected a value of type " ++ showName tn
+                  ++ ", got " ++ showExpr sTy)
+  where
+    peelParams 0 _ ty = pure ty
+    peelParams k ps ty = do
+      (_, cod) <- ensurePi ty
+      peelParams (k - 1) (tail ps) (inst1 (head ps) cod)
