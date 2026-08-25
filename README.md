@@ -75,18 +75,36 @@ bash tools/run-tests.sh validation      # the validation corpus below
 
 `validation/` is a separate corpus of pathological cases built by a subagent that
 *was* allowed to read Lean's source and issue tracker, as an adversarial check on
-a kernel that was not. `validation/disputed/` holds the cases where eink0rn and
-official Lean disagree and eink0rn is not obviously wrong; SPEC §12.6 discusses
-the arithmetic ones.
+a kernel that was not. 832 of its 846 labelled cases get the label's verdict; the
+other 14 are divergences SPEC §12 records and defends — eight on the arithmetic
+licence (§12.6), three universe-polymorphic inductives whose fields satisfy the
+universe condition under every assignment (§12.2), two nested occurrences at a
+fixed index (§12.12), and one quotient package spelled under other names (§12.3,
+which `--pin-std` catches).
+
+`validation/disputed/` holds 35 further cases where eink0rn and official Lean are
+expected to disagree and eink0rn is not obviously wrong. It accepts 22 and
+rejects 13, and every one falls into a family SPEC §12 already argues: level
+identities the complete `≤` decides (§12.2), files that redefine `Nat.add` and
+then assert the standard fact about it (§12.6, in both directions), the line
+schema (§12.8), and `Acc.rec` on a proof variable (§12.13).
 
 ### The Lean Kernel Arena exports
 
-| corpus | declarations | verdict |
-| --- | --- | --- |
-| `init.ndjson` (325 MB) | 53,093 | ACCEPT |
-| `std.ndjson` (552 MB) | 90,778 | ACCEPT |
-| `cslib.ndjson` (2.1 GB) | 370,939 | ACCEPT |
-| `mathlib.ndjson` (5.6 GB) | | |
+Whole-run wall clock and peak RSS, on one core of a GCP `n2` instance. The file
+is parsed strictly before checking starts, which is most of the memory.
+
+| corpus | declarations | verdict | time | peak RSS |
+| --- | --- | --- | --- | --- |
+| `init.ndjson` (325 MB) | 53,093 | ACCEPT | 3m 29s | 1.6 GB |
+| `std.ndjson` (552 MB) | 90,778 | ACCEPT | 6m 0s | 3.3 GB |
+| `cslib.ndjson` (2.1 GB) | 370,939 | ACCEPT | 22m 32s | 9.6 GB |
+| `mathlib.ndjson` (5.6 GB) | 654,504 | ACCEPT | 2h 16m | 25 GB |
+
+One mathlib theorem —
+`AlgebraicGeometry.Scheme.exists_π_app_comp_eq_of_locallyOfFinitePresentation_of_isAffine`
+— accounts for 11 minutes of that on its own. The next slowest takes 48 seconds,
+and only six declarations in the whole export take longer than 20.
 
 ## Layout
 
