@@ -38,11 +38,12 @@ import           Control.Monad          (unless, when)
 import qualified Data.ByteString.Char8  as B
 import           Data.IntMap.Strict     (IntMap)
 import qualified Data.IntMap.Strict     as IM
-import           Data.List              (find)
+import           Data.List              (find, foldl')
 import           Data.Map.Strict        (Map)
 import qualified Data.Map.Strict        as M
-import           Kernel.Cache           (Cache, bucket, clearCache, newCache,
-                                         push)
+import           Kernel.Cache           (Cache, Counter, bucket, bumpCounter,
+                                         clearCache, newCache, newCounter, push,
+                                         readCounter, tick)
 import           Kernel.Canon
 import           Kernel.Env
 import           Kernel.Expr
@@ -61,6 +62,11 @@ data TCState = TCState
                                --   speculation; 'unmetered' outside one
   , tcWaste       :: !Int      -- ^ reduction steps still available to be
                                --   /wasted/ on speculation; see 'speculate'
+  , tcCredit      :: !Counter  -- ^ real reduction steps still to be taken
+                               --   before the next is added to 'tcWaste'; see
+                               --   'wasteRate'
+  , tcStarve      :: !Counter  -- ^ how many times reduction has stopped for
+                               --   want of budget; see 'starving'
   , tcInferV      :: !Memo     -- ^ memo for 'inferM' @Verify@; see 'Memo'
   , tcInferA      :: !Memo     -- ^ memo for 'inferM' @Assume@
   , tcWhnf        :: !Memo     -- ^ memo for 'whnf'
@@ -211,21 +217,35 @@ type LevelMemo = Cache (Expr, [Level], Expr)
 -- The bodies come from the environment, so the pointer is stable for as long as
 -- the table lives; the universe arguments are compared properly, being short.
 -- Missing a hit only wastes time, so the bucket is capped.
+--
+-- The arguments are part of the /key/ and not only of the entry, which matters
+-- more than it sounds: one body instantiated at a dozen different universes is
+-- the normal case, not a rare one, and hanging all dozen off the body's hash
+-- alone puts them in one bucket, where the cap throws them away as fast as they
+-- arrive.
 instLevels :: [Name] -> [Level] -> Expr -> TC Expr
 instLevels [] _  e = pure e
-instLevels ps ls e = TC $ \s -> do
-  let tbl = tcLevelInst s
-      key = exprHash e
-      hit ((b, ls', r) : rest) | ptrEq b e, ls' == ls = Just r
-                               | otherwise            = hit rest
-      hit []                                          = Nothing
-  b <- bucket tbl key
-  case hit b of
-    Just r  -> pure (Right (r, s))
-    Nothing -> do
-      let r = instLevelsE ps ls e
-      push (\(x, _, _) -> exprHash x) tbl key (e, ls, r)
-      pure (Right (r, s))
+instLevels ps ls e
+  | and (zipWith isSelf ps ls) = pure e
+  | otherwise = TC $ \s -> do
+      let tbl = tcLevelInst s
+          key = levelsKey e ls
+          hit ((b, ls', r) : rest) | ptrEq b e, ls' == ls = Just r
+                                   | otherwise            = hit rest
+          hit []                                          = Nothing
+      b <- bucket tbl key
+      case hit b of
+        Just r  -> pure (Right (r, s))
+        Nothing -> do
+          let r = instLevelsE ps ls e
+          push (\(x, l, _) -> levelsKey x l) tbl key (e, ls, r)
+          pure (Right (r, s))
+  where
+    isSelf p (LParam q) = p == q
+    isSelf _ _          = False
+
+levelsKey :: Expr -> [Level] -> Int
+levelsKey e = foldl' (\h l -> hashMix h (levelHash l)) (exprHash e)
 
 -- | The checking monad: state, failure, and -- because the memo tables above
 -- are mutable -- 'IO'.
@@ -269,8 +289,10 @@ runTCLearn env lps (TC f) = unsafePerformIO $ do
   defEq  <- newCache
   lvlM   <- newCache
   locId  <- newCache
+  credit <- newCounter wasteRate
+  starve <- newCounter 0
   r <- f (seedLicences env
-           (TCState env IM.empty 0 lps unmetered wasteBudget
+           (TCState env IM.empty 0 lps unmetered wasteBudget credit starve
                     inferV inferA whnfM defEq lvlM locId (-1)
                     Nothing Nothing M.empty M.empty M.empty))
   pure (fmap readLicences <$> r)
@@ -285,27 +307,76 @@ throwTC msg = TC $ \_ -> pure (Left msg)
 unmetered :: Int
 unmetered = maxBound
 
--- | How much reduction one declaration may /waste/ on speculation.
+-- | How much reduction may be /wasted/ on speculation at one go.
 --
 -- Purely a time/completeness trade-off, with no effect on what counts as a
--- proof: see 'speculate'.  Speculation that pays off is not charged, so this is
--- a bound on dead ends, not on congruence.  Big enough that a comparison
--- needing real but bounded normalisation still gets settled the cheap way;
--- small enough that a few failures cannot run away with an evaluation the
--- caller was about to make unnecessary.
+-- proof: see 'speculate'.  Speculation that pays off is not charged, so this
+-- bounds dead ends, not congruence.  Big enough that a comparison needing real
+-- but bounded normalisation still gets settled the cheap way; small enough that
+-- a few failures cannot run away with an evaluation the caller was about to make
+-- unnecessary.
+--
+-- This is the /burst/: what may be spent before any real work has been done, and
+-- the most that may ever be saved up.  See 'wasteRate'.
 wasteBudget :: Int
-wasteBudget = 20000
+wasteBudget = 50000
+
+-- | Real reduction steps that earn one step of speculation.
+--
+-- A fixed allowance per declaration is the wrong shape, because declarations are
+-- not the same size: a bound generous enough to be invisible on a one-line lemma
+-- is spent in the first instant of a machine-generated arithmetic certificate,
+-- and what happens then is not that the checker goes slightly slower.  It stops
+-- speculating at all, which means it stops taking the cheap way through
+-- conversion, and finishes the declaration by brute unfolding -- so the cap
+-- meant to stop a proof running away is exactly what makes it run away.
+--
+-- So the allowance is earned rather than granted: dead ends may consume a fixed
+-- fraction of the reduction the checker was going to perform anyway, with
+-- 'wasteBudget' as both the opening balance and the ceiling.  Nothing about the
+-- calculus depends on the numbers; a starved speculation only ever answers
+-- @False@, which means "not this way" and never "not equal".
+wasteRate :: Int
+wasteRate = 8
 
 -- | Charge one reduction step.
+--
+-- A step taken outside a speculation is work the declaration genuinely needed,
+-- and earns speculative allowance at the rate 'wasteRate' sets.
 spend :: TC ()
-spend = TC $ \s -> pure (Right ((), if tcFuel s == unmetered
-                                      then s
-                                      else s { tcFuel = tcFuel s - 1 }))
+spend = TC $ \s ->
+  if tcFuel s /= unmetered
+    then pure (Right ((), s { tcFuel = tcFuel s - 1 }))
+    else do earned <- tick (tcCredit s) wasteRate
+            pure . Right $ if earned
+              then ((), s { tcWaste = min wasteBudget (tcWaste s + 1) })
+              else ((), s)
 
 -- | Has the current speculative comparison run out of budget?  When it has,
 -- reduction stops where it stands and conversion answers @False@.
 outOfFuel :: TC Bool
-outOfFuel = TC $ \s -> pure (Right (tcFuel s <= 0, s))
+outOfFuel = TC $ \s ->
+  let out = tcFuel s <= 0
+  in do when out (bumpCounter (tcStarve s))
+        pure (Right (out, s))
+
+-- | A ticket that says how much reduction has been abandoned half-done.
+--
+-- 'whnf' remembers what it computed, and what it computes under a speculative
+-- budget may not be a normal form: reduction stops where it stands.  Using such
+-- a term is harmless -- it is reached from the original by reduction, so it is
+-- convertible with it, and a comparison that consults it can fail but cannot
+-- wrongly succeed -- but /remembering/ it as the normal form costs a later
+-- caller, with a real budget, the answer it was entitled to.
+--
+-- Rather than refuse to remember anything computed under a budget, take a ticket
+-- before and after: if reduction never once stopped for want of fuel, what came
+-- back is the normal form, however small the budget was.  That is the common
+-- case, and it is the whole value of the memo inside a speculation.
+starving :: TC Int
+starving = TC $ \s -> do
+  n <- readCounter (tcStarve s)
+  pure (Right (n, s))
 
 -- | Run a comparison whose /negative/ answer is not conclusive -- the caller
 -- will unfold and ask again -- under a budget.
@@ -320,7 +391,7 @@ speculate :: TC Bool -> TC Bool
 speculate (TC act) = TC $ \s ->
   let fuel0 = tcFuel s
       allow = if fuel0 == unmetered then tcWaste s else min fuel0 (tcWaste s)
-  in if allow <= 0 then pure (Right (False, s)) else
+  in if allow <= 0 then bumpCounter (tcStarve s) >> pure (Right (False, s)) else
      act s { tcFuel = allow } >>= \case
        Left e        -> pure (Left e)
        Right (b, s') ->
@@ -546,9 +617,10 @@ whnf e
   | otherwise         = lookupWhnf e >>= \case
       Just v  -> pure v
       Nothing -> do
-        real <- unmeteredNow
-        v    <- whnfRaw e
-        when real (insertWhnf e v)
+        before <- starving
+        v      <- whnfRaw e
+        after  <- starving
+        when (before == after) (insertWhnf e v)
         pure v
   where
     -- A head that no rule applies to is its own normal form, and looking that
@@ -563,10 +635,6 @@ whnfRaw e = do
   unfoldDelta e1 >>= \case
     Just e2 -> whnf e2
     Nothing -> pure e1
-
--- | Is this the real reduction, rather than one under a speculative budget?
-unmeteredNow :: TC Bool
-unmeteredNow = TC $ \s -> pure (Right (tcFuel s == unmetered, s))
 
 lookupWhnf :: Expr -> TC (Maybe Expr)
 lookupWhnf e = TC $ \s -> do
@@ -621,9 +689,11 @@ unfoldDelta e = outOfFuel >>= \out -> if out then pure Nothing else do
       env <- getEnv
       case lookupConst env n of
         Just (CDef d) | length ls == length (defLevels d) -> do
-          spend
-          body <- instLevels (defLevels d) ls (defValue d)
-          pure (Just (betaApply body args))
+          held <- natBlocked n args
+          if held then pure Nothing else do
+            spend
+            body <- instLevels (defLevels d) ls (defValue d)
+            pure (Just (betaApply body args))
         _ -> pure Nothing
     _ -> pure Nothing
 
@@ -972,24 +1042,34 @@ powBounded a b
 reduceNatOp :: Name -> NatOp -> [Expr] -> TC (Maybe Expr)
 reduceNatOp n op args = natOpOk n >>= \ok -> if not ok then pure Nothing else
   case (op, args) of
-    (Nat1 f, a : rest) -> withLits [a] $ \case
-      [x] -> Just (mkApps (NatLit (f x)) rest)
-      _   -> Nothing
-    (Nat2 f, a : b : rest) -> withLits [a, b] $ \case
-      [x, y] -> (\v -> mkApps (NatLit v) rest) <$> f x y
-      _      -> Nothing
-    (Cmp2 f, a : b : rest) -> withLits [a, b] $ \case
-      [x, y] -> Just (mkApps (boolOf (f x y)) rest)
-      _      -> Nothing
+    (Nat1 f, a : rest) -> natShape a >>= \sa -> pure $ case sa of
+      NSLit x -> Just (mkApps (NatLit (f x)) rest)
+      _       -> Nothing
+    (Nat2 f, a : b : rest) -> do
+      sa <- natShape a
+      sb <- natShape b
+      pure $ case (sa, sb) of
+        (NSLit x, NSLit y) -> (\v -> mkApps (NatLit v) rest) <$> f x y
+        _                  -> Nothing
+    (Cmp2 f, a : b : rest) -> do
+      sa <- natShape a
+      sb <- natShape b
+      pure $ case (sa, sb) of
+        (NSLit x, NSLit y) -> Just (mkApps (boolOf (f x y)) rest)
+        _                  -> Nothing
     _ -> pure Nothing
   where
     boolOf b = Const (if b then nameBoolTrue else nameBoolFalse) []
-    withLits es k = do
-      vs <- mapM natValueOf es
-      pure (maybe Nothing k (sequence vs))
 
--- | Read a term as a numeral: a literal, or @Nat.succ@ applied to one, or a
--- chain of those bottoming out at @Nat.zero@.
+-- | How a @Nat@-valued term looks once reduced, as far as the equations care.
+data NatShape
+  = NSLit !Integer   -- ^ a numeral: a literal, or a @Nat.succ@ tower over one
+  | NSSucc Expr      -- ^ @Nat.succ e@, with @e@ not read as a numeral
+  | NSNeutral        -- ^ neither, and no further reduction will make it either
+
+-- | Read a term as a numeral -- a literal, or @Nat.succ@ applied to one, or a
+-- chain of those bottoming out at @Nat.zero@ -- and failing that, as a
+-- successor of something, and failing that, as neither.
 --
 -- Reached only with 'natShapeOk' already established, since 'reduceNatOp' asks
 -- 'natOpOk' first; that is what makes @Nat.succ ⌜k⌝@ and @⌜k+1⌝@ the same term
@@ -999,15 +1079,77 @@ reduceNatOp n op args = natOpOk n >>= \ok -> if not ok then pure Nothing else
 -- so a comparison against a bound reaches the shortcut with one constructor
 -- already peeled off; reading only bare literals would miss every @decide@ in
 -- the prelude and leave the numeral to be counted down by hand.
-natValueOf :: Expr -> TC (Maybe Integer)
-natValueOf = go 0
+--
+-- The walk is bounded because the term it walks need not be finite in any useful
+-- sense: 'natSymStep' turns @x + ⌜k⌝@ into @Nat.succ (x + ⌜k-1⌝)@, so a numeral
+-- offset from an open term is a successor tower as deep as the numeral is large,
+-- and reading it as a numeral is exactly what cannot be afforded.  Giving up
+-- returns @NSSucc@, which is what the term is; only the arithmetic shortcut is
+-- lost, and it was never going to fire on an open term anyway.
+natShape :: Expr -> TC NatShape
+natShape = go succWalk
   where
-    go !acc e = whnf e >>= \e' -> case e' of
-      NatLit v | v >= 0 -> pure (Just (acc + v))
+    go :: Int -> Expr -> TC NatShape
+    go !d e = whnf e >>= \e' -> case e' of
+      NatLit v | v >= 0 -> pure (NSLit v)
       _ -> case unApps e' of
-        (Const c [], [])  | c == nameNatZero -> pure (Just acc)
-        (Const c [], [a]) | c == nameNatSucc -> go (acc + 1) a
-        _                                    -> pure Nothing
+        (Const c [], [])  | c == nameNatZero -> pure (NSLit 0)
+        (Const c [], [a]) | c == nameNatSucc, d <= 0 -> pure (NSSucc a)
+                          | c == nameNatSucc -> go (d - 1) a >>= \case
+                              NSLit v -> pure (NSLit (v + 1))
+                              _       -> pure (NSSucc a)
+        _ -> pure NSNeutral
+
+-- | How deep a @Nat.succ@ tower may be before 'natShape' stops reading it as a
+-- numeral.  Anything a file writes by hand is one or two deep.
+succWalk :: Int
+succWalk = 256
+
+-- | The arithmetic operations that recurse structurally on their second
+-- argument.  All four are exported that way, and 'Kernel.Canon.natOpCanon'
+-- states their equations in that shape.
+natSymOps :: [Name]
+natSymOps = [nameNatAdd, nameNatSub, nameNatMul, nameNatPow]
+
+-- | How large a numeral may be in the argument one of 'natSymOps' recurses on
+-- before the kernel declines to unfold the operation at all.
+--
+-- The four are exported as structural recursions on that argument, so unfolding
+-- one of them counts the numeral down: @x + ⌜k⌝@ with an open @x@ sets a
+-- @brecOn@ going that builds @k@ levels of @Nat.below@ before it can say
+-- anything.  For the numerals a file writes by hand that is a handful of steps.
+-- For the ones a file /derives/ it is not: a signed bit width turns into an
+-- offset of @2^31@ or @2^63@, and the two operands of the comparison it came
+-- from are open terms, so the recursion runs to the end of the numeral and the
+-- answer it eventually reaches is that there is no answer -- @x + ⌜k⌝@ has no
+-- head constructor to find.  Two billion steps to learn that a term is stuck.
+--
+-- So past this bound the application is held whole.  Nothing is lost that could
+-- have been gained: what the unfolding would have produced is the same term with
+-- @k@ layers of arithmetic around it, and no conversion the kernel is asked
+-- about is settled by walking them.  What is gained is that two such terms are
+-- compared argument by argument, which is what they were always going to have to
+-- be compared by.
+--
+-- Declining to unfold can only cost conversions, never grant them, so the bound
+-- is a statement about effort and not about the theory.
+heldNumeral :: Integer
+heldNumeral = 4096
+
+-- | Should this application be left alone rather than unfolded?  See
+-- 'heldNumeral'.
+--
+-- Only a licensed operation is held: without a licence the kernel has no reason
+-- to believe the name recurses the way the equations say, and unfolds it like
+-- anything else.
+natBlocked :: Name -> [Expr] -> TC Bool
+natBlocked n args
+  | n `elem` natSymOps, (_ : b : _) <- args =
+      natOpOk n >>= \ok -> if not ok then pure False else held <$> natShape b
+  | otherwise = pure False
+  where
+    held (NSLit k) = k > heldNumeral
+    held _         = False
 
 -- | May this operation be computed on bignums?
 --
@@ -1183,9 +1325,10 @@ isDefEq t0 s0
   | otherwise = lookupEq t0 s0 >>= \case
       Just b  -> pure b
       Nothing -> do
-        b    <- decide
-        real <- unmeteredNow
-        when real (insertEq t0 s0 b)
+        before <- starving
+        b      <- decide
+        after  <- starving
+        when (b || before == after) (insertEq t0 s0 b)
         pure b
   where
     decide = outOfFuel >>= \out -> if out then pure False else do

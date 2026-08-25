@@ -21,10 +21,15 @@ module Kernel.Cache
   , clearCache
   , bucket
   , push
+  , Counter
+  , newCounter
+  , tick
+  , readCounter
+  , bumpCounter
   ) where
 
 import           Data.Array.Base (unsafeRead, unsafeWrite)
-import           Data.Array.IO   (IOArray, newArray)
+import           Data.Array.IO   (IOArray, IOUArray, newArray)
 import           Data.Bits       (shiftL, (.&.))
 import           Data.IORef      (IORef, newIORef, readIORef, writeIORef)
 
@@ -101,3 +106,28 @@ grow keyOf ref mask arr = do
             slot c' (i + 1)
   n <- slot 0 0
   writeIORef ref (Rep mask' n arr')
+
+-- | A countdown that lives outside the checker's state.
+--
+-- "Kernel.Check" charges every reduction step, and the state it charges it to is
+-- an ordinary immutable record: bumping a field in it allocates a new one, which
+-- for a counter ticked tens of millions of times a declaration is the whole cost
+-- of having the counter.  A one-word unboxed array is a machine word write.
+newtype Counter = Counter (IOUArray Int Int)
+
+newCounter :: Int -> IO Counter
+newCounter n = Counter <$> newArray (0, 0) n
+
+-- | Count one down, reloading and reporting 'True' on the step that reaches
+-- zero.
+tick :: Counter -> Int -> IO Bool
+tick (Counter a) reload = do
+  n <- unsafeRead a 0
+  if n > 1 then unsafeWrite a 0 (n - 1) >> pure False
+           else unsafeWrite a 0 reload  >> pure True
+
+readCounter :: Counter -> IO Int
+readCounter (Counter a) = unsafeRead a 0
+
+bumpCounter :: Counter -> IO ()
+bumpCounter (Counter a) = unsafeRead a 0 >>= unsafeWrite a 0 . (+ 1)

@@ -573,6 +573,38 @@ This is sound for the same reason the expansion in §6.3 is: it is used only
 where §12.1's `Nat` shape check has passed, which is what makes `Nat.succ ⌜k⌝`
 and `⌜k+1⌝` the same term as far as conversion is concerned.
 
+The walk up the `succ`s is bounded, at 256. A tower a file writes by hand is one
+or two deep, and a tower it can only have arrived at by counting is one the reader
+should not be counting back down. Giving up returns the term unread, which costs
+at most the shortcut on that term.
+
+**The held numeral.** `Nat.add`, `Nat.sub`, `Nat.mul` and `Nat.pow` are all
+exported as structural recursions on their *second* argument, and this is the one
+place where the shape of the export leaks into what the kernel is willing to do.
+Unfolding one of them counts that argument down. With both arguments numerals
+that never happens, because the rule above fires first and answers in one step.
+With the first argument open it happens in full: `x + ⌜k⌝` sets a `brecOn` going
+that builds `k` levels of `Nat.below` before it can say anything, and what it
+eventually says is that there is nothing to say — `x + ⌜k⌝` has no head
+constructor to find. This is not hypothetical. A signed bit width appears in the
+prelude as an offset of `2³¹` or `2⁶³` against an open term, and two billion steps
+to learn that a term is stuck is the same thing as not terminating.
+
+So a licensed operation from that list, applied to a numeral larger than 4096 in
+the argument it recurses on, is **held**: `whnf` leaves the application alone
+rather than delta-unfolding it. The two sides of a conversion are then compared
+argument by argument, which is what they were always going to have to be compared
+by.
+
+Nothing about the theory changes. Declining to unfold removes reduction sequences
+and so can only remove conversions, never add them; every judgement the kernel
+still makes it made before. What the bound is a statement about is effort, and it
+is placed where the trade is one-sided: below it, nothing is different, and above
+it the only conversions lost are between a numeral offset and a `succ` tower
+written out in full, which at that size nothing can write. Only a *licensed*
+operation is held — without a licence the kernel has no reason to believe the name
+recurses the way the equations say, and unfolds it like anything else.
+
 ---
 
 ## 7. Definitional equality
@@ -640,9 +672,21 @@ unfolding the head is about to discard, and normalising them can cost arbitraril
 more than the comparison the caller actually wants.
 
 So a speculative comparison runs under a step budget (`tcFuel`), drawn from a
-per-declaration allowance for *wasted* work (`tcWaste`, 20000 steps). When the
-budget runs out, reduction stops where it stands and the comparison answers
-`False`.
+running allowance for *wasted* work (`tcWaste`). When the budget runs out,
+reduction stops where it stands and the comparison answers `False`.
+
+The allowance is **credited**, not fixed. A declaration opens with 50000 steps
+and earns one more for every eight reduction steps the checker performs outside a
+speculation, to a ceiling of the same 50000. A fixed per-declaration allowance is
+the wrong shape for this: it is generous on a one-line lemma and is gone in the
+first instant of a machine-generated arithmetic certificate, and what happens when
+it runs out is not that the checker goes a little slower — it stops speculating at
+all, and every congruence that would have closed in a hundred steps is replaced by
+unfolding both heads. The cap meant to stop a proof running away is then exactly
+what makes it run away. Crediting says the affordable thing instead: dead ends may
+consume a bounded fraction of the reduction the checker was going to do anyway,
+whatever the size of the declaration, and the opening balance doubles as the most
+that may be spent on any one speculation.
 
 This is sound because **every rule that answers `True` is sound no matter how much
 reduction preceded it**. A starved comparison can therefore only ever answer
@@ -1123,15 +1167,23 @@ the table lives, and the arguments properly, being short. Unlike the three above
 this one survives the environment changing, because what it records is a fact
 about a body and some levels and not about an environment.
 
-The `whnf` memo has one extra condition: an entry is recorded only when the
-reduction ran *outside* a speculation (§7.4). A starved reduction stops where it
+The `whnf` memo has one extra condition. A starved reduction stops where it
 stands and returns a term that is correct to **use** — a speculation reads a
 failure to reduce as "not this way", never as "not equal" — but not correct to
 **remember**, since a later caller with a real budget would be handed the
 half-reduced term as if it were the normal form and could fail a comparison that
-holds. Outside a speculation the fuel is unmetered and stays so for the whole
-call — `spend` leaves it alone and `speculate` puts it back — so testing it once
-on entry is enough.
+holds.
+
+The condition is not "the reduction ran outside a speculation", which is the
+obvious rule and much too coarse: inside a speculation is exactly where the same
+dictionary is normalised for the twentieth time, so a memo that switches itself
+off there switches itself off when it is worth the most. What matters is not
+whether there *was* a budget but whether the budget was ever *reached*. So the
+checker keeps a count of how many times reduction has stopped for want of fuel —
+a number that only ever goes up within a declaration — and `whnf` reads it before
+and after. If it did not move, nothing anywhere inside that call gave up early,
+and what came back is the normal form however small the budget was. That is the
+common case, and it is recorded. If it moved, the result is used and forgotten.
 
 That leaves the waste allowance, which a nested speculation *can* exhaust, and
 which therefore also affects how far an unmetered reduction gets. It needs no
@@ -1155,11 +1207,13 @@ the rules of §7 and stays true however much or little reduction preceded it, so
 replaying one replays a derivation. A `false` can only ever *decline*: it makes
 some check fail, and a check that fails rejects the file. So the table can cost
 completeness and cannot cost acceptance of an unsound file — and to keep the
-completeness cost at nothing that matters, an entry is written only from a
-comparison that ran unmetered, never from inside a speculation (§7.4), where
-`false` means no more than "not this way". Entries are *read* under any budget:
-a remembered answer is the answer the unmetered comparison gave, which is at
-least as good as what the starved caller would have worked out for itself.
+completeness cost at nothing that matters, the two answers are filed on different
+terms. A `true` is recorded unconditionally: it was derived, and a derivation does
+not stop being one because the derivation was cheap. A `false` is recorded only
+when the starvation count of the previous paragraph did not move across the
+comparison, since a `false` reached by giving up says "not this way" and not "not
+equal". Entries are *read* under any budget: a remembered answer is at least as
+good as what the caller would have worked out for itself.
 
 One consequence is worth noting, because it runs the safe way. A cached `false`
 is returned without spending the waste allowance the original comparison spent,
