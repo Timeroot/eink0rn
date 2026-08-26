@@ -896,29 +896,33 @@ reasons worth recording:
   at whatever level that container has — and a single type has one level.
 
 The first two objections turned out to be answerable and the third is nearly
-vacuous, so §9.3 goes back and does the reduction anyway, for the blocks where it
-is possible. On the third: the universe condition of §8.4 already forces the
-levels to agree in almost every case. A recursive field landing in member `k` has
-sort `l_k`, and `imax(l_k, l_j) <= l_j` forces `l_k <= l_j` whenever `l_j` is not
-zero; an auxiliary that recurses back into the block sits in a cycle with it, so
-the two levels are equal. What escapes is a `Prop` nesting inside a data
-container — `inductive A : Prop | mk : List A -> A` would put a `Prop` member
-beside a `Type 0` auxiliary — and instrumenting step 3 to report every auxiliary
-level found **no** such block anywhere: 1 in `init`, 3 in `std`, 41 in `cslib`
-and 200 across `refs/tests`, `tests` and `validation`, all at the declared
-members' own level. So the exemption in §8.3 step 4 is real but never yet paid
-for.
+vacuous, so §9.3 goes back and does the reduction anyway — for *every* block, so
+that the core is only ever handed one type at a time. On the third: the universe
+condition of §8.4 already forces the levels to agree in almost every case. A
+recursive field landing in member `k` has sort `l_k`, and `imax(l_k, l_j) <= l_j`
+forces `l_k <= l_j` whenever `l_j` is not zero; an auxiliary that recurses back
+into the block sits in a cycle with it, so the two levels are equal. What escapes
+is a `Prop` nesting inside a data container — `inductive A : Prop | mk : List A ->
+A` would put a `Prop` member beside a `Type 0` auxiliary — and instrumenting the
+construction to report every auxiliary level found **no** such block anywhere: 1
+in `init`, 3 in `std`, 41 in `cslib` and 200 across `refs/tests`, `tests` and
+`validation`, all at the declared members' own level. So the exemption in §8.3
+step 4 is real, but nothing has ever needed it, and §9.3 — which does not grant
+it — has never had to reject a block over it.
 
-What is *not* answerable is the obstruction in §9.3.4: a nested block's
-constructors and recursors, as the export writes them, name the real container
-types, and those cannot be `F` at a tag. That is the reason this kernel keeps a
-mutual block as a primitive, and it comes from the export format rather than from
-the theory.
+A fourth objection was asserted here for a while and was simply wrong: that a
+*nested* block could not be flattened at all, because the export types its
+constructors and recursors at the real container types and those can never be `F`
+at a tag. The premise is true and the conclusion does not follow; §9.3.5 records
+the argument and the mistake in it.
 
-A mutual block is already the primitive the thesis treats (§2.9), and treating it
-directly costs one extra index (`which member?`) in the bookkeeping and nothing in
-the metatheory. The genuinely aggressive normalisation — the transformation that
-*does* buy a simpler core — is nesting, which is compiled away completely (§9).
+A mutual block is still what the core takes as primitive. It is the primitive the
+thesis treats (§2.9), and treating it directly costs one extra index (`which
+member?`) in the bookkeeping and nothing in the metatheory. But with §9.3 in
+front of it, that primitive is only ever used at one member: no file can reach
+the mutual case. The genuinely aggressive normalisation is still nesting, which
+is compiled away completely (§9); flattening is what turns its output, and
+everything else, into a single indexed family.
 
 ### 8.2 Notation
 
@@ -958,6 +962,12 @@ elimination rules of §8.5 are stated per member and stay sound for a
 heterogeneous block — so this is a conformance rule in the sense of §12.3, and
 its exemption for §9's auxiliaries is what keeps it from rejecting the nesting
 compilation's own output.
+
+Step 4 is also, as written, unreachable: §9.3 hands the core only blocks of one
+member, for which the rule is vacuous. The condition itself is not lost — the
+flattening derives it from the ordinary typing rule for definitions (§9.3.2) —
+but the derived version does not grant the exemption, which is the one place the
+front end is stricter than this section (§9.3.4).
 
 ### 8.4 The `ctor` judgement
 
@@ -1211,13 +1221,21 @@ one was trying to avoid. That objection is real but it is not fatal, because the
 tag type does not need the mutual rule — it is a plain enumeration-with-arguments.
 This section takes the reduction seriously and does it.
 
-Only a block with **two or more members and no nesting** is flattened. A single
-type is already flat, so that half of the guard costs nothing. The `no nesting`
-half is not a shortcut and cannot be lifted: §9.3.4 shows that a nested block's
-constructors, as the export types them, can never be constructors of `F`. Since
-a nested block is the *only* way a block of two or more members reaches
-`Kernel.Inductive` once this construction is on, that guard is exactly the line
-between what can be flattened and what provably cannot.
+**Every** block is flattened, so `Kernel.Inductive` is only ever handed one type.
+The order is the one §9 already fixes: nesting is compiled first and flattening
+runs on its output. §9.1 turns a declaration with `m` nested occurrences into a
+block of `1 + m` members over specialised copies of the containers; §9.3 turns
+any block of two or more members into two ordinary single inductive types. So the
+guard is arithmetic —
+
+```
+flatten  ⟺  (types the file declared) + (auxiliaries §9.1 added)  >  1
+```
+
+— and a block that is already a single type goes straight through, because there
+is nothing left to do to it. Every other shape, mutual or merely nested, is
+flattened. §9.3.5 retracts the argument, published in an earlier edition of this
+document, that the nested case was impossible.
 
 #### 9.3.1 The construction
 
@@ -1227,8 +1245,10 @@ Given a block over shared parameters `p̄ :: π`
 T_1 : ∀ p̄, α_1, Sort l    ...    T_n : ∀ p̄, α_n, Sort l
 ```
 
-with constructors `c : ∀ p̄ b̄::β, T_j p̄ ā`, the checker admits two ordinary
-single inductive types and `2n` definitions.
+with constructors `c : ∀ p̄ b̄::β, T_j p̄ ā` — where `T_1 … T_n` are the members the
+file declared followed by the auxiliaries §9.1 added — the checker admits two
+ordinary single inductive types into a **scratch environment**, reads the block's
+own constants off them, and throws the scratch environment away.
 
 1. **The tag type.** One constructor per member, carrying that member's indices:
 
@@ -1249,213 +1269,257 @@ single inductive types and `2n` definitions.
    F : ∀ p̄, Idx p̄ → Sort l
    ```
 
-   whose constructors are the file's own, with every occurrence `T_k p̄ ā` rewritten
+   whose constructors are the block's own, with every occurrence `T_k p̄ ā` rewritten
    to `F p̄ (Idx.mk_k p̄ ā)`. The rewrite is syntactic, and requires the occurrence
    to be at the block's own parameters and fully applied to that member's indices —
    which is exactly what §8.4's `splitSelf` already required, so an occurrence the
    rewrite misses is one the core would have rejected. Any member name surviving
    the rewrite is an error.
 
-3. **The members.**
+3. **The members' stand-ins.** For as long as it takes to state step 4, each member
+   is a *definition* in the scratch environment:
 
    ```
    T_j := fun p̄ ā => F p̄ (Idx.mk_j p̄ ā)      : ∀ p̄, α_j, Sort l
    ```
 
-   as ordinary definitions.
+   checked at the arity the file declared. This is where §8.3's uniform-universe
+   rule is paid for instead of assumed: `F` lands in whatever sort the *first*
+   member does, and this definition typechecks only if the `j`-th member lands
+   there too.
 
-4. **The recursors.** With `bigC p̄ C̄ := Idx.rec (fun i => F p̄ i → Sort u) C_1 … C_n`,
-   which turns the block's `n` motives into the one motive `F` has,
+4. **The constructors, at the types the file wrote.** Two rewrites stand between
+   the type `F`'s constructor was admitted at and the type the file declared, so
+   there are two comparisons, both up to definitional equality. That unfolding the
+   stand-ins of step 3 recovers the type *the block* gives a constructor is asked
+   of every member, auxiliaries included. That §9.1's `applyAux` then recovers the
+   type *the file* gives it is asked of the declared members only — an auxiliary's
+   constructors are not in the file to compare against.
+
+5. **The recursors**, one per member, derived from `F.rec` and **primitive**:
+   `RecInfo`s carrying their own reduction rules, not definitions that unfold to a
+   call of `F.rec`. Writing
 
    ```
-   T_j.rec := fun p̄ C̄ ē ā t => F.rec p̄ (bigC p̄ C̄) ē (Idx.mk_j p̄ ā) t
+   bigC := Idx.rec (fun i => F p̄ i → Sort u) C_1 … C_n
    ```
 
-   also as ordinary definitions. Their *types* are read off `F.rec`'s own — peel
-   its parameters, instantiate its motive at `bigC`, keep its minor premises — so
-   the induction hypotheses are `F`'s, not a second implementation of §8.7.
+   for the term that turns the block's `n` motives into the one motive `F` has,
+   `T_j.rec`'s type is `F.rec`'s own with the parameters peeled, the motive
+   instantiated at `bigC`, and the block's `n` motives quantified back over; and
+   each of its rules is `F.rec`'s corresponding rule beta-reduced at `bigC` and
+   re-closed the same way. So the induction hypotheses are `F`'s, not a second
+   implementation of §8.7.
+
+   Both are then rewritten by three iota steps performed **by hand**:
+
+   ```
+   F p̄ (Idx.mk_j p̄ ā)               ~>  T_j p̄ ā
+   bigC (Idx.mk_j p̄ ā) t            ~>  C_j ā t
+   F.rec p̄ bigC ē (Idx.mk_j p̄ ā) t  ~>  T_j.rec p̄ C̄ ē ā t
+   ```
+
+   The first is step 3's definition unfolded; the second is iota for `Idx.rec`; the
+   third is `F.rec`'s own iota rule read against the rule being built for
+   `T_j.rec`. None of them is a new rule, and each fires only on an occurrence in
+   exactly the shape the construction put it in — at the block's own parameters, at
+   `bigC` itself, at the very motive and minor-premise locals the term is stated
+   over — so an accidental match is not possible. Every tag occurring in anything
+   `F`'s admission produced is a literal `Idx.mk_j`, because step 2's rewrite is
+   what put it there, so all three fire everywhere they must.
+
+6. **Unnesting, and the audit.** §9.1's substitution puts the real containers back
+   into the derived types and rules, exactly as it does for a block admitted the
+   classic way. Then the checker demands that **no name this pass invented
+   survives** anywhere in a derived recursor type or reduction rule — not `Idx`,
+   `F`, their constructors or their recursors, and not §9.1's auxiliaries. If one
+   does, the block is rejected as an internal error rather than admitted at a type
+   naming a constant the caller cannot see.
+
+7. **The environment.** What the caller gets back is the environment it handed in
+   plus exactly the constants the file declared: the declared members as inductive
+   types at their declared arities, their constructors at their declared types, and
+   one recursor per member of the post-nesting block (`T.rec`, `T.rec_1`, …) as a
+   primitive. The derived recursor types are typechecked once more there — for the
+   reason §9.1's are, that they were rebuilt behind the kernel's back — and then
+   compared against the file's own (§8.8).
+
+Step 5's choice — recursors *derived from* `F.rec` rather than *defined in terms
+of* it — is the load-bearing one, and §9.3.5 explains why.
 
 #### 9.3.2 What this buys
 
 **§8.3 stops being a rule.** The uniform-universe requirement — every member of a
-block lands in the same sort — is not checked here. `F` lands in whatever sort the
-*first* member does, and the definition of `T_j` in step 3 typechecks only if the
-`j`-th member lands there too. A block whose members disagree is rejected by the
-ordinary typing rule for definitions, and the checker says so. This is the fact the
-construction turns on: Lean's exporter only ever emits blocks whose members share a
-universe, and that is precisely the condition under which the flattening exists.
+block lands in the same sort — is not checked here. It is *derived*, by step 3,
+from the ordinary typing rule for definitions, and the checker reports the failure
+in those terms. This is the fact the construction turns on: Lean's exporter only
+ever emits blocks whose members share a universe, and that is precisely the
+condition under which the flattening exists. §8.3's exemption for §9.1's
+auxiliaries goes with it — here they pay the rule too, which is the one place the
+fork is stricter than the core it replaces.
 
-**Iota is one rule instead of `n`.** `F.rec`'s rules are the block's, and `T_j.rec`
-is a definition that unfolds to a call of it. The mutual recursion in §8.7 — an
-induction hypothesis calling the recursor of *its own* member — becomes ordinary
-recursion on one type.
+**Iota is one derivation instead of `n`.** The block's recursors are read off
+`F.rec`'s single set of rules. The mutual recursion of §8.7 — an induction
+hypothesis calling the recursor of *its own* member — is derived by ordinary
+recursion on one type, and reappears in the finished rules only as a name.
 
-**Elimination is decided by §8.5 case 1 alone.** For a block of two or more
-members case 2 never applies anyway, so `isDefinitelyNonZero l` is the whole rule.
+**Elimination is decided by §8.5 case 1 alone.** A flattened block has two or more
+members, so case 2 never applied to it anyway, and `isDefinitelyNonZero l` is the
+whole rule. `F`, being one type, may qualify under case 2 where the block does
+not; the recursors are built at the block's licence and not at `F`'s, so nothing
+escapes.
+
+**The core never sees a mutual block.** Every `CoreBlock` reaching
+`Kernel.Inductive` has one member — the tag type, the flat type, or a declaration
+that was already a single type. The core's mutual machinery (per-member motive
+lists, `csOwner`, `roMember`, the shared minor-premise numbering) still runs, at
+length one. It is kept rather than deleted because it is what makes the derivation
+of the flattening legible: `F.rec` *is* the block's recursors packed into one, and
+the packing is stated in the terms §8.7 states them in. Deleting it would replace
+some lists by scalars and remove no rule from the theory.
 
 **How often any of this happens.** Counts below are of *export blocks*, not of
 Lean `mutual` commands: one `{"inductive": ...}` line, classified by whether its
-`types` array holds more than one entry and whether any member declares
-`numNested > 0`. The two are independent, and only the first is what §9.3
-branches on.
+`types` array holds more than one entry and whether it declares `numNested > 0`.
+The two are independent, and the flattening fires on the sum. `a×b` in the last
+column means `b` blocks of `a` members.
 
-| corpus | blocks | single-type | single, nested | multi-type | multi, nested | flattened | member counts |
+| corpus | blocks | single-type | single, nested | multi-type | multi, nested | flattened | members after §9.1 |
 |---|---|---|---|---|---|---|---|
-| `init` | 588 | 588 | 1 | 0 | 0 | 0 | — |
-| `std` | 908 | 908 | 3 | 0 | 0 | 0 | — |
-| `cslib` | 4336 | 4324 | 38 | 12 | 3 | 9 | 2×6, 3×2, 7×1 |
-| `mathlib` | 6644 | 6631 | 38 | 13 | 3 | 10 | 2×8, 3×1, 7×1 |
+| `init` | 588 | 588 | 1 | 0 | 0 | 1 | 3×1 |
+| `std` | 908 | 908 | 3 | 0 | 0 | 3 | 2×2, 3×1 |
+| `cslib` | 4336 | 4324 | 38 | 12 | 3 | 50 | 2×12, 3×17, 4×7, 5×6, 6×3, 7×3, 9×1, 21×1 |
+| `mathlib` | 6644 | 6631 | 38 | 13 | 3 | 51 | 2×14, 3×16, 4×7, 5×6, 6×3, 7×3, 9×1, 21×1 |
 
-Nesting does **not** enlarge the block: every multi-type block in all four
-corpora consists of types the user declared (`EqCnstr`/`EqCnstrProof`,
-`ExBase`/`ExProd`/`ExSum`, `Lean.IR.Alt`/`FnBody`, ...), never of an
-`_nested`-style auxiliary. A nested-but-not-mutual declaration such as
-`inductive A : Prop | mk : Nonempty A -> A` arrives as a *single-type* block
-carrying `numNested = 1`, and is compiled by §9.1 exactly as before.
+Nesting does not enlarge the *declared* part of a block: every multi-type block in
+all four corpora consists of types the user wrote (`EqCnstr`/`EqCnstrProof`,
+`ExBase`/`ExProd`/`ExSum`, `Lean.IR.Alt`/`FnBody`, …), never of an `_nested`-style
+auxiliary. It does enlarge the block that gets flattened, and that is where both
+ends of the size distribution come from. A nested-but-not-mutual declaration such
+as `inductive A : Prop | mk : Nonempty A -> A` arrives as a single-type block with
+`numNested = 1` and is flattened at two members. The three blocks per corpus that
+are both mutual and nested are the largest things the construction handles:
+`Lean.Compiler.LCNF.{Alt,FunDecl,Cases,Code}` at 4 + 2 = 6 members, `Lean.IR.{Alt,
+FnBody}` at 2 + 2 = 4, and `Lean.Meta.Grind.Arith.Cutsat.*` at 12 + 9 = 21. (An
+earlier edition of this table reported those nesting counts as 8, 4 and 108. That
+was a miscount: `numNested` is a property of the block, repeated on every entry of
+`types`, so summing it over the members multiplies it by their number.)
 
-The three multi-type blocks per corpus that also nest are skipped by the `null
-nested` guard, and they are the large ones:
-`Lean.Compiler.LCNF.{Alt,FunDecl,Cases,Code}` (4 members, 8 nested occurrences),
-`Lean.IR.{Alt,FnBody}` (2 / 4), and `Lean.Meta.Grind.Arith.Cutsat.*` (12 / 108).
-So the flattened fraction is 9 of 12 by count but distinctly the easier 9.
-
-`init` and `std` bound the fork's cost on the *common* path and say nothing about
-the flattening itself; the validation corpus, where a hundred-odd files declare a
-mutual block on purpose, is where the construction is actually exercised.
+`init` and `std` bound the fork's cost on the *common* path; the validation
+corpus, where a hundred-odd files declare a mutual block on purpose, is where the
+construction is actually exercised.
 
 #### 9.3.3 What it costs
 
-`Idx`, `F`, `Idx.rec` and `F.rec` genuinely enter the environment. They are named
-`T_1._flat.idx`, `T_1._flat.ty` and so on, derived from the block's own first
-member and bumped to `T_1._flat_i.*` until every one of them is free; and they are
-recorded in `envInternal`, which the barrier of §12.7 consults, so **no declaration
-in the file may mention one**. The construction is unreachable rather than absent.
+`Idx`, `F`, `Idx.rec` and `F.rec` are genuinely admitted, but into a scratch
+environment that the construction drops on the way out. They never reach the
+file's environment, and §12.7's barrier has nothing extra to guard. They are still
+given fresh names — `T_1._flat.idx`, `T_1._flat.ty` and so on, derived from the
+block's own first member and bumped to `T_1._flat_i.*` until every one of them is
+free — because a file that has already declared a constant of that name would
+otherwise collide with them inside the scratch environment.
 
-The other cost is that a member of the block is now a definition, and three rules
-of the theory care about the difference. That is §9.3.4's second bullet, and it is
-the larger half of the fork.
+What remains is one extra inductive admission per flattened block (the tag type),
+a second admission of the block itself in re-indexed form, and a second typecheck
+of each derived recursor type in the final environment. On `init` and `std`, where
+one and three blocks respectively are affected, that is not measurable against
+run-to-run noise.
+
+The thing to audit is the by-hand iota fold of step 5: about sixty lines that
+rewrite, outside the core, terms the core built, and whose correctness is implied
+by nothing the core checked. Step 6's *nothing invented survives* test is the cheap
+half of the defence, and catches a step that failed to fire. The recursor
+typecheck of step 7, together with the comparison against the file's own recursors
+(§8.8), is the expensive half, and catches a step that fired wrongly.
 
 #### 9.3.4 Deliberate divergences
 
-These are the ways a flattening kernel and a primitive-mutual kernel disagree. All
-of them are consequences of `T_j` being a definition rather than an inductive type.
+What is left, after all that, on which this front end and a primitive-mutual one
+disagree.
 
-* **Reduction is strictly more permissive in one corner.** `F` is a single type, so
-  §8.5 case 2 and the `k` flag of §8.6 can apply to it where the block would not
-  have qualified. This happens only for an all-`Prop` block with at most one
-  constructor in *total*. The recursors the file gets are still built at the
-  block's licence — the wrapper's elimination universe comes from case 1 — so
-  nothing eliminates that should not; but `F.rec` may reduce on a neutral major
-  premise where the primitive `T_j.rec` would be stuck. That is sound: it is
-  K-like reduction on a subsingleton, justified exactly as §8.6 justifies it, and
-  the two terms it identifies are equal by proof irrelevance anyway. It is a
-  divergence because it accepts strictly more.
+* **`indIsRecursive` is recomputed rather than read off `F`.** `F` knows only
+  whether the *block* has a recursive field, and the flag is per member, so it is
+  recovered by asking whether any member of the block occurs syntactically in one
+  of this member's constructor types. Nothing that existed before the block was
+  declared can mention a member of it, so an occurrence `whnf` would expose was
+  already there syntactically and the test cannot under-report. It can over-report,
+  on the erasable-redex fields of §8.4, and over-reporting costs only eta *during
+  reduction* (§6.1) — a term getting stuck sooner, never a wrong reduction.
 
-* **A member of a mutual block can still be a structure — but only by a side
-  table.** This is the expensive one, and it is not hypothetical: cslib's
-  `Lean.Meta.Grind.AC.DiseqCnstr` is a one-constructor member of a mutual block
-  that the file then projects out of, and the first version of this fork rejected
-  the whole corpus over it. §5.3's `Expr.proj` and §7.2's eta both ask whether a
-  *type constant* is an inductive with one constructor and no indices, and after
-  flattening `T_j` is not a type constant, while `F` — one index, and as many
-  constructors as the whole block — is the wrong type to ask.
+* **`Prop`-valued auxiliaries would be rejected.** §8.3 exempts §9.1's auxiliaries
+  from the uniform-universe rule; step 3 does not, because it cannot. A block
+  mixing a `Prop` member with a `Type` auxiliary — which needs a `Prop` nested
+  inside a data container — is accepted by the classic path and refused here. §8.1
+  records that no such block occurs in any corpus measured, so this is a divergence
+  on paper only, but it is a real one.
 
-  So the flattening keeps a table of what it spent, in both directions:
+* **Reduction is not more permissive.** Noted because an earlier version of this
+  fork *was*: it wrapped the block's recursors around `F.rec`, and `F` — a single
+  type — could qualify for the `k` rule of §8.6 where the block would not. That is
+  gone. `F.rec` is not in the environment the file is checked in, and the recursors
+  that are carry the block's `k` flag, which is false.
 
-  - `envFlat` maps each member to the `IndInfo` it would have had. `inductiveAt`
-    consults it, and `isStructureLike`, `isEtaReducible` and `ctorOfStructure`
-    go through `inductiveAt`.
-  - `envUnflat` maps the flat type to its tag type, its parameter count, and its
-    members in tag order. `unflatten` uses it to turn a *type* `F p̄ (Idx.mk_j p̄ ā)`
-    back into `T_j p̄ ā`, and the four rules that ask what inductive type a term
-    inhabits — `inferProj`, `tryStructEta`, `tryUnitLike`, `toCtorWhenStruct` —
-    each call it once, after `whnf` and before looking at the head.
+#### 9.3.5 A retracted impossibility argument
 
-  The tag is read off its own head constructor rather than inferred, because two
-  members of one block flatten to applications of the same `F` differing only in
-  the tag: anything weaker would hand a projection of `T_1` the fields of `T_2`.
-  For the same reason `toCtorWhenStruct` checks that the member it recovers is one
-  of the block the recursor belongs to, since `toCtorApp` does not check that the
-  constructor it finds is the recursor's.
+An earlier edition of this document argued that a *nested* block could not be
+flattened, in any order, and concluded from that that "the export format requires
+this kernel to have a mutual block as a primitive". Most of the argument is true
+and the false step is instructive, so both are kept here.
 
-  One thing is still lost: `envFlat` records the *block's* recursiveness, not the
-  member's, so `isEtaReducible` — eta *during reduction*, §6.1 — is refused to a
-  non-recursive member of a recursive block. That can only make reduction get
-  stuck sooner, never fire wrongly.
+The true part. `Lean.Syntax` in `init` has one declared type and two nested
+occurrences, and the export commits to
 
-  All of this is machinery whose entire purpose is to remember what a definition
-  used to be. It is the honest price of the fork, and it is about seventy lines.
+```
+Lean.Syntax.node : SourceInfo -> SyntaxNodeKind -> Array.{0} Syntax -> Syntax
+Lean.Syntax.rec  : forall (motive_1 : Syntax -> Sort u)
+                          (motive_2 : Array.{0} Syntax -> Sort u)
+                          (motive_3 : List.{0} Syntax -> Sort u), ...
+```
 
-* **Nesting inside a member still works, by the same table.** §9.1 needs the arity
-  and constructors of the container it is copying, and reads them through
-  `inductiveAt`. Without that, a file that declares a mutual block and then nests
-  a later inductive inside one of its members is rejected.
+with reduction rules on `Array.mk`, `List.nil` and `List.cons` — the containers'
+*real* constructors, not copies. (There are three recursors, `rec`, `rec_1` and
+`rec_2`, one per member of the post-nesting block, all sharing those three
+motives.) `Syntax.node` cannot be a constructor of a flat type in which `Syntax`
+is `F p̄ (Idx.mk_1 p̄)`, because its third field would then be `Array (F p̄
+(Idx.mk_1 p̄))` — an occurrence of the type being defined underneath another type
+constructor, which is precisely what §8.4 rejects and §9 exists to remove. All of
+that is correct, and it is why the two compilations run in the order they do: what
+§9.3 flattens is the block that has `Syntax._nested.1` in that field, never the
+block the file wrote.
 
-* **What flattening cannot do, and why that is a theorem rather than a gap.** A
-  nested block cannot be flattened at all, in any order, for a reason that has
-  nothing to do with universes.
+The false step was the next one. §9.1 finishes by substituting the real containers
+back into the constructor and recursor types it derived, and re-checking the
+result; the claim was that after flattening there is nothing left to substitute,
+because "the auxiliary's type occurs only as `F p̄ i` with `i` a *bound variable*,
+instantiated to `Idx.mk_2 p̄` by the recursor's own reduction. The occurrence has
+been absorbed into a binder, and a substitution cannot reach under it."
 
-  `Lean.Syntax` in `init` is the smallest witness. One declared type, two nested
-  occurrences, and the export commits to
+That is a true description of the *body* of a definition that wraps `F.rec`, and
+of nothing else. It is not true of what actually has to be substituted:
 
-  ```
-  Lean.Syntax.node : SourceInfo -> SyntaxNodeKind -> Array.{0} Syntax -> Syntax
-  Lean.Syntax.rec  : forall (motive_1 : Syntax -> Sort u)
-                            (motive_2 : Array.{0} Syntax -> Sort u)
-                            (motive_3 : List.{0} Syntax -> Sort u), ...
-  ```
+- A recursor is a primitive. It has a type and a list of reduction rules and **no
+  body** — so there is no term whose type must be preserved under the
+  substitution, which is exactly the licence §9.1 already uses on the classic
+  path.
+- Its type names each member of the block *syntactically*. The motive for member
+  `k` is `∀ ā, T_k p̄ ā → Sort u` and the major premise is `T_k p̄ ā`, both written
+  with that member's own constant. `applyAux` reaches every one of them.
+- The right-hand sides are in the same position: an induction hypothesis is
+  `fun x̄ => T_k.rec p̄ C̄ ē π̄ (b x̄)`, with the member named outright.
 
-  with reduction rules on `Array.mk`, `List.nil` and `List.cons` — the containers'
-  *real* constructors, not copies. (There are three recursors, `rec`, `rec_1` and
-  `rec_2`, one per member of the post-nesting block, all sharing those three
-  motives.) §9.1 delivers exactly this: it admits the block with auxiliary members,
-  then substitutes the real containers back in and re-checks.
+So the substitution has plenty to reach, provided the block's recursors are
+*derived from* `F.rec` rather than *defined in terms of* it. Deriving them is step
+5, and this is why it is the load-bearing step. The absorbed-into-a-binder
+phenomenon is real, but it is a property of the wrapper design the earlier fork
+happened to use, not of flattening.
 
-  Now try to flatten. `Syntax.node` has to become a constructor of `F`, and
-  `Syntax` becomes the definition `F p̄ (Idx.mk_1 p̄)`. Its third field, `Array
-  Syntax`, therefore unfolds to `Array (F p̄ (Idx.mk_1 p̄))` — an occurrence of the
-  type being defined underneath another type constructor, which is precisely the
-  shape §8.4 rejects and §9 exists to remove. The only repair is the one §9 already
-  makes, replacing the field by an auxiliary member — which after flattening is `F`
-  at another tag, so `ctorType` is no longer the type the export declared and §8.8
-  fails.
-
-  So `Syntax.node` would have to be simultaneously a constructor of `F` and of a
-  type in which `F` occurs nested. **Ordering the two compilations differently does
-  not help, because the difficulty is not one of order**: the export names `Array
-  Syntax` in a position where flattening requires `F` at a tag, and those are two
-  distinct inductive types, not two spellings of one. The recursor says the same
-  thing from the other end — `F` has the single motive
-  `C : forall (i : Idx p̄), F p̄ i -> Sort u`, and instantiating it at a tag can only
-  ever yield a domain `F p̄ (Idx.mk_k p̄ ā)`, never `Array Syntax`. Per-member
-  motives are what make §9.1's substitution possible, and merging them is the whole
-  content of flattening.
-
-  It is worth being precise about why §9.1's own manoeuvre cannot simply be
-  repeated here, since it is the obvious thing to try. §9.1 gets away with
-  registering a constructor whose stored type is *not* the one §8.4 checked
-  because the auxiliary `Syntax._nested.1` occurs **syntactically** at every
-  position that matters, so one textual substitution reaches all of them and the
-  result can be re-audited (step 6). After flattening there is nothing to
-  substitute: the auxiliary's type occurs only as `F p̄ i` with `i` a *bound
-  variable*, instantiated to `Idx.mk_2 p̄` by the recursor's own reduction. The
-  occurrence has been absorbed into a binder, and a substitution cannot reach
-  under it. Flattening trades a syntactic distinction for a computational one,
-  and unnesting needs the syntactic one.
-
-  The consequence is worth stating plainly: **the export format requires this
-  kernel to have a mutual block as a primitive.** §8.1 reached that conclusion for
-  weaker reasons; this is the binding one. The only escape would be to give the
-  core a native nesting rule — a positivity rule admitting `Array (F ...)` on the
-  strength of `Array`'s recursor — which is adding a rule to the core in order to
-  remove one.
-
-  So a nested block is admitted the classic way, and `Kernel.Inductive` keeps every
-  line of its mutual machinery. Note also how little that machinery is: `admit` and
-  `buildRecursors` are written uniformly in the number of members, with no
-  single-member special case, so even a hypothetical always-flatten kernel would
-  not delete a code path — it would replace some lists by scalars. The flattening
-  is an *alternative* front end, not a simplification of the core.
+Two smaller claims fell with it and are also withdrawn. §5.3's projections and
+§7.2's eta were said to need a side table — `envFlat`, `envUnflat`, and an
+`unflatten` pass on the way out of `whnf` — but they needed it only because a
+member had become a definition; members are inductive types again and the table is
+gone. And §9.1's own need to read a container's arity and constructors was said to
+need the same indirection; it is served by the ordinary environment lookup, for
+the same reason.
 
 ---
 

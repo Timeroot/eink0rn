@@ -20,7 +20,6 @@ module Kernel.Env
   , Env (..)
   , emptyEnv
   , lookupConst
-  , inductiveAt
   , addConst
   , constName
   , constLevels
@@ -32,7 +31,6 @@ module Kernel.Env
   ) where
 
 import qualified Data.IntMap.Strict as IM
-import qualified Data.Map.Strict as M
 import qualified Data.Set        as S
 import           Kernel.Expr
 import           Kernel.Name
@@ -219,31 +217,13 @@ data Env = Env
     -- consulted in exactly one place, "Front.Lower"'s barrier check; no rule of
     -- §5 or §6 looks at it, so an unsafe constant behaves as an opaque constant
     -- of its declared type wherever it is legal at all.
-  , envInternal :: !(S.Set Name)
-    -- ^ constants the checker invented, rather than read: the tag type and the
-    -- flat type that "Front.Lower"'s flattening of a mutual block builds
-    -- (SPEC.md §9.3).  They are ordinary constants in every other respect --
-    -- reduction and typing know nothing about this set -- but the file that is
-    -- being checked may not name one, or it would be reaching into a
-    -- construction that is supposed to be an implementation detail.
-  , envFlat     :: !(M.Map Name IndInfo)
-    -- ^ what a flattened member of a mutual block (SPEC.md §9.3) would have been
-    -- had it been admitted as an inductive type.  Read by 'inductiveAt' and by
-    -- nothing else.
-  , envUnflat   :: !(M.Map Name (Name, Int, [Name]))
-    -- ^ the same table read the other way: a flat type, to its tag type, the
-    -- number of parameters it shares with it, and its members in tag order.
-    -- Read by "Kernel.Check"'s @unflatten@, which is how the rules that ask what
-    -- inductive type a /term/ belongs to -- projections and eta -- get told that
-    -- @F p (Idx.mk_j p a)@ is the type the file wrote as @T_j p a@.
   , envLicence  :: !Licences
     -- ^ what has already been established about this environment; a cache, in
     -- the sense that clearing it changes only how long the answer takes.
   }
 
 emptyEnv :: Env
-emptyEnv =
-  Env IM.empty False AccelCanonical S.empty S.empty M.empty M.empty noLicences
+emptyEnv = Env IM.empty False AccelCanonical S.empty noLicences
 
 lookupConst :: Env -> Name -> Maybe ConstInfo
 lookupConst env n = IM.lookup (nameHash n) (envConsts env) >>= go
@@ -251,29 +231,6 @@ lookupConst env n = IM.lookup (nameHash n) (envConsts env) >>= go
     go (ci : rest) | constName ci == n = Just ci
                    | otherwise         = go rest
     go []                              = Nothing
-
--- | The inductive type a name stands for, seeing through the flattening of a
--- mutual block.
---
--- A flattened member is a definition, and most of the theory is entitled to see
--- it as one: it reduces to an application of the flat type, and the rules of §5,
--- §6 and §7 that only ever ask a type to /reduce/ need to know nothing more.
--- Three things ask more than that, and they are the callers of this lookup.
---
--- * §9.1's nesting compilation does not /use/ a container, it /copies/ one, so
---   it needs the arity and the constructors of the type the file declared --
---   which the flattening spent.
--- * §5.3's projections and §7.2's eta ask whether a name is a structure: one
---   constructor, no indices.  @F@ has an index (the tag) and as many
---   constructors as the whole block, so asking it is asking the wrong type.
---
--- Both get the answer they would have had without the fork.  Note that
--- @indIsRecursive@ here is the /block's/, not the member's, which costs
--- 'isEtaReducible' -- and only it -- some precision; see SPEC.md §9.3.4.
-inductiveAt :: Env -> Name -> Maybe IndInfo
-inductiveAt env n = case lookupConst env n of
-  Just (CInd i) -> Just i
-  _             -> M.lookup n (envFlat env)
 
 -- | Declarations are write-once: a repeated name is a hard error, which is what
 -- rejects the @dup_*@ tests.
@@ -293,9 +250,9 @@ addConst env ci
 -- a statement about what the fields may mention, and eta is a statement about
 -- the outermost constructor.
 isStructureLike :: Env -> Name -> Bool
-isStructureLike env n = case inductiveAt env n of
-  Just i -> length (indCtors i) == 1
-         && indNumIndices i == 0
+isStructureLike env n = case lookupConst env n of
+  Just (CInd i) -> length (indCtors i) == 1
+                && indNumIndices i == 0
   _ -> False
 
 -- | Structure-like, and safe to eta-expand /during reduction/: also not
@@ -308,13 +265,13 @@ isStructureLike env n = case inductiveAt env n of
 -- no such problem, because it only fires against a side that already /is/ a
 -- constructor application and descends into it.
 isEtaReducible :: Env -> Name -> Bool
-isEtaReducible env n = isStructureLike env n && case inductiveAt env n of
-  Just i -> not (indIsRecursive i)
-  _      -> False
+isEtaReducible env n = isStructureLike env n && case lookupConst env n of
+  Just (CInd i) -> not (indIsRecursive i)
+  _             -> False
 
 ctorOfStructure :: Env -> Name -> Maybe CtorInfo
-ctorOfStructure env n = case inductiveAt env n of
-  Just i | [c] <- indCtors i
-         , indNumIndices i == 0
-         , Just (CCtor ci) <- lookupConst env c -> Just ci
+ctorOfStructure env n = case lookupConst env n of
+  Just (CInd i) | [c] <- indCtors i
+                , indNumIndices i == 0
+                , Just (CCtor ci) <- lookupConst env c -> Just ci
   _ -> Nothing

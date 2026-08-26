@@ -37,7 +37,6 @@ import           Control.Monad  (foldM, forM, forM_, unless, when)
 import qualified Data.ByteString.Char8 as B
 import           Data.List      (elemIndex, find, nub, sort)
 import           Data.Maybe     (isJust, isNothing)
-import qualified Data.Map.Strict as M
 import qualified Data.Set       as S
 import           Front.Export
 import           Kernel.Canon
@@ -357,23 +356,14 @@ blockSafety types ctors recs
 -- literals: their typing and expansion rules (§5.2, §6.3) fire only against
 -- constants matching a stored canonical /inductive/ shape, and an unsafe @Nat@
 -- is an axiom, which fails that test before the barrier is reached.
--- The same scan also enforces the /other/ thing a declaration may not mention:
--- the constants the flattening of a mutual block invented (SPEC.md §9.3).  Those
--- are not unsound, they are simply not the file's to name -- an implementation
--- detail of how this checker admitted somebody else's declaration -- and a file
--- that reaches for one is relying on something no other kernel provides.
 barrier :: Env -> [Expr] -> Either String ()
-barrier env es = do
-  say "a safe declaration may not mention the unsafe " (envUnsafe env)
-  say "a declaration may not mention the internal " (envInternal env)
+barrier env es
+  | S.null bad = Right ()
+  | otherwise  = Left ("a safe declaration may not mention the unsafe "
+                       ++ (if S.size bad == 1 then "constant " else "constants ")
+                       ++ commas (map showName (S.toList bad)))
   where
-    used = S.unions (map constsOf es)
-    say what set
-      | S.null bad = Right ()
-      | otherwise  = Left (what
-                           ++ (if S.size bad == 1 then "constant " else "constants ")
-                           ++ commas (map showName (S.toList bad)))
-      where bad = S.intersection used set
+    bad = S.intersection (S.unions (map constsOf es)) (envUnsafe env)
 
 commas :: [String] -> String
 commas = foldr1 (\a b -> a ++ ", " ++ b)
@@ -445,17 +435,20 @@ checkInductive env types ctors recs = do
         Left ("the block's recursors are " ++ show (map showName (sort (map exrName recs)))
               ++ ", expected " ++ show (map showName (sort ourRecNames)))
 
-      -- Two ways to admit the block.  They differ only in what reaches the
-      -- kernel: the classic one hands it the mutual block as it stands, the
-      -- flattening one hands it two single inductive types and derives the
-      -- block's own constants from them (SPEC.md §9.3).  Both come back having
-      -- admitted every constant the file declared and having compared every
-      -- exported recursor against the one they derived; what is left over is
-      -- the bookkeeping below, which is the same either way.
-      br <- if nDecl > 1 && null nested
-              then flattenBlock env groups declMembers paramTele lvls nps recs
-              else classicBlock env groups declMembers auxMembers nested
-                                declNames nDecl lvls nps recs
+      -- Two ways to admit the block, and only one of them hands
+      -- "Kernel.Inductive" a block the file wrote.  A block that is already a
+      -- single inductive type goes straight through; every other shape -- more
+      -- than one declared type, or a nesting whose compilation just added a
+      -- member -- is flattened first, and what the core sees is the two single
+      -- types the flattening built (SPEC.md §9.3).  So no mutual block reaches
+      -- the core.  Both paths come back having admitted every constant the
+      -- file declared and having compared every exported recursor against the
+      -- one they derived; what is left over is the bookkeeping below, which is
+      -- the same either way.
+      br <- if nDecl + length nested > 1
+              then flattenBlock env groups declMembers auxMembers nested
+                                paramTele nDecl lvls nps recs
+              else singleBlock env groups declMembers lvls nps recs
 
       -- The export's own bookkeeping must agree with what we derived.
       forM_ (zip3 types (brIndices br) (brFields br)) $ \(iv, nIdx, nFields) -> do
@@ -506,53 +499,39 @@ elimHint recLpss indLps = case [ h | (h : t) <- recLpss
   (h : _) -> h
   _       -> str "u"
 
--- | Admit the block the way the core was built for: hand "Kernel.Inductive" the
--- whole mutual family, nesting auxiliaries and all, and let it derive one
--- primitive recursor per member.
-classicBlock :: Env -> [[ExCtor]] -> [CoreMember] -> [CoreMember]
-             -> [Nested] -> [Name] -> Int -> [Name] -> Int -> [ExRec]
-             -> Either String BlockResult
-classicBlock env groups declMembers auxMembers nested declNames nDecl
-             lvls nps recs = do
+-- | Admit a block that is already a single inductive type with no nesting:
+-- hand it to "Kernel.Inductive" as it stands.
+--
+-- This is the only place the core is asked to admit a block the file wrote,
+-- and it is a block of one member.  Everything else goes through
+-- 'flattenBlock', which calls the core twice, each time on one member it built
+-- itself.
+singleBlock :: Env -> [[ExCtor]] -> [CoreMember] -> [Name] -> Int -> [ExRec]
+            -> Either String BlockResult
+singleBlock env groups declMembers lvls nps recs = do
       ab <- admitBlock env CoreBlock
         { cbLevels      = lvls
         , cbNumParams   = nps
-        , cbMembers     = declMembers ++ auxMembers
-        , cbNumDeclared = nDecl
+        , cbMembers     = declMembers
+        , cbNumDeclared = 1
         , cbElimHint    = elimHint (map exrLevels recs) lvls
         }
+      (ind, cs, r) <- case (abInds ab, abCtors ab, abRecs ab) of
+        ([i], [c], [rr]) -> Right (i, c, rr)
+        _ -> Left "internal: a one-type block did not come back as one type"
 
-      -- Drop the auxiliary members and put the real containers back.
-      let unnest | null nested = id
-                 | otherwise   = applyAux lvls nps nested
-          inds  = take nDecl (abInds ab)
-          ourCs = [ [ ci { ctorType = excType c } | (ci, c) <- zip g cs ]
-                  | (g, cs) <- zip (take nDecl (abCtors ab)) groups ]
-          ourRs = [ r { recType   = unnest (recType r)
-                      , recInduct = unAux nested (recInduct r)
-                      , recRules  = [ ru { rrCtor = unAux nested (rrCtor ru)
-                                         , rrRhs  = unnest (rrRhs ru) }
-                                    | ru <- recRules r ]
-                      }
-                  | r <- abRecs ab ]
-
+      let ourCs = [ ci { ctorType = excType c }
+                  | (ci, c) <- zip cs (concat groups) ]
       envInd <- foldM addConst env
-        (map CInd inds ++ map CCtor (concat ourCs) ++ map CRec ourRs)
-      -- Unnesting rebuilt these terms behind the kernel's back, so for a nested
-      -- block they get audited again against the real containers.
-      unless (null nested) $ forM_ ourRs $ \r ->
-        either (\e -> Left ("recursor " ++ showName (recName r)
-                            ++ " does not typecheck after unnesting: " ++ e))
-               (const (Right ()))
-               (runTC envInd (recLevels r) (inferSortOf (recType r)))
-      forM_ ourRs $ \r -> case find ((== recName r) . exrName) recs of
+        (CInd ind : map CCtor ourCs ++ [CRec r])
+      case find ((== recName r) . exrName) recs of
         Nothing -> Left ("no exported recursor named " ++ showName (recName r))
-        Just rv -> checkRecursorMatches envInd declNames rv r
+        Just rv -> checkRecursorMatches envInd [indName ind] rv r
       pure BlockResult
         { brEnv     = envInd
-        , brIndices = map indNumIndices inds
-        , brFields  = map (map ctorNumFields) ourCs
-        , brRec     = any indIsRecursive (abInds ab)
+        , brIndices = [indNumIndices ind]
+        , brFields  = [map ctorNumFields ourCs]
+        , brRec     = indIsRecursive ind
         , brRefl    = or (abReflexive ab)
         }
 
@@ -650,9 +629,10 @@ checkRecursorMatches env allInds rv r = do
 --
 -- > T_1 : forall p::pi, alpha_1, Sort l    ...    T_n : forall p::pi, alpha_n, Sort l
 --
--- is admitted as /two/ ordinary single inductive types and @2n@ definitions.
--- The first is a tag type, one constructor per member, carrying that member's
--- indices:
+-- -- whose members are the file's own /and/ the auxiliaries the nesting
+-- compilation of §9.1 added -- is derived from two ordinary single inductive
+-- types.  The first is a tag type, one constructor per member, carrying that
+-- member's indices:
 --
 -- > Idx     : forall p::pi, Sort v          v = max 1 (sorts of every index)
 -- > Idx.mk_j : forall p::pi, a::alpha_j, Idx p
@@ -662,39 +642,56 @@ checkRecursorMatches env allInds rv r = do
 -- > F : forall p::pi, Idx p -> Sort l
 --
 -- whose constructors are the file's own, with every occurrence @T_j p a@
--- rewritten to @F p (Idx.mk_j p a)@.  The members and their recursors come back
--- as definitions:
+-- rewritten to @F p (Idx.mk_j p a)@.  Those two are the only blocks
+-- "Kernel.Inductive" is ever handed, and both have exactly one member: after
+-- this pass the core never sees a mutual block at all.
 --
--- > T_j     := fun p a => F p (Idx.mk_j p a)
--- > T_j.rec := fun p C e a t => F.rec p (bigC p C) e (Idx.mk_j p a) t
+-- The block's own constants are then read back off @F@.  Its members and
+-- constructors are the ones the file declared, at the types the file gave
+-- them; its recursors are @F@'s single recursor, /rewritten/ rather than
+-- wrapped.  Writing @bigC = Idx.rec (fun i => F p i -> Sort u) C_1 ... C_n@ for
+-- the term that turns the block's @n@ motives into the one motive @F@ has, the
+-- rewrite is three iota steps performed by hand:
 --
--- where @bigC p C = Idx.rec (fun i => F p i -> Sort u) C_1 ... C_n@ turns the
--- block's @n@ motives into the one motive @F@ has.  @Idx.rec@ can do that
--- because @v@ is a successor, so the tag type is never a @Prop@ and eliminates
--- into any sort.
+-- > F p (Idx.mk_j p a)              ~>  T_j p a
+-- > bigC (Idx.mk_j p a) t           ~>  C_j a t
+-- > F.rec p bigC e (Idx.mk_j p a) t ~>  T_j.rec p C e a t
+--
+-- Every tag in a term @F@'s admission produced is a literal @Idx.mk_j@ -- the
+-- rewrite that built @F@'s constructors put it there -- so all three fire
+-- everywhere they have to, and what comes back mentions neither @Idx@ nor @F@
+-- nor their recursors.  That is checked, not hoped for: 'flattenBlock' refuses
+-- the block if any invented name survives in a derived type or reduction rule.
+--
+-- So @Idx@ and @F@ live and die inside 'flattenBlock'.  They are admitted into
+-- a scratch environment that is thrown away, and the environment the caller
+-- gets back is @env0@ plus exactly the constants the file declared -- the same
+-- shape 'singleBlock' produces, with the members real inductive types (so §5.3
+-- projections and §7.2 eta see them) and the recursors primitives (so §9.1's
+-- unnesting substitution can reach into their types and rules, which it could
+-- not if they were definitions with bodies to preserve).
 --
 -- Why this is the same theory and not a larger one:
 --
--- * The rewrite is a bijection on occurrences, so the constructor judgement
---   (§8.4) -- strict positivity and @imax(l',l) <= l@ -- is asked exactly the
---   questions it was asked before, and @F@'s recursor is the block's recursors
---   packed into one.
+-- * The rewrite that builds @F@ is a bijection on occurrences, so the
+--   constructor judgement (§8.4) -- strict positivity and @imax(l',l) <= l@ --
+--   is asked exactly the questions it was asked before, and @F@'s recursor is
+--   the block's recursors packed into one.
 -- * The uniform-universe rule of §8.3 is not assumed here, it is /derived/:
---   @F@ lands in whatever sort the first member does, and the definition of
---   @T_j@ typechecks only if the @j@-th member lands there too.  A block whose
---   members disagree is rejected by the ordinary rule for definitions.
+--   @F@ lands in whatever sort the first member does, and @T_j@'s stand-in
+--   @fun p a => F p (Idx.mk_j p a)@ typechecks at the arity the file declared
+--   only if the @j@-th member lands there too.  A block whose members disagree
+--   is rejected by the ordinary rule for definitions.  This is the one place
+--   the fork is stricter than the core it replaces: §8.3 exempts the
+--   auxiliaries of a nested block from that rule, and here they pay it.
 -- * Elimination is decided by §8.5 case 1 alone -- @isDefinitelyNonZero l@ --
 --   which is what that rule says for a block of two or more members anyway.
 --   @F@ is one type and so can qualify under case 2 where the block would not;
---   the wrapper is built at the block's licence, not at @F@'s, so nothing
---   escapes.  (Reduction is a different matter: see SPEC.md §9.3.4.)
---
--- What the kernel invents rather than reads -- @Idx@, @F@ and their recursors --
--- really does enter the environment, so unlike the nesting compilation of §9
--- this construction is not entirely invisible.  It is made unreachable instead:
--- the names are derived from the block's own first member, checked to be free,
--- and recorded in 'envInternal', which 'barrier' refuses to let any later
--- declaration mention.
+--   the recursors are built at the block's licence, not at @F@'s, so nothing
+--   escapes.
+-- * The derived recursor types are audited again in the final environment,
+--   for the reason §9.1's unnesting is: they were rebuilt behind the kernel's
+--   back, so nothing has typechecked them where they will be used.
 
 -- | The constants one flattening invents.
 data FlatNames = FlatNames
@@ -703,7 +700,7 @@ data FlatNames = FlatNames
   , fnIdxRec  :: !Name
   , fnTy      :: !Name           -- ^ the flat type
   , fnTyRec   :: !Name
-  , fnAll     :: ![Name]         -- ^ all of the above, for 'envInternal'
+  , fnAll     :: ![Name]         -- ^ all of the above, for the step 7 audit
   }
 
 -- | Names under @T_1._flat@, or @T_1._flat_i@ for the least @i@ that is free.
@@ -733,16 +730,22 @@ flatNames env base nMem =
     free fn = all (isNothing . lookupConst env) (fnAll fn)
 
 -- | Admit the block by flattening it: see the note above.
-flattenBlock :: Env -> [[ExCtor]] -> [CoreMember] -> [(Binder, Expr)]
-             -> [Name] -> Int -> [ExRec] -> Either String BlockResult
-flattenBlock env0 groups members paramTele lvls nps recs = do
-  let declNames = map cmName members
+flattenBlock :: Env -> [[ExCtor]] -> [CoreMember] -> [CoreMember] -> [Nested]
+             -> [(Binder, Expr)] -> Int -> [Name] -> Int -> [ExRec]
+             -> Either String BlockResult
+flattenBlock env0 groups declMembers auxMembers nested paramTele nDecl
+             lvls nps recs = do
+  let members   = declMembers ++ auxMembers
+      declNames = map cmName declMembers
+      memNames  = map cmName members
       nMem      = length members
       nCtors    = map (length . cmCtors) members
       selfL     = map LParam lvls
-      fn        = flatNames env0 (head declNames) nMem
+      fn        = flatNames env0 (head memNames) nMem
       ctxt      = "flattening the block of " ++ showName (head declNames) ++ ": "
       ctorCtxt cn = ctxt ++ "constructor " ++ showName cn ++ ": "
+      unnest | null nested = id
+             | otherwise   = applyAux lvls nps nested
 
   -- 1. Each member's index telescope, the sort it lands in, and the sorts its
   --    indices live in.  An arity may not mention the block -- the core checks
@@ -782,13 +785,13 @@ flattenBlock env0 groups members paramTele lvls nps recs = do
 
   -- 3. The flat type, and the block's own constructors re-headed at it.
   (flatCtorTys, flatDecl) <- runTC envIdx lvls $ withLocals paramTele $ \ps -> do
-    let rw = flatRewrite declNames selfL fn nIdxs nps (map FVar ps)
+    let rw = flatRewrite memNames selfL fn nIdxs nps (map FVar ps)
     ar <- closePis ps (mkArrow (mkApps (Const (fnIdx fn) selfL) (map FVar ps))
                                (Sort resLvl))
     cs <- forM members $ \m ->
       forM (cmCtors m) $ \(cn, cty) -> do
         body <- rw <$> peelSharedParams (ctorCtxt cn) nps ps cty
-        forM_ declNames $ \n -> when (occursConst n body) $
+        forM_ memNames $ \n -> when (occursConst n body) $
           throwTC (ctorCtxt cn ++ showName n ++ " occurs somewhere the flattening \
             \cannot follow it; every occurrence of a member of a mutual block must \
             \be applied to the block's own parameters and to all of that member's \
@@ -805,8 +808,10 @@ flattenBlock env0 groups members paramTele lvls nps recs = do
     _ -> Left (ctxt ++ "internal: the flat block is not a single type")
   envF <- foldM addConst envIdx [CInd indF, CRec recF]
 
-  -- 4. The members themselves.  This is where §8.3 is paid for: a member that
-  --    does not land in the sort the first one does fails to typecheck here.
+  -- 4. Each member stands in as @fun p a => F p (Idx.mk_j p a)@ for as long as
+  --    it takes to state the two comparisons below.  This is where §8.3 is paid
+  --    for: a member that does not land in the sort the first one does fails to
+  --    typecheck here.
   vals <- runTC envF lvls $ withLocals paramTele $ \ps ->
     forM (zip [0 ..] members) $ \(k, m) -> do
       (is, _) <- openArity ctxt nps ps (cmArity m)
@@ -814,10 +819,10 @@ flattenBlock env0 groups members paramTele lvls nps recs = do
         (map FVar ps ++ [ mkApps (Const (fnIdxCtor fn k) selfL)
                                  (map FVar ps ++ map FVar is) ]))
   forM_ (zip members vals) $ \(m, v) ->
-    either (\e -> Left (ctxt ++ showName (cmName m) ++ " does not have the type it \
-                        \declares once the block is flattened -- which is what it \
-                        \looks like for the members of a mutual block to land in \
-                        \different universes: " ++ e))
+    either (\e -> Left (ctxt ++ showName (unAux nested (cmName m))
+                        ++ " does not have the type it declares once the block is \
+                           \flattened -- which is what it looks like for the members \
+                           \of a mutual block to land in different universes: " ++ e))
            (const (Right ()))
            (runTC envF lvls (checkType v (cmArity m)))
   envTy <- foldM addConst envF
@@ -825,19 +830,29 @@ flattenBlock env0 groups members paramTele lvls nps recs = do
                    , defValue = v, defHint = HAbbrev }
     | (m, v) <- zip members vals ]
 
-  -- 5. The constructors, at the types the file gave them -- which the rewrite
-  --    has to agree with, or it changed something it should not have.
-  forM_ (zip (concat groups) (concat flatCtorTys)) $ \(c, (cn, flatTy)) ->
-    either (\e -> Left (ctorCtxt cn ++ e)) (const (Right ())) $
+  -- 5. The constructors, at the types the file gave them.  Two rewrites stand
+  --    between the type @F@'s constructor was admitted at and the type the file
+  --    wrote, so there are two things to check.  The flattening of §9.3 is
+  --    undone by unfolding the stand-ins of step 4, and that is asked of every
+  --    member, auxiliaries included.  The nesting compilation of §9.1 is undone
+  --    by 'applyAux', and that is asked only of the declared ones: an
+  --    auxiliary's constructors are not in the file to compare against.
+  let ctysOf ms = map (map snd . cmCtors) ms
+  forM_ (zip (concat flatCtorTys) (concat (ctysOf members))) $
+    \((cn, flatTy), cty) ->
+      either (\e -> Left (ctorCtxt cn ++ e)) (const (Right ())) $
+        runTC envTy lvls $ do
+          ok <- isDefEq cty flatTy
+          unless ok $ throwTC ("the flattening does not give it the type its \
+            \block gives it\n  in the block " ++ showExpr cty
+            ++ "\n  flattened  " ++ showExpr flatTy)
+  forM_ (zip (concat groups) (concat (ctysOf declMembers))) $ \(c, cty) ->
+    either (\e -> Left (ctorCtxt (excName c) ++ e)) (const (Right ())) $
       runTC envTy lvls $ do
-        ok <- isDefEq (excType c) flatTy
-        unless ok $ throwTC ("the flattening does not give it the type it declares\
+        ok <- isDefEq (excType c) (unnest cty)
+        unless ok $ throwTC ("the block does not give it the type it declares\
           \\n  declared " ++ showExpr (excType c)
-          ++ "\n  derived  " ++ showExpr flatTy)
-  envC <- foldM addConst envTy
-    [ CCtor ci { ctorType = excType c, ctorInduct = cmName m, ctorIdx = k }
-    | (m, g, cis) <- zip3 members groups (regroup nCtors ctorFs)
-    , (k, ci, c) <- zip3 [0 ..] cis g ]
+          ++ "\n  derived  " ++ showExpr (unnest cty))
 
   -- 6. The recursors.  The elimination universe is the block's -- §8.5 case 1 --
   --    even when @F@, being a single type, would have been granted more.
@@ -847,9 +862,74 @@ flattenBlock env0 groups members paramTele lvls nps recs = do
       elimLvl   = if wantLarge then LParam (head (recLevels recF)) else LZero
       fRecUs    = [ elimLvl | fRecLarge ] ++ selfL
       idxRecUs  = mkIMax resLvl (mkSucc elimLvl) : selfL
+      nMinors   = recNumMinors recF
+      recNames  = map cmRecName members
+      wrapUs    = map LParam wrapLvls
+
+      -- The three iota steps of the note above, run by hand over a term the
+      -- core built out of @Idx@ and @F@.  'ps', 'cVars' and 'es' are the locals
+      -- the term is stated over: matching against them is what makes each step
+      -- fire only on an occurrence in the shape it was put there in.
+      unflatten ps cVars bigC eArgs = go
+        where
+          pArgs = map FVar ps
+          cArgs = map FVar cVars
+          -- @Idx.mk_j p a@, the only shape a tag ever has in one of these terms.
+          asTag t = case unApps t of
+            (Const c us, as)
+              | Just j <- lookup c tags
+              , length us == length selfL, and (zipWith levelEquiv us selfL)
+              , length as == nps + nIdxs !! j
+              , take nps as == pArgs
+              -> Just (j, drop nps as)
+            _ -> Nothing
+          tags = [ (fnIdxCtor fn j, j) | j <- [0 .. nMem - 1] ]
+          go e = case step e of
+            Just e' -> go e'
+            Nothing -> case unApps e of
+              (h, [])   -> descend h
+              (h, args) -> mkApps (descend h) (map go args)
+          descend e = case e of
+            Lam n t b   -> Lam n (go t) (go b)
+            Pi  n t b   -> Pi  n (go t) (go b)
+            Let n t v b -> Let n (go t) (go v) (go b)
+            Proj tn i s -> Proj tn i (go s)
+            _           -> e
+          step e = case unApps e of
+            -- F.rec p bigC e (Idx.mk_j p a) t  ~>  T_j.rec p C e a t
+            (Const c us, as)
+              | c == fnTyRec fn, us == fRecUs
+              , length as >= nps + 1 + nMinors + 2
+              , take nps as == pArgs
+              , as !! nps == bigC
+              , take nMinors (drop (nps + 1) as) == eArgs
+              , (maj : t : after) <- drop (nps + 1 + nMinors) as
+              , Just (j, ixs) <- asTag maj
+              -> Just (mkApps (Const (recNames !! j) wrapUs)
+                         (pArgs ++ cArgs ++ eArgs ++ ixs ++ (t : after)))
+            -- bigC (Idx.mk_j p a) t  ~>  C_j a t
+            (Const c _, as)
+              | c == fnIdxRec fn
+              , length as >= nps + 1 + nMem + 1
+              , take nps as == pArgs
+              , take nMem (drop (nps + 1) as) == cArgs
+              , (maj : after) <- drop (nps + 1 + nMem) as
+              , Just (j, ixs) <- asTag maj
+              -> Just (mkApps (FVar (cVars !! j)) (ixs ++ after))
+            -- F p (Idx.mk_j p a)  ~>  T_j p a
+            (Const c us, as)
+              | c == fnTy fn
+              , length us == length selfL, and (zipWith levelEquiv us selfL)
+              , length as >= nps + 1
+              , take nps as == pArgs
+              , Just (j, ixs) <- asTag (as !! nps)
+              -> Just (mkApps (Const (memNames !! j) selfL)
+                         (pArgs ++ ixs ++ drop (nps + 1) as))
+            _ -> Nothing
+
       -- Everything a recursor of the block is quantified over: the parameters,
       -- one motive per member, and the minor premises, which are @F@'s own with
-      -- its single motive already instantiated at 'bigC'.
+      -- its single motive already instantiated at 'bigC' and folded back.
       withCtx k = withLocals paramTele $ \ps -> do
         kappas <- forM members $ \m -> do
           (is, _) <- openArity ctxt nps ps (cmArity m)
@@ -866,118 +946,123 @@ flattenBlock env0 groups members paramTele lvls nps recs = do
                                        (map FVar ps ++ [BVar 0]))
                                (Sort elimLvl)) ]
                ++ map FVar cVars)
+            rw = unflatten ps cVars bigC
         rest <- peelSharedParams ctxt nps ps
                   (instLevelsE (recLevels recF) fRecUs (recType recF))
         let (_, afterC)  = unPisN 1 rest
-            (minors, _)  = unPisN (recNumMinors recF) (inst1 bigC afterC)
-        withLocals minors $ \es -> k ps cVars es bigC
+            (minors0, _) = unPisN nMinors (inst1 bigC afterC)
+        withLocals [ (b, rw [] t) | (b, t) <- minors0 ] $ \es ->
+          k ps cVars es bigC (rw (map FVar es))
   unless (fRecLarge || not wantLarge) $
     Left (ctxt ++ "internal: the flat type lost its large elimination")
 
-  wrapped <- runTC envC wrapLvls $ withCtx $ \ps cVars es bigC ->
-    forM (zip [0 ..] members) $ \(j, m) -> do
+  derived <- runTC envTy wrapLvls $ withCtx $ \ps cVars es bigC rw ->
+    forM (zip3 [0 ..] members (regroup nCtors (recRules recF))) $ \(j, m, rules) -> do
       (is, _) <- openArity ctxt nps ps (cmArity m)
       z <- freshFVar (Binder (str "t"))
              (mkApps (Const (cmName m) selfL) (map FVar ps ++ map FVar is))
       concl <- closePis (is ++ [z])
                  (mkApps (FVar (cVars !! j)) (map FVar is ++ [FVar z]))
-      ty  <- closePis (ps ++ cVars ++ es) concl
-      _   <- inferSortOf ty
-      val <- closeLams (ps ++ cVars ++ es ++ is ++ [z])
-               (mkApps (Const (fnTyRec fn) fRecUs)
-                 (map FVar ps ++ [bigC] ++ map FVar es
-                  ++ [ mkApps (Const (fnIdxCtor fn j) selfL)
-                              (map FVar ps ++ map FVar is)
-                     , FVar z ]))
-      checkType val ty
-      pure (ty, val)
-  envRec <- foldM addConst envC
-    [ CDef DefInfo { defName = cmRecName m, defLevels = wrapLvls, defType = ty
-                   , defValue = val, defHint = HAbbrev }
-    | (m, (ty, val)) <- zip members wrapped ]
+      ty <- closePis (ps ++ cVars ++ es) concl
+      -- A rule of @F@ is abstracted over the parameters, @F@'s one motive, the
+      -- minor premises and the fields; ours over the parameters, the block's
+      -- @n@ motives, the same minor premises and the same fields.  Opening the
+      -- first at 'bigC' and closing the second over 'cVars' is the whole
+      -- difference, once the recursive calls inside have been folded back.
+      rs <- forM (zip rules (map snd (cmCtors m))) $ \(ru, cty) ->
+        withFields ctxt nps ps cty (rrNumFields ru) $ \bs -> do
+          let body = instLams (map FVar ps ++ [bigC] ++ map FVar es ++ map FVar bs)
+                              (instLevelsE (recLevels recF) fRecUs (rrRhs ru))
+          rhs <- closeLams (ps ++ cVars ++ es ++ bs) (rw body)
+          pure ru { rrRhs = rhs }
+      pure RecInfo
+        { recName       = cmRecName m
+        , recLevels     = wrapLvls
+        , recType       = ty
+        , recInduct     = cmName m
+        , recNumParams  = nps
+        , recNumMotives = nMem
+        , recNumIndices = nIdxs !! j
+        , recNumMinors  = nMinors
+        , recRules      = rs
+        , recK          = False
+        }
 
-  -- 7. And the export's recursors must be these.  The rules are compared
-  --    behaviourally -- both sides applied to the same parameters, motives,
-  --    minor premises and fields -- because ours are @F@'s, stated in @F@'s
-  --    single motive rather than in the block's @n@.
-  either Left (const (Right ())) $ runTC envRec wrapLvls $
-    withCtx $ \ps cVars es bigC ->
-      forM_ (zip (zip3 [0 ..] members wrapped)
-                 (zip (regroup nCtors (recRules recF)) flatCtorTys)) $
-        \((j, m, (ty, _)), (rules, ctys)) -> do
-          rv <- case find ((== cmRecName m) . exrName) recs of
-            Just r  -> pure r
-            Nothing -> throwTC ("no exported recursor named "
-                                ++ showName (cmRecName m))
-          let rn = "recursor " ++ showName (cmRecName m) ++ ": "
-              need what got want = unless (got == want) $
-                throwTC (rn ++ "declares " ++ show got ++ " " ++ what
-                         ++ ", expected " ++ show want)
-              theirs :: Expr -> Expr
-              theirs = instLevelsE (exrLevels rv) (map LParam wrapLvls)
-          unless (exrAll rv == declNames) $
-            throwTC (rn ++ "\"all\" does not list the types of its inductive block")
-          need "parameters"          (exrNumParams rv)        nps
-          need "motives"             (exrNumMotives rv)       nMem
-          need "indices"             (exrNumIndices rv)       (nIdxs !! j)
-          need "minor premises"      (exrNumMinors rv)        (recNumMinors recF)
-          need "universe parameters" (length (exrLevels rv))  (length wrapLvls)
-          need "reduction rules"     (length (exrRules rv))   (length rules)
-          when (exrK rv) $
-            throwTC (rn ++ "declares k = true, but no recursor of a mutual block \
-                           \has a K-like rule")
-          either throwTC pure (checkLevelParams (exrLevels rv))
-          okTy <- isDefEq (theirs (exrType rv)) ty
-          unless okTy $
-            throwTC (rn ++ "the declared recursor type is not the one this \
-              \inductive type justifies\n  declared "
-              ++ showExpr (theirs (exrType rv)) ++ "\n  derived  " ++ showExpr ty)
-          forM_ (zip3 (exrRules rv) rules ctys) $ \(ru, our, (_, cty)) -> do
-            unless (exuCtor ru == rrCtor our) $
-              throwTC (rn ++ "the reduction rules are for " ++ showName (exuCtor ru)
-                       ++ " where constructor order puts " ++ showName (rrCtor our))
-            unless (exuNumFields ru == rrNumFields our) $
-              throwTC (rn ++ "reduction rule for " ++ showName (exuCtor ru)
-                       ++ " declares " ++ show (exuNumFields ru) ++ " fields, expected "
-                       ++ show (rrNumFields our))
-            withFields ctxt nps ps cty (rrNumFields our) $ \bs -> do
-              let post = map FVar es ++ map FVar bs
-                  lhs  = mkApps (theirs (exuRhs ru))
-                                (map FVar ps ++ map FVar cVars ++ post)
-                  rhs  = mkApps (instLevelsE (recLevels recF) fRecUs (rrRhs our))
-                                (map FVar ps ++ [bigC] ++ post)
-              okR <- isDefEq lhs rhs
-              unless okR $
-                throwTC (rn ++ "the declared reduction rule for "
-                  ++ showName (exuCtor ru) ++ " is not the one iota gives\n  declared "
-                  ++ showExpr lhs ++ "\n  derived  " ++ showExpr rhs)
+  -- 7. Put the real containers back where §9.1 put auxiliaries, and check that
+  --    nothing this pass invented is left anywhere in what the caller will get.
+  let ourRs = [ r { recType   = unnest (recType r)
+                  , recInduct = unAux nested (recInduct r)
+                  , recRules  = [ ru { rrCtor = unAux nested (rrCtor ru)
+                                     , rrRhs  = unnest (rrRhs ru) }
+                                | ru <- recRules r ]
+                  }
+              | r <- derived ]
+      invented = fnAll fn ++ map nsAux nested
+              ++ [ i | n <- nested, (i, _) <- nsCtorMap n ]
+  forM_ ourRs $ \r ->
+    case [ n | n <- invented
+             , any (occursConst n) (recType r : map rrRhs (recRules r)) ] of
+      []      -> Right ()
+      (n : _) -> Left (ctxt ++ "internal: " ++ showName n ++ " survives in the \
+                       \derived recursor " ++ showName (recName r))
+
+  -- 8. And so the block's own constants, on the environment we were handed:
+  --    nothing the flattening invented ever reaches it.
+  --
+  --    'indIsRecursive' is a property of the individual member, not of the
+  --    block, and @F@ only knows the block's, so it is recomputed here: does a
+  --    member of the block occur in one of this member's constructors?  Nothing
+  --    that existed before the block was declared can mention a member of it, so
+  --    an occurrence that whnf would expose was already there syntactically, and
+  --    this can only over-report -- which costs eta during reduction (§6.1) and
+  --    nothing else.
+  let selfRec m = or [ occursConst n cty | (_, cty) <- cmCtors m, n <- memNames ]
+      ourInds =
+        [ IndInfo { indName        = cmName m
+                  , indLevels      = lvls
+                  , indType        = cmArity m
+                  , indNumParams   = nps
+                  , indNumIndices  = ni
+                  , indCtors       = map fst (cmCtors m)
+                  , indIsRecursive = selfRec m
+                  , indLargeElim   = wantLarge
+                  , indK           = False
+                  }
+        | (m, ni) <- zip declMembers nIdxs ]
+      ourCs = [ [ ci { ctorType = excType c, ctorInduct = cmName m, ctorIdx = k }
+                | (k, ci, c) <- zip3 [0 ..] cis g ]
+              | (m, g, cis) <- zip3 declMembers groups
+                                    (take nDecl (regroup nCtors ctorFs)) ]
+  envInd <- foldM addConst env0
+    (map CInd ourInds ++ map CCtor (concat ourCs) ++ map CRec ourRs)
+  forM_ ourRs $ \r ->
+    either (\e -> Left ("recursor " ++ showName (recName r)
+                        ++ " does not typecheck after flattening: " ++ e))
+           (const (Right ()))
+           (runTC envInd (recLevels r) (inferSortOf (recType r)))
+  forM_ ourRs $ \r -> case find ((== recName r) . exrName) recs of
+    Nothing -> Left ("no exported recursor named " ++ showName (recName r))
+    Just rv -> checkRecursorMatches envInd declNames rv r
 
   pure BlockResult
-    { brEnv     = envRec
-        { envInternal = foldr S.insert (envInternal envRec) (fnAll fn)
-          -- The inductive types these members would have been, for the one
-          -- consumer that still needs them; see 'inductiveAt'.
-        , envFlat = foldr (\i -> M.insert (indName i) i) (envFlat envRec)
-            [ IndInfo { indName        = cmName m
-                      , indLevels      = lvls
-                      , indType        = cmArity m
-                      , indNumParams   = nps
-                      , indNumIndices  = ni
-                      , indCtors       = map fst (cmCtors m)
-                      , indIsRecursive = indIsRecursive indF
-                      , indLargeElim   = wantLarge
-                      , indK           = False
-                      }
-            | (m, ni) <- zip members nIdxs ]
-          -- and the same table read the other way, for 'Kernel.Check.unflatten'.
-        , envUnflat = M.insert (fnTy fn) (fnIdx fn, nps, declNames)
-                               (envUnflat envRec)
-        }
-    , brIndices = nIdxs
-    , brFields  = regroup nCtors (map ctorNumFields ctorFs)
+    { brEnv     = envInd
+    , brIndices = take nDecl nIdxs
+    , brFields  = map (map ctorNumFields) ourCs
     , brRec     = indIsRecursive indF
     , brRefl    = or (abReflexive ab)
     }
+
+-- | Beta-reduce a term's leading lambdas against the given arguments.
+--
+-- The terms this is used on are recursor right-hand sides, which
+-- 'Kernel.Inductive.mkRule' builds as a lambda per parameter, motive, minor
+-- premise and field; if one ever has fewer, the application it falls back to
+-- is the same term and the fold that follows simply does not fire -- which
+-- step 7 turns into a rejection rather than letting it through.
+instLams :: [Expr] -> Expr -> Expr
+instLams []         e           = e
+instLams (a : as)   (Lam _ _ b) = instLams as (inst1 a b)
+instLams as         e           = mkApps e as
 
 -- | Rewrite every occurrence of a member of the block into one of the flat type.
 --
@@ -1146,8 +1231,8 @@ planNesting cap nps lvls paramTele declNames declCtorTys =
         instParams (ctorNumParams ci) pargs
                    (instLevelsE (ctorLevels ci) us (ctorType ci))
 
-    indAt c = getEnv >>= \env -> case inductiveAt env c of
-      Just ind -> pure ind
+    indAt c = getEnv >>= \env -> case lookupConst env c of
+      Just (CInd ind) -> pure ind
       _ -> throwTC ("nested inductive: " ++ showName c ++ " is not an inductive type")
     ctorAt cn = getEnv >>= \env -> case lookupConst env cn of
       Just (CCtor ci) -> pure ci
@@ -1185,7 +1270,7 @@ collectNested env declNames = go
       Nothing          -> sub e
     here e = case unApps e of
       (Const c us, args)
-        | Just ind <- inductiveAt env c
+        | Just (CInd ind) <- lookupConst env c
         , let (pargs, ixargs) = splitAt (indNumParams ind) args
         , length args >= indNumParams ind
         , all ((== 0) . looseBVarRange) pargs
