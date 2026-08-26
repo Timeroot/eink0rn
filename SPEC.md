@@ -890,12 +890,30 @@ reasons worth recording:
   to index them with;
 - eliminating into `Sort u` from that index type requires it to large-eliminate,
   which is another obligation to discharge before the prelude has the machinery;
-- the members of a block may sit at *heterogeneous* universe levels — the types
-  the file declares share one level (§8.3), but §9 adds a member per nested
-  occurrence and each of those stands for a container admitted elsewhere, at
-  whatever level that container has — and a single type has one level;
-  reconciling them means inserting universe lifts, which changes the types the
-  export wrote down and so breaks the recursor-matching check of §1.
+- the members of a block may in principle sit at *heterogeneous* universe levels
+  — the types the file declares share one level (§8.3), but §9 adds a member per
+  nested occurrence and each of those stands for a container admitted elsewhere,
+  at whatever level that container has — and a single type has one level.
+
+The first two objections turned out to be answerable and the third is nearly
+vacuous, so §9.3 goes back and does the reduction anyway, for the blocks where it
+is possible. On the third: the universe condition of §8.4 already forces the
+levels to agree in almost every case. A recursive field landing in member `k` has
+sort `l_k`, and `imax(l_k, l_j) <= l_j` forces `l_k <= l_j` whenever `l_j` is not
+zero; an auxiliary that recurses back into the block sits in a cycle with it, so
+the two levels are equal. What escapes is a `Prop` nesting inside a data
+container — `inductive A : Prop | mk : List A -> A` would put a `Prop` member
+beside a `Type 0` auxiliary — and instrumenting step 3 to report every auxiliary
+level found **no** such block anywhere: 1 in `init`, 3 in `std`, 41 in `cslib`
+and 200 across `refs/tests`, `tests` and `validation`, all at the declared
+members' own level. So the exemption in §8.3 step 4 is real but never yet paid
+for.
+
+What is *not* answerable is the obstruction in §9.3.4: a nested block's
+constructors and recursors, as the export writes them, name the real container
+types, and those cannot be `F` at a tag. That is the reason this kernel keeps a
+mutual block as a primitive, and it comes from the export format rather than from
+the theory.
 
 A mutual block is already the primitive the thesis treats (§2.9), and treating it
 directly costs one extra index (`which member?`) in the bookkeeping and nothing in
@@ -1193,9 +1211,13 @@ one was trying to avoid. That objection is real but it is not fatal, because the
 tag type does not need the mutual rule — it is a plain enumeration-with-arguments.
 This section takes the reduction seriously and does it.
 
-Only a block with **two or more members and no nesting** is flattened; a single
-type is already flat, and §9.1 needs primitive recursors over the real containers,
-which this construction cannot supply (see the last paragraph of §9.3.4).
+Only a block with **two or more members and no nesting** is flattened. A single
+type is already flat, so that half of the guard costs nothing. The `no nesting`
+half is not a shortcut and cannot be lifted: §9.3.4 shows that a nested block's
+constructors, as the export types them, can never be constructors of `F`. Since
+a nested block is the *only* way a block of two or more members reaches
+`Kernel.Inductive` once this construction is on, that guard is exactly the line
+between what can be flattened and what provably cannot.
 
 #### 9.3.1 The construction
 
@@ -1369,15 +1391,71 @@ of them are consequences of `T_j` being a definition rather than an inductive ty
   `inductiveAt`. Without that, a file that declares a mutual block and then nests
   a later inductive inside one of its members is rejected.
 
-* **What flattening cannot do.** §9.1's auxiliary members must come back out as
-  *primitive* recursors over the real containers: `T.rec_1` eliminates
-  `t : List (T 0)` with rules on `List.nil` and `List.cons`. A definition-based
-  wrapper cannot survive that substitution — its body mentions `F.rec` at an
-  auxiliary index, and once the index is replaced by `List (T 0)` the body is
-  ill-typed — and one `F.rec` cannot carry rules for another type's constructors.
+* **What flattening cannot do, and why that is a theorem rather than a gap.** A
+  nested block cannot be flattened at all, in any order, for a reason that has
+  nothing to do with universes.
+
+  `Lean.Syntax` in `init` is the smallest witness. One declared type, two nested
+  occurrences, and the export commits to
+
+  ```
+  Lean.Syntax.node : SourceInfo -> SyntaxNodeKind -> Array.{0} Syntax -> Syntax
+  Lean.Syntax.rec  : forall (motive_1 : Syntax -> Sort u)
+                            (motive_2 : Array.{0} Syntax -> Sort u)
+                            (motive_3 : List.{0} Syntax -> Sort u), ...
+  ```
+
+  with reduction rules on `Array.mk`, `List.nil` and `List.cons` — the containers'
+  *real* constructors, not copies. (There are three recursors, `rec`, `rec_1` and
+  `rec_2`, one per member of the post-nesting block, all sharing those three
+  motives.) §9.1 delivers exactly this: it admits the block with auxiliary members,
+  then substitutes the real containers back in and re-checks.
+
+  Now try to flatten. `Syntax.node` has to become a constructor of `F`, and
+  `Syntax` becomes the definition `F p̄ (Idx.mk_1 p̄)`. Its third field, `Array
+  Syntax`, therefore unfolds to `Array (F p̄ (Idx.mk_1 p̄))` — an occurrence of the
+  type being defined underneath another type constructor, which is precisely the
+  shape §8.4 rejects and §9 exists to remove. The only repair is the one §9 already
+  makes, replacing the field by an auxiliary member — which after flattening is `F`
+  at another tag, so `ctorType` is no longer the type the export declared and §8.8
+  fails.
+
+  So `Syntax.node` would have to be simultaneously a constructor of `F` and of a
+  type in which `F` occurs nested. **Ordering the two compilations differently does
+  not help, because the difficulty is not one of order**: the export names `Array
+  Syntax` in a position where flattening requires `F` at a tag, and those are two
+  distinct inductive types, not two spellings of one. The recursor says the same
+  thing from the other end — `F` has the single motive
+  `C : forall (i : Idx p̄), F p̄ i -> Sort u`, and instantiating it at a tag can only
+  ever yield a domain `F p̄ (Idx.mk_k p̄ ā)`, never `Array Syntax`. Per-member
+  motives are what make §9.1's substitution possible, and merging them is the whole
+  content of flattening.
+
+  It is worth being precise about why §9.1's own manoeuvre cannot simply be
+  repeated here, since it is the obvious thing to try. §9.1 gets away with
+  registering a constructor whose stored type is *not* the one §8.4 checked
+  because the auxiliary `Syntax._nested.1` occurs **syntactically** at every
+  position that matters, so one textual substitution reaches all of them and the
+  result can be re-audited (step 6). After flattening there is nothing to
+  substitute: the auxiliary's type occurs only as `F p̄ i` with `i` a *bound
+  variable*, instantiated to `Idx.mk_2 p̄` by the recursor's own reduction. The
+  occurrence has been absorbed into a binder, and a substitution cannot reach
+  under it. Flattening trades a syntactic distinction for a computational one,
+  and unnesting needs the syntactic one.
+
+  The consequence is worth stating plainly: **the export format requires this
+  kernel to have a mutual block as a primitive.** §8.1 reached that conclusion for
+  weaker reasons; this is the binding one. The only escape would be to give the
+  core a native nesting rule — a positivity rule admitting `Array (F ...)` on the
+  strength of `Array`'s recursor — which is adding a rule to the core in order to
+  remove one.
+
   So a nested block is admitted the classic way, and `Kernel.Inductive` keeps every
-  line of its mutual machinery. The flattening is an *alternative* front end, not a
-  simplification of the core.
+  line of its mutual machinery. Note also how little that machinery is: `admit` and
+  `buildRecursors` are written uniformly in the number of members, with no
+  single-member special case, so even a hypothetical always-flatten kernel would
+  not delete a code path — it would replace some lists by scalars. The flattening
+  is an *alternative* front end, not a simplification of the core.
 
 ---
 
