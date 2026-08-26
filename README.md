@@ -93,15 +93,17 @@ schema (§12.8), and `Acc.rec` on a proof variable (§12.13).
 
 ### The Lean Kernel Arena exports
 
-Whole-run wall clock and peak RSS, on one core of a GCP `n2` instance. The file
-is parsed strictly before checking starts, which is most of the memory.
+Whole-run wall clock and peak RSS, one run each, alone on one core of a GCP `n2`
+instance. The file is parsed strictly before checking starts, which is most of
+the memory. Read the times to about ±10%, and do not compare two of them: over a
+morning, repeated runs of *one* binary over `init` spread by eight per cent.
 
 | corpus | declarations | verdict | time | peak RSS |
 | --- | --- | --- | --- | --- |
-| `init.ndjson` (325 MB) | 53,093 | ACCEPT | 3m 29s | 1.6 GB |
-| `std.ndjson` (552 MB) | 90,778 | ACCEPT | 6m 0s | 3.3 GB |
-| `cslib.ndjson` (2.1 GB) | 370,939 | ACCEPT | 22m 32s | 9.6 GB |
-| `mathlib.ndjson` (5.6 GB) | 654,504 | ACCEPT | 2h 16m | 25 GB |
+| `init.ndjson` (325 MB) | 53,093 | ACCEPT | 2m 49s | 1.6 GB |
+| `std.ndjson` (552 MB) | 90,778 | ACCEPT | 6m 4s | 3.3 GB |
+| `cslib.ndjson` (2.1 GB) | 370,939 | ACCEPT | 20m 32s | 9.6 GB |
+| `mathlib.ndjson` (5.6 GB) | 654,504 | ACCEPT | 1h 44m | 25.3 GB |
 
 One mathlib theorem —
 `AlgebraicGeometry.Scheme.exists_π_app_comp_eq_of_locallyOfFinitePresentation_of_isAffine`
