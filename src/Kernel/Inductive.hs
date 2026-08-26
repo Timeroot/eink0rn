@@ -1,82 +1,70 @@
 {-# LANGUAGE LambdaCase #-}
--- | Admitting a block of core inductive types, and deriving their recursors.
+-- | Admitting a core inductive type, and deriving its recursor.
 --
--- \"Core\" means /flat/: a finite set of mutually recursive families over a
--- shared parameter telescope, each a plain telescope of indices ending in a
--- sort.  No nesting -- a family occurring underneath some other type
--- constructor is compiled away by "Front.Lower" before it gets here, into extra
--- members of the very block this module admits.
+-- \"Core\" means /flat/ and /single/: one family over a parameter telescope,
+-- with a plain telescope of indices ending in a sort.  Neither structure the
+-- export format allows on top of that reaches this module.  Nesting -- a family
+-- occurring underneath some other type constructor -- is compiled away by
+-- "Front.Lower" (SPEC.md §9.1) into extra members of a mutual block, and the
+-- mutual block is then compiled away (§9.3) into two single families: a tag type
+-- and the block re-indexed by it.  So the core's inductive rule is the
+-- one-family rule and nothing else.
 --
 -- The rules below follow Carneiro, /The Type Theory of Lean/ §2.9 -- the @ctor@
 -- and @LE@ judgements, the shape of the recursor, and iota -- almost literally,
--- generalised from one family to a block in the way §2.9 describes.  SPEC.md
--- states them again in the notation used there.
+-- read at one family, which is the case §2.9 states before generalising to a
+-- block.  SPEC.md §8 states them again in the notation used there.
 --
 -- Notation, as in the thesis:
 --
--- > t_j : forall a::alpha_j, Sort l_j     the j-th family, parameters in the context
--- > c : forall b::beta, t_j p[b]          a constructor of the j-th family
--- > b_i : forall x::xi_i, t_k pi_i[b,x]   a recursive field, of the k-th family
+-- > t : forall a::alpha, Sort l         the family, parameters in the context
+-- > c : forall b::beta, t p[b]          a constructor
+-- > b_i : forall x::xi_i, t pi_i[b,x]   a recursive field
 --
 -- Parameters are ordinary context variables here, exactly as in the thesis; the
--- outer @forall params@ is put back on at the very end.  They are shared: every
--- member of a block has the same parameter telescope, and every occurrence of
--- any member anywhere in the block must be at those very parameters.
+-- outer @forall params@ is put back on at the very end.  Every occurrence of the
+-- family inside its own constructors must be at those very parameters.
 module Kernel.Inductive
-  ( CoreBlock (..)
-  , CoreMember (..)
-  , AdmittedBlock (..)
-  , admitBlock
+  ( CoreInd (..)
+  , AdmittedInd (..)
+  , admitInd
   ) where
 
 import           Control.Monad (forM, forM_, unless, when)
-import           Data.List     (elemIndex, intercalate, nub)
 import           Kernel.Check
 import           Kernel.Env
 import           Kernel.Expr
 import           Kernel.Level
 import           Kernel.Name
 
--- | One family of a block, in the shape the core accepts.
-data CoreMember = CoreMember
-  { cmName    :: !Name
-  , cmArity   :: !Expr             -- ^ @forall params indices, Sort l@
-  , cmCtors   :: ![(Name, Expr)]   -- ^ in constructor-index order
-  , cmRecName :: !Name
-  }
-
--- | A mutual block.  A single inductive type is the one-member case.
-data CoreBlock = CoreBlock
-  { cbLevels    :: ![Name]
-  , cbNumParams :: !Int
-  , cbMembers   :: ![CoreMember]   -- ^ non-empty
-  , cbNumDeclared :: !Int
-    -- ^ how many of 'cbMembers' the file actually declared.  The rest are the
-    -- specialised containers the nesting compilation added (SPEC.md §9), which
-    -- are exempt from the uniform-universe rule of §8.3: they stand for types
-    -- admitted elsewhere, at whatever universe those have.
-  , cbElimHint  :: !Name
+-- | One inductive family, in the shape the core accepts.
+data CoreInd = CoreInd
+  { coreLevels    :: ![Name]
+  , coreNumParams :: !Int
+  , coreName      :: !Name
+  , coreArity     :: !Expr             -- ^ @forall params indices, Sort l@
+  , coreCtors     :: ![(Name, Expr)]   -- ^ in constructor-index order
+  , coreRecName   :: !Name
+  , coreElimHint  :: !Name
     -- ^ preferred name for the fresh elimination universe; purely cosmetic, but
-    -- reusing the exported one makes the derived recursors compare syntactically.
+    -- reusing the exported one makes the derived recursor compare syntactically.
   }
 
--- | Parallel to 'cbMembers' throughout.
-data AdmittedBlock = AdmittedBlock
-  { abInds      :: ![IndInfo]
-  , abCtors     :: ![[CtorInfo]]
-  , abRecs      :: ![RecInfo]
-  , abReflexive :: ![Bool]
-    -- ^ some constructor of this member has a recursive field /under a binder/,
-    -- as @Acc.intro@'s @forall y, r y x -> Acc r y@ does.  No rule in this
-    -- kernel consults it; it is derived so that "Front.Lower" can hold the
-    -- export's @isReflexive@ to something.  ('indIsRecursive' plays the same
-    -- part for @isRec@, and is on 'IndInfo' because reduction does use it.)
+data AdmittedInd = AdmittedInd
+  { aiInd       :: !IndInfo
+  , aiCtors     :: ![CtorInfo]
+  , aiRec       :: !RecInfo
+  , aiReflexive :: !Bool
+    -- ^ some constructor has a recursive field /under a binder/, as
+    -- @Acc.intro@'s @forall y, r y x -> Acc r y@ does.  No rule in this kernel
+    -- consults it; it is derived so that "Front.Lower" can hold the export's
+    -- @isReflexive@ to something.  ('indIsRecursive' plays the same part for
+    -- @isRec@, and is on 'IndInfo' because reduction does use it.)
   }
 
--- | A recursive field @b_i : forall x::xi, t_k pi@.
+-- | A recursive field @b_i : forall x::xi, t pi@.
 data RecOcc = RecOcc
-  { roMember  :: !Int               -- ^ @k@: which member of the block it lands in
-  , roTele    :: ![(Binder, Expr)]  -- ^ @xi@, a closed de Bruijn telescope
+  { roTele    :: ![(Binder, Expr)]  -- ^ @xi@, a closed de Bruijn telescope
   , roIndices :: ![Expr]            -- ^ @pi@, de Bruijn relative to @xi@
   }
 
@@ -84,12 +72,12 @@ data RecOcc = RecOcc
 data CField = CField
   { cfVar   :: !Int             -- ^ the local standing for it
   , cfLevel :: !Level           -- ^ the sort its type lives in
-  , cfRec   :: !(Maybe RecOcc)  -- ^ 'Nothing' when the field mentions no member
+  , cfRec   :: !(Maybe RecOcc)  -- ^ 'Nothing' when the field mentions the family
+                                --   nowhere
   }
 
 data CtorShape = CtorShape
   { csName   :: !Name
-  , csOwner  :: !Int           -- ^ the member this is a constructor of
   , csFields :: ![CField]
   , csResIdx :: ![Expr]        -- ^ @p[b]@, mentioning the field locals
   }
@@ -97,106 +85,81 @@ data CtorShape = CtorShape
 csNumFields :: CtorShape -> Int
 csNumFields = length . csFields
 
--- | Check an inductive block and derive its constructors and recursors.  The
+-- | Check an inductive type and derive its constructors and recursor.  The
 -- environment must not already contain any of the names involved.
-admitBlock :: Env -> CoreBlock -> Either String AdmittedBlock
-admitBlock env cb = runTC env (cbLevels cb) (admit cb)
+admitInd :: Env -> CoreInd -> Either String AdmittedInd
+admitInd env ci = runTC env (coreLevels ci) (admit ci)
 
-admit :: CoreBlock -> TC AdmittedBlock
-admit cb = do
+admit :: CoreInd -> TC AdmittedInd
+admit ci = do
   env0 <- getEnv
-  let lvls  = cbLevels cb
+  let lvls  = coreLevels ci
       selfL = map LParam lvls
-      nps   = cbNumParams cb
-      ms    = cbMembers cb
-      names = map cmName ms
-      ctxt  = "inductive " ++ showName (head names) ++ ": "
-      memberCtxt m = "inductive " ++ showName (cmName m) ++ ": "
+      nps   = coreNumParams ci
+      name  = coreName ci
+      ctxt  = "inductive " ++ showName name ++ ": "
 
-  unless (not (null ms)) $ throwTC "inductive block with no types"
   unless (nps >= 0) $ throwTC (ctxt ++ "negative parameter count")
-  unless (length (nub names) == length names) $
-    throwTC (ctxt ++ "the block declares the same type twice")
 
-  -- 1. Every declared arity must be a well-formed type, and they must agree on
-  --    the shared parameter telescope.  The first member's is taken as
-  --    definitive; the rest are checked against it in step 2.
-  forM_ ms $ \m -> inferSortOf (cmArity m)
-  let (paramTele, _) = unPisN nps (cmArity (head ms))
+  -- 1. The arity must be a well-formed type, and must have at least as many
+  --    leading binders as it declares parameters.
+  _ <- inferSortOf (coreArity ci)
+  let (paramTele, _) = unPisN nps (coreArity ci)
   unless (length paramTele == nps) $
     throwTC (ctxt ++ "declares " ++ show nps ++ " parameters but its type has "
              ++ show (length paramTele))
 
-  -- 2. Constructors are checked with every member of the block standing for
-  --    itself as an opaque constant of exactly its declared arity.
-  envSelf <- foldMTC (\e m -> addC e (CAxiom (cmName m) lvls (cmArity m))) env0 ms
-  (ps, arities, shapess) <- withEnv envSelf $ withLocals paramTele $ \ps -> do
-    ars <- forM ms $ \m -> do
-      rest <- peelSharedParams (memberCtxt m) nps ps (cmArity m)
-      (is, res) <- peelPis rest
-      lvl <- case res of
-        Sort l -> pure l
-        _      -> throwTC (memberCtxt m ++ "the type must end in a sort, got "
-                           ++ showExpr res)
-      tele <- teleOf is
-      pure (lvl, tele)
-    shs <- forM (zip3 [0 ..] ms ars) $ \(j, m, (lvl, _)) ->
-      forM (cmCtors m) $ \(cn, cty) ->
-        analyzeCtor names selfL ps lvl nps j cn cty
-    pure (ps, ars, shs)
+  -- 2. Constructors are checked with the family standing for itself as an opaque
+  --    constant of exactly its declared arity, so a constructor cannot exploit
+  --    anything about the contents of the type it is building.
+  envSelf <- addC env0 (CAxiom name lvls (coreArity ci))
+  (ps, indLvl, idxTele, shapes) <- withEnv envSelf $ withLocals paramTele $ \ps -> do
+    rest <- peelSharedParams ctxt nps ps (coreArity ci)
+    (is, res) <- peelPis rest
+    lvl <- case res of
+      Sort l -> pure l
+      _      -> throwTC (ctxt ++ "the type must end in a sort, got " ++ showExpr res)
+    tele <- teleOf is
+    shs  <- forM (coreCtors ci) $ \(cn, cty) ->
+      analyzeCtor name selfL ps lvl nps cn cty
+    pure (ps, lvl, tele, shs)
 
-  -- 3. Every type the file declared in this block must land in the /same/ sort.
-  --    A block is one definition with one set of motives, and its members are
-  --    read as one family indexed by the member; letting the members sit at
-  --    different universes would make that reading false.  (SPEC.md §8.3.)
-  let indLvls   = map fst arities
-      idxTeles  = map snd arities
-      declLvls  = take (cbNumDeclared cb) indLvls
-  unless (and (zipWith levelEquiv declLvls (drop 1 declLvls))) $
-    throwTC (ctxt ++ "the types of a mutual block must all land in the same \
-                     \universe, but they land in "
-             ++ intercalate ", " (map showLevel declLvls))
-
-  -- 4. Derived attributes.  Large elimination and the @k@ flag are properties of
-  --    the block as a whole: one set of motives is shared by every member, so
-  --    the weakest member decides.
-  let largeElim = decideLargeElim (zip indLvls shapess)
-      kLike     = case (ms, indLvls, shapess) of
-        ([_], [l], [[sh]]) -> isDefinitelyZero l && csNumFields sh == 0
-        _                  -> False
-      indInfos =
-        [ IndInfo { indName        = cmName m
-                  , indLevels      = lvls
-                  , indType        = cmArity m
-                  , indNumParams   = nps
-                  , indNumIndices  = length idxTele
-                  , indCtors       = map csName shs
-                  , indIsRecursive = any (any (isRecField . cfRec) . csFields) shs
-                  , indLargeElim   = largeElim
-                  , indK           = kLike
-                  }
-        | (m, idxTele, shs) <- zip3 ms idxTeles shapess ]
-      ctorInfoss =
-        [ [ CtorInfo { ctorName      = cn
-                     , ctorLevels    = lvls
-                     , ctorType      = cty
-                     , ctorInduct    = cmName m
-                     , ctorIdx       = k
-                     , ctorNumParams = nps
-                     , ctorNumFields = csNumFields sh
-                     }
-          | (k, (cn, cty), sh) <- zip3 [0 ..] (cmCtors m) shs ]
-        | (m, shs) <- zip ms shapess ]
+  -- 3. Derived attributes.
+  let largeElim = decideLargeElim indLvl shapes
+      kLike     = case shapes of
+        [sh] -> isDefinitelyZero indLvl && csNumFields sh == 0
+        _    -> False
+      indInfo = IndInfo
+        { indName        = name
+        , indLevels      = lvls
+        , indType        = coreArity ci
+        , indNumParams   = nps
+        , indNumIndices  = length idxTele
+        , indCtors       = map csName shapes
+        , indIsRecursive = any (any (isRecField . cfRec) . csFields) shapes
+        , indLargeElim   = largeElim
+        , indK           = kLike
+        }
+      ctorInfos =
+        [ CtorInfo { ctorName      = cn
+                   , ctorLevels    = lvls
+                   , ctorType      = cty
+                   , ctorInduct    = name
+                   , ctorIdx       = k
+                   , ctorNumParams = nps
+                   , ctorNumFields = csNumFields sh
+                   }
+        | (k, (cn, cty), sh) <- zip3 [0 ..] (coreCtors ci) shapes ]
 
   envFull <- do
-    e1 <- foldMTC (\e i -> addC e (CInd i)) env0 indInfos
-    foldMTC (\e c -> addC e (CCtor c)) e1 (concat ctorInfoss)
+    e1 <- addC env0 (CInd indInfo)
+    foldMTC (\e c -> addC e (CCtor c)) e1 ctorInfos
 
-  recInfos <- withEnv envFull $
-    buildRecursors cb indInfos ps idxTeles largeElim kLike shapess
+  recInfo <- withEnv envFull $
+    buildRecursor ci indInfo ps idxTele largeElim kLike shapes
 
-  pure (AdmittedBlock indInfos ctorInfoss recInfos
-          [ any (any (isReflField . cfRec) . csFields) shs | shs <- shapess ])
+  pure (AdmittedInd indInfo ctorInfos recInfo
+          (any (any (isReflField . cfRec) . csFields) shapes))
   where
     isRecField (Just _) = True
     isRecField Nothing  = False
@@ -236,27 +199,23 @@ withRecOcc ro k = withLocals (roTele ro) $ \xs ->
 -- | The @ctor@ judgement.  Walks a constructor type left to right, classifying
 -- each field as recursive or not, and checking
 --
--- * strict positivity -- a member of the block occurs only as the head of a
---   field's final result, never in a domain and never inside the indices;
+-- * strict positivity -- the family occurs only as the head of a field's final
+--   result, never in a domain and never inside the indices;
 -- * the universe side condition @imax(l', l) <= l@ on every field, where @l'@
---   is the field's sort and @l@ the sort of the member being constructed;
+--   is the field's sort and @l@ the sort the family lands in;
 -- * that the parameters are used unchanged, both by the result and by every
 --   recursive occurrence.
---
--- A recursive field may land in /any/ member of the block; the result must land
--- in the member the constructor was declared for.
-analyzeCtor :: [Name] -> [Level] -> [Int] -> Level -> Int -> Int -> Name -> Expr
+analyzeCtor :: Name -> [Level] -> [Int] -> Level -> Int -> Name -> Expr
             -> TC CtorShape
-analyzeCtor names selfL ps indLvl nps owner cn cty0 = do
+analyzeCtor iname selfL ps indLvl nps cn cty0 = do
   _ <- inferSortOf cty0
   cty <- peelSharedParams ctxt nps ps cty0
   (flds, resIdx) <- goFields [] cty
-  pure CtorShape { csName = cn, csOwner = owner, csFields = flds, csResIdx = resIdx }
+  pure CtorShape { csName = cn, csFields = flds, csResIdx = resIdx }
   where
-    iname = names !! owner
-    ctxt  = "constructor " ++ showName cn ++ " of " ++ showName iname ++ ": "
+    ctxt = "constructor " ++ showName cn ++ " of " ++ showName iname ++ ": "
 
-    occursSelf e = any (`occursConst` e) names
+    occursSelf = occursConst iname
 
     goFields acc ty = whnf ty >>= \case
       Pi n dom cod -> do
@@ -271,17 +230,14 @@ analyzeCtor names selfL ps indLvl nps owner cn cty0 = do
         x <- freshFVar n dom
         goFields (CField x l' occ : acc) (inst1 (FVar x) cod)
       res -> do
-        (j, idx) <- splitSelf "result type" res
-        unless (j == owner) $
-          throwTC (ctxt ++ "result type is headed by " ++ showName (names !! j)
-                   ++ ", not by " ++ showName iname)
+        idx <- splitSelf "result type" res
         pure (reverse acc, idx)
 
-    -- A field either mentions no member of the block at all, or has the strictly
-    -- positive shape @forall x::xi, t_k params idx@ with no member in @xi@ and
-    -- none in @idx@.  Anything else -- a negative occurrence, or a member under
-    -- another type constructor -- is rejected.  Nested inductives never reach
-    -- here: "Front.Lower" has already turned them into extra members.
+    -- A field either does not mention the family at all, or has the strictly
+    -- positive shape @forall x::xi, t params idx@ with the family in neither
+    -- @xi@ nor @idx@.  Anything else -- a negative occurrence, or the family
+    -- under another type constructor -- is rejected.  Nested inductives never
+    -- reach here: "Front.Lower" has already turned them into separate types.
     --
     -- The occurs check is syntactic, so it also fires on an occurrence that is
     -- about to be erased: the specialised containers the nesting compilation
@@ -300,17 +256,17 @@ analyzeCtor names selfL ps indLvl nps owner cn cty0 = do
               when (occursSelf t) $ do
                 t' <- whnf t
                 when (occursSelf t') $
-                  throwTC (ctxt ++ "occurrence of the inductive block to the\
+                  throwTC (ctxt ++ "occurrence of the inductive type to the\
                                    \ left of an arrow")
-            (j, idx) <- splitSelf "recursive field" res
+            idx  <- splitSelf "recursive field" res
             tele <- teleOf xs
-            pure (Just (RecOcc j tele (map (abstractFVars xs) idx)))
+            pure (Just (RecOcc tele (map (abstractFVars xs) idx)))
 
-    -- Require @res == t_j params idx@, and return @j@ and @idx@.
+    -- Require @res == t params idx@, and return @idx@.
     splitSelf what res = do
       let (h, args) = unApps res
       case h of
-        Const n ls | Just j <- elemIndex n names -> do
+        Const n ls | n == iname -> do
           unless (length ls == length selfL && and (zipWith levelEquiv ls selfL)) $
             throwTC (ctxt ++ what ++ " uses " ++ showName n
                      ++ " at the wrong universes")
@@ -318,40 +274,40 @@ analyzeCtor names selfL ps indLvl nps owner cn cty0 = do
             throwTC (ctxt ++ what ++ ": " ++ showName n ++ " is not fully applied")
           let (pargs, iargs) = splitAt nps args
           unless (pargs == map FVar ps) $
-            throwTC (ctxt ++ what ++ " must use the block's own parameters")
+            throwTC (ctxt ++ what ++ " must use the type's own parameters")
           forM_ iargs $ \a ->
             unless (not (occursSelf a)) $
               throwTC (ctxt ++ showName n ++ " may not occur in its own indices")
-          pure (j, iargs)
-        _ -> throwTC (ctxt ++ what ++ " must be headed by a type of the block, got "
-                      ++ showExpr res)
+          pure iargs
+        _ -> throwTC (ctxt ++ what ++ " must be headed by " ++ showName iname
+                      ++ ", got " ++ showExpr res)
 
 -- Large elimination -------------------------------------------------------------
 
--- | Thesis §2.9.2.  A block eliminates into an arbitrary sort when either
+-- | Thesis §2.9.2.  A type eliminates into an arbitrary sort when either
 --
--- 1. /every/ member is provably not a @Prop@ under any assignment of the
---    block's universes -- they share the motives, so the weakest decides; or
--- 2. the block has exactly one member and that member is a subsingleton: at
---    most one constructor, each of whose fields is either a proof or is
---    recovered from the result's indices.
---
--- The one-member side condition on case 2 is not decoration.  The subsingleton
--- licence is justified by reading the eliminator back as a function that
--- recovers the constructor's fields from the major premise's type, and that
--- argument is about /one/ inductive family: a mutual block's recursor also
--- carries motives and minor premises for its other members, whose data is not
--- recovered from anything.  The nesting compilation (SPEC.md §9) makes blocks
--- out of some declarations that were written as a single type, so a nested
--- @Prop@ loses the licence too -- correctly, since the container field it
--- nests under is data.
+-- 1. it is provably not a @Prop@ under any assignment of its universes; or
+-- 2. it is a subsingleton: at most one constructor, each of whose fields is
+--    either a proof or is recovered from the result's indices.
 --
 -- Case 2 is what makes @Eq.rec@, @And.rec@ and @Acc.rec@ large-eliminating while
 -- @Exists.rec@ is not: @Exists.intro@'s witness is data that the result type
 -- @Exists p@ does not mention, so it must not be allowed to escape.
 --
+-- The rule is stated for /one/ family, and that is not an accident of this
+-- module now taking only one.  The subsingleton licence is justified by reading
+-- the eliminator back as a function that recovers the constructor's fields from
+-- the major premise's type, and that argument is about a single family: a mutual
+-- block's recursor also carries motives and minor premises for its other
+-- members, whose data is recovered from nothing.  So the flattening of SPEC.md
+-- §9.3 does /not/ hand the block the licence its flat type gets here; it builds
+-- the block's recursors at case 1 only.  The same goes for the nesting
+-- compilation, which makes several types out of a declaration written as one, so
+-- a nested @Prop@ loses the licence too -- correctly, since the container field
+-- it nests under is data.
+--
 -- \"Is a proof\" is read /absolutely/: the field's sort must be zero under every
--- assignment, not merely whenever the member itself lands in @Prop@.  The weaker,
+-- assignment, not merely whenever the type itself lands in @Prop@.  The weaker,
 -- relative reading @l' <= imax l' l@ is tempting and is what one reaches for to
 -- justify a structure at @Sort (max u v)@ with fields at @u@ and @v@, but it is
 -- not the rule.  @refs\/tests\/good\/tutorial\/093_MaybeProp.mk.ndjson@ pins this
@@ -367,14 +323,13 @@ analyzeCtor names selfL ps indLvl nps owner cn cty0 = do
 -- worries about are already covered by case 1: @PProd@ and @PSigma@ are declared
 -- at @Sort (max 1 (max u v))@, which is provably non-zero, so they never reach
 -- the subsingleton test at all.
-decideLargeElim :: [(Level, [CtorShape])] -> Bool
-decideLargeElim members
-  | all (isDefinitelyNonZero . fst) members = True
-  | [(_, shapes)] <- members = case shapes of
+decideLargeElim :: Level -> [CtorShape] -> Bool
+decideLargeElim lvl shapes
+  | isDefinitelyNonZero lvl = True
+  | otherwise = case shapes of
       []   -> True                      -- an empty Prop eliminates into anything
       [sh] -> all (recoverable sh) (csFields sh)
       _    -> False
-  | otherwise = False
   where
     recoverable sh f =
       isDefinitelyZero (cfLevel f)
@@ -382,81 +337,67 @@ decideLargeElim members
 
 -- Recursors -----------------------------------------------------------------------
 
--- | Build one recursor per member,
+-- | Build the recursor,
 --
--- > T_j.rec : forall params, forall C::kappa, forall e::eps,
--- >             forall a::alpha_j, forall (z : T_j params a), C_j a z
+-- > t.rec : forall params, forall C::kappa, forall e::eps,
+-- >           forall a::alpha, forall (z : t params a), C a z
 --
--- where the motives @C@ and the minor premises @e@ range over the /whole/ block,
--- in member order and then constructor order.  Each recursor carries iota rules
--- for its own member's constructors only; the shared prefix means a rule looks
--- the same whichever recursor of the block reduces it.
-buildRecursors :: CoreBlock -> [IndInfo] -> [Int] -> [[(Binder, Expr)]]
-               -> Bool -> Bool -> [[CtorShape]] -> TC [RecInfo]
-buildRecursors cb inds ps idxTeles largeElim kLike shapess = do
-  let lvls     = cbLevels cb
+-- with one minor premise per constructor, in constructor order.
+buildRecursor :: CoreInd -> IndInfo -> [Int] -> [(Binder, Expr)] -> Bool -> Bool
+              -> [CtorShape] -> TC RecInfo
+buildRecursor ci ind ps idxTele largeElim kLike shapes = do
+  let lvls     = coreLevels ci
       selfL    = map LParam lvls
-      elimName = freshLevelName (cbElimHint cb) lvls
+      elimName = freshLevelName (coreElimHint ci) lvls
       elimLvl  = if largeElim then LParam elimName else LZero
       recLvls  = if largeElim then elimName : lvls else lvls
-      recNames = map cmRecName (cbMembers cb)
-      nMembers = length inds
-      selfApp ind as = mkApps (Const (indName ind) selfL) (map FVar ps ++ as)
+      selfApp as = mkApps (Const (indName ind) selfL) (map FVar ps ++ as)
 
   setLevelParams recLvls
 
-  -- kappa_j = forall a::alpha_j, T_j params a -> Sort u
-  motiveTys <- forM (zip inds idxTeles) $ \(ind, idxTele) ->
-    withLocals idxTele $ \is ->
-      closePis is (mkArrow (selfApp ind (map FVar is)) (Sort elimLvl))
-  cVars <- forM (zip [1 :: Integer ..] motiveTys) $ \(k, t) ->
-    freshFVar (Binder (if nMembers == 1 then str "motive"
-                                        else mkNum (str "motive") k)) t
+  -- kappa = forall a::alpha, t params a -> Sort u
+  motiveTy <- withLocals idxTele $ \is ->
+    closePis is (mkArrow (selfApp (map FVar is)) (Sort elimLvl))
+  cVar <- freshFVar (Binder (str "motive")) motiveTy
 
-  -- eps_c = forall b::beta, forall v::delta, C_j p[b] (c params b)
-  minorTys  <- mapM (minorType selfL ps cVars) (concat shapess)
+  -- eps_c = forall b::beta, forall v::delta, C p[b] (c params b)
+  minorTys  <- mapM (minorType selfL ps cVar) shapes
   minorVars <- forM (zip [1 :: Integer ..] minorTys) $ \(k, t) ->
     freshFVar (Binder (mkNum (str "minor") k)) t
 
-  forM (zip4 [0 ..] inds idxTeles shapess) $ \(j, ind, idxTele, shapes) -> do
-    -- forall a::alpha_j, forall z : T_j params a, C_j a z
-    concl <- withLocals idxTele $ \is -> do
-      z <- freshFVar (Binder (str "t")) (selfApp ind (map FVar is))
-      closePis (is ++ [z]) (mkApps (FVar (cVars !! j)) (map FVar is ++ [FVar z]))
-    recTy <- closePis (ps ++ cVars ++ minorVars) concl
-    _ <- inferSortOf recTy   -- audit: the derived type must itself typecheck
+  -- forall a::alpha, forall z : t params a, C a z
+  concl <- withLocals idxTele $ \is -> do
+    z <- freshFVar (Binder (str "t")) (selfApp (map FVar is))
+    closePis (is ++ [z]) (mkApps (FVar cVar) (map FVar is ++ [FVar z]))
+  recTy <- closePis (ps ++ [cVar] ++ minorVars) concl
+  _ <- inferSortOf recTy   -- audit: the derived type must itself typecheck
 
-    let minorBase = length (concat (take j shapess))
-    rules <- forM (zip [0 ..] shapes) $ \(k, sh) ->
-      mkRule recNames recLvls ps cVars minorVars (minorBase + k) sh
+  rules <- forM (zip [0 ..] shapes) $ \(k, sh) ->
+    mkRule (coreRecName ci) recLvls ps cVar minorVars k sh
 
-    pure RecInfo
-      { recName       = recNames !! j
-      , recLevels     = recLvls
-      , recType       = recTy
-      , recInduct     = indName ind
-      , recNumParams  = indNumParams ind
-      , recNumMotives = nMembers
-      , recNumIndices = indNumIndices ind
-      , recNumMinors  = length minorVars
-      , recRules      = rules
-      , recK          = kLike
-      }
-  where
-    zip4 (a : as) (b : bs) (c : cs) (d : ds) = (a, b, c, d) : zip4 as bs cs ds
-    zip4 _ _ _ _                             = []
+  pure RecInfo
+    { recName       = coreRecName ci
+    , recLevels     = recLvls
+    , recType       = recTy
+    , recInduct     = indName ind
+    , recNumParams  = indNumParams ind
+    , recNumMotives = 1
+    , recNumIndices = indNumIndices ind
+    , recNumMinors  = length minorVars
+    , recRules      = rules
+    , recK          = kLike
+    }
 
--- | @eps_c = forall b::beta, forall v::delta, C_j p[b] (c params b)@, where the
--- induction hypotheses @v@ come after /all/ the fields, one per recursive field,
--- each stated with the motive of the member that field lands in.
-minorType :: [Level] -> [Int] -> [Int] -> CtorShape -> TC Expr
-minorType selfL ps cVars sh = do
+-- | @eps_c = forall b::beta, forall v::delta, C p[b] (c params b)@, where the
+-- induction hypotheses @v@ come after /all/ the fields, one per recursive field.
+minorType :: [Level] -> [Int] -> Int -> CtorShape -> TC Expr
+minorType selfL ps cVar sh = do
   ihs <- forM (zip [0 :: Integer ..] (csFields sh)) $ \(k, f) ->
     case cfRec f of
       Nothing -> pure Nothing
       Just ro -> do
         t <- withRecOcc ro $ \xs idx ->
-          closePis xs (mkApps (FVar (cVars !! roMember ro))
+          closePis xs (mkApps (FVar cVar)
                               (idx ++ [mkApps (FVar (cfVar f)) (map FVar xs)]))
         pure (Just (k, t))
   ihVars <- forM [ p | Just p <- ihs ] $ \(k, t) ->
@@ -464,33 +405,31 @@ minorType selfL ps cVars sh = do
   let ctorApp = mkApps (Const (csName sh) selfL)
                        (map FVar ps ++ map (FVar . cfVar) (csFields sh))
   closePis (map cfVar (csFields sh) ++ ihVars)
-           (mkApps (FVar (cVars !! csOwner sh)) (csResIdx sh ++ [ctorApp]))
+           (mkApps (FVar cVar) (csResIdx sh ++ [ctorApp]))
 
 -- | The iota rule
 --
--- > T_j.rec params C e p[b] (c params b)  ~>  e_c b v
--- > where v_i = fun x::xi_i => T_k.rec params C e pi_i[b,x] (b_i x)
+-- > t.rec params C e p[b] (c params b)  ~>  e_c b v
+-- > where v_i = fun x::xi_i => t.rec params C e pi_i[b,x] (b_i x)
 --
--- Its right-hand side is stored abstracted over parameters, motives, minor
+-- Its right-hand side is stored abstracted over parameters, motive, minor
 -- premises and fields, in that order -- which is the order
--- 'Kernel.Check.reduceRec' supplies them in.  Note that an induction hypothesis
--- calls the recursor of /its own/ member, which is what makes a mutual block
--- recurse across its types.
-mkRule :: [Name] -> [Name] -> [Int] -> [Int] -> [Int] -> Int -> CtorShape
+-- 'Kernel.Check.reduceRec' supplies them in.
+mkRule :: Name -> [Name] -> [Int] -> Int -> [Int] -> Int -> CtorShape
        -> TC RecRule
-mkRule recNames recLvls ps cVars minorVars k sh = do
-  let prefixArgs = map FVar ps ++ map FVar cVars ++ map FVar minorVars
+mkRule recNm recLvls ps cVar minorVars k sh = do
+  let prefixArgs = map FVar ps ++ [FVar cVar] ++ map FVar minorVars
   ihs <- forM (csFields sh) $ \f -> case cfRec f of
     Nothing -> pure Nothing
     Just ro -> fmap Just $ withRecOcc ro $ \xs idx ->
-      closeLams xs (mkApps (Const (recNames !! roMember ro) (map LParam recLvls))
+      closeLams xs (mkApps (Const recNm (map LParam recLvls))
         (prefixArgs ++ idx ++ [mkApps (FVar (cfVar f)) (map FVar xs)]))
   let body = mkApps (FVar (minorVars !! k))
                     (map (FVar . cfVar) (csFields sh) ++ [ e | Just e <- ihs ])
-  rhs <- closeLams (ps ++ cVars ++ minorVars ++ map cfVar (csFields sh)) body
+  rhs <- closeLams (ps ++ [cVar] ++ minorVars ++ map cfVar (csFields sh)) body
   pure RecRule { rrCtor = csName sh, rrNumFields = csNumFields sh, rrRhs = rhs }
 
--- | A universe parameter name not already taken by the block.
+-- | A universe parameter name not already taken by the type.
 freshLevelName :: Name -> [Name] -> Name
 freshLevelName hint used
   | hint `notElem` used = hint

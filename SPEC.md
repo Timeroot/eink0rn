@@ -38,7 +38,8 @@ design; the whole point is that the core has fewer cases to get wrong.
 | `opaque` | checked like a definition, then admitted as an **axiom** | it must not delta-unfold; an axiom is exactly a constant that does not |
 | reducibility hints | **kept**, as the delta-unfolding order of §7 step 6 (§12.11) | scheduling advice, and advice is all it can be: no ordering changes which terms are convertible |
 | safety flags (`isUnsafe`, `safety`) | **kept**: they select a quarantined fragment (§12.7) | an unsafe declaration skipped the termination check, so its type is not a claim the kernel can use |
-| nested inductives | compiled to mutual blocks (§9) | the core's positivity judgement has no rule for nesting |
+| nested inductives | compiled to mutual blocks (§9.1), which are then flattened (§9.3) | the core's positivity judgement has no rule for nesting, and no rule for a block |
+| mutual inductive blocks | compiled to one tag type and one family indexed by it (§9.3) | the core's inductive rule is the one-family rule |
 | exported recursors | **re-derived and required to match** (§8.7) | see below |
 
 The last row is a load-bearing design decision. The export contains recursors
@@ -338,10 +339,14 @@ comparison is done before the budget runs out and a speculation gives up.
 T_j.rec.{l̄} p̄ C̄ ē ī (c p̄ f̄)  ⟶  rule_c[l̄] p̄ C̄ ē f̄
 ```
 
-where the major premise sits at position `|p̄| + |C̄| + |ē| + |ī|`. A mutual block
-shares one set of motives `C̄` and one set of minor premises `ē` across all its
-members, so the prefix a rule is applied to is the same for every recursor of the
-block; only the rules differ. Arguments after the major premise are re-applied.
+where the major premise sits at position `|p̄| + |C̄| + |ē| + |ī|`, read off the
+counts the recursor carries. A recursor the core derives has one motive (§8.7),
+but the ones §9.3 derives for the members of a flattened block share one set of
+motives `C̄` and one set of minor premises `ē` across all the members, exactly as
+the export declares them; the prefix a rule is applied to is then the same for
+every recursor of the block, and only the rules differ. This arithmetic covers
+both because it never assumes `|C̄| = 1`. Arguments after the major premise are
+re-applied.
 
 Three things can make a non-constructor major premise usable:
 
@@ -874,16 +879,22 @@ concluding anything.
 
 ## 8. Inductive types
 
-The core primitive is a **flat mutual block**: a finite, non-empty set of families
-over a *shared* parameter telescope, each a plain telescope of indices ending in a
-sort. A single inductive type is the one-member case. Nesting is not part of the
-core (§9).
+The core primitive is a **single flat family**: one type over a parameter
+telescope, then a plain telescope of indices, ending in a sort. Neither of the
+two structures the export format puts on top of that reaches here. Nesting is
+compiled away by §9.1 into extra members of a mutual block, and the mutual block
+is compiled away by §9.3 into two single families. So every rule below is stated
+once, for one type — the case the thesis states before it generalises — and
+`Kernel/Inductive.hs` reads the same way.
 
-### 8.1 Why a mutual block, and not a single indexed type
+### 8.1 Why a single family, and not a mutual block
 
-The project's stated ambition was to compile mutual inductives away into a single
-indexed type with projections. That was tried and rejected as a design, for
-reasons worth recording:
+The thesis takes a mutual block as the primitive (§2.9). This kernel did the
+same for most of its life, and the switch is worth recording, because three of
+the four reasons on file were arguments *against* it.
+
+The project's stated ambition was to compile mutual inductives away into a
+single indexed type with projections. That was tried and, for a while, rejected:
 
 - The encoding needs an index type (a finite enumeration of the block's members)
   that may not exist yet — mutual blocks appear in the prelude *before* anything
@@ -891,24 +902,26 @@ reasons worth recording:
 - eliminating into `Sort u` from that index type requires it to large-eliminate,
   which is another obligation to discharge before the prelude has the machinery;
 - the members of a block may in principle sit at *heterogeneous* universe levels
-  — the types the file declares share one level (§8.3), but §9 adds a member per
+  — the types the file declares share one level, but §9.1 adds a member per
   nested occurrence and each of those stands for a container admitted elsewhere,
   at whatever level that container has — and a single type has one level.
 
-The first two objections turned out to be answerable and the third is nearly
-vacuous, so §9.3 goes back and does the reduction anyway — for *every* block, so
-that the core is only ever handed one type at a time. On the third: the universe
-condition of §8.4 already forces the levels to agree in almost every case. A
-recursive field landing in member `k` has sort `l_k`, and `imax(l_k, l_j) <= l_j`
-forces `l_k <= l_j` whenever `l_j` is not zero; an auxiliary that recurses back
-into the block sits in a cycle with it, so the two levels are equal. What escapes
-is a `Prop` nesting inside a data container — `inductive A : Prop | mk : List A ->
-A` would put a `Prop` member beside a `Type 0` auxiliary — and instrumenting the
-construction to report every auxiliary level found **no** such block anywhere: 1
-in `init`, 3 in `std`, 41 in `cslib` and 200 across `refs/tests`, `tests` and
-`validation`, all at the declared members' own level. So the exemption in §8.3
-step 4 is real, but nothing has ever needed it, and §9.3 — which does not grant
-it — has never had to reject a block over it.
+The first two are answered by building the index type *in the same breath* as
+the flattened family, in a scratch environment, out of nothing (§9.3.1): it is a
+parameterised enumeration whose constructors have no recursive fields, so it
+large-eliminates by §8.5 case 1 no matter what the prelude does or does not yet
+contain.
+
+The third is nearly vacuous. The universe condition of §8.4 already forces the
+levels to agree in almost every case: a recursive field landing in member `k` has
+sort `l_k`, and `imax(l_k, l_j) ≤ l_j` forces `l_k ≤ l_j` whenever `l_j` is not
+zero; an auxiliary that recurses back into the block sits in a cycle with it, so
+the two levels are equal. What escapes is a `Prop` nesting inside a data
+container — `inductive A : Prop | mk : List A -> A` would put a `Prop` member
+beside a `Type 0` auxiliary — and instrumenting the construction to report every
+auxiliary level found **no** such block anywhere: 1 in `init`, 3 in `std`, 41 in
+`cslib` and 200 across `refs/tests`, `tests` and `validation`, all at the
+declared members' own level.
 
 A fourth objection was asserted here for a while and was simply wrong: that a
 *nested* block could not be flattened at all, because the export types its
@@ -916,13 +929,19 @@ constructors and recursors at the real container types and those can never be `F
 at a tag. The premise is true and the conclusion does not follow; §9.3.5 records
 the argument and the mistake in it.
 
-A mutual block is still what the core takes as primitive. It is the primitive the
-thesis treats (§2.9), and treating it directly costs one extra index (`which
-member?`) in the bookkeeping and nothing in the metatheory. But with §9.3 in
-front of it, that primitive is only ever used at one member: no file can reach
-the mutual case. The genuinely aggressive normalisation is still nesting, which
-is compiled away completely (§9); flattening is what turns its output, and
-everything else, into a single indexed family.
+With all four answered, §9.3 flattens *every* block, the mutual case became
+unreachable, and it is now gone from the core. What that deleted is one index —
+"which member?" — threaded through everything: an owner on every constructor
+shape, a target member on every recursive occurrence, a vector of motives where
+there is now one motive, a vector of recursors built in lockstep with it, a
+duplicate-name check across members, and the uniform-universe rule discussed
+under §8.3. What it bought is that §8.5 case 2 no longer needs a side condition
+saying "and only for one member", and that the reader of this section never has
+to hold two levels of indexing at once.
+
+The genuinely aggressive normalisation is still nesting, which is compiled away
+completely (§9.1); flattening is what turns its output, and everything else,
+into something this section can talk about.
 
 ### 8.2 Notation
 
@@ -930,121 +949,123 @@ Following the thesis, with parameters as ordinary context variables (the outer
 `forall params` is put back at the very end):
 
 ```
-t_j : forall a::α_j, Sort l_j          the j-th family
-c   : forall b::β, t_j p̄[b]            a constructor of the j-th family
-b_i : forall x::ξ_i, t_k π_i[b,x]      a recursive field, landing in the k-th family
+t   : forall a::α, Sort l           the family
+c   : forall b::β, t p̄[b]           a constructor
+b_i : forall x::ξ_i, t π_i[b,x]     a recursive field
 ```
 
-### 8.3 Admitting a block
+### 8.3 Admitting a family
 
-1. Every declared arity is a well-formed type, and they agree on the shared
-   parameter telescope (the first member's is definitive; the rest are checked
-   against it, up to definitional equality of each binder type). Each must end in
-   a `Sort`.
-2. Every member is added to a scratch environment as an **axiom** of exactly its
+1. The arity is a well-formed type, with at least as many leading `Pi` binders as
+   it declares parameters, ending in a `Sort`.
+2. The family is added to a scratch environment as an **axiom** of exactly its
    declared arity, and the constructors are checked against that. So a
-   constructor may only see its own block's types as opaque constants of the right
-   arity — it cannot exploit anything about their contents.
+   constructor may see only an opaque constant of the right arity where its own
+   type should be — it cannot exploit anything about that type's contents.
 3. Constructor analysis (§8.4).
-4. **Uniform resultant universe.** Every type the file *declared* in this block
-   ends in the same sort, up to the level equivalence of §3. Members that §9
-   added for nested occurrences are exempt.
-5. Derived attributes (§8.5, §8.6).
-6. Recursor construction (§8.7), whose derived type is itself type-checked as an
+4. Derived attributes (§8.5, §8.6).
+5. Recursor construction (§8.7), whose derived type is itself type-checked as an
    audit.
 
-Step 4 is a rule about what a mutual block *is*. A block is one declaration with
-one set of motives and one set of minor premises shared by all its members, read
-as a single family indexed by "which member?"; members at different universes
-would make that reading false, and the elaborators that produce these files hold
-to it. Nothing in the theory below breaks without it — the shared-motive
-elimination rules of §8.5 are stated per member and stay sound for a
-heterogeneous block — so this is a conformance rule in the sense of §12.3, and
-its exemption for §9's auxiliaries is what keeps it from rejecting the nesting
-compilation's own output.
+**Where the uniform-resultant-universe rule went.** A mutual block is one
+declaration with one set of motives and one set of minor premises shared by all
+its members, read as a single family indexed by "which member?"; members at
+different universes make that reading false, and the elaborators that produce
+these files hold to it. When the core took blocks, it enforced that directly —
+"every type the file *declared* in this block ends in the same sort, up to the
+level equivalence of §3" — with an exemption for the members §9.1 adds, whose
+levels are not the file's business.
 
-Step 4 is also, as written, unreachable: §9.3 hands the core only blocks of one
-member, for which the rule is vacuous. The condition itself is not lost — the
-flattening derives it from the ordinary typing rule for definitions (§9.3.2) —
-but the derived version does not grant the exemption, which is the one place the
-front end is stricter than this section (§9.3.4).
+The core no longer sees a block, so it no longer states the rule; and nothing is
+lost, because §9.3 derives it from the ordinary typing of definitions. The
+flattening builds one family `F` at one level and then *defines* each declared
+member as `F` at a tag. A member declared at a different sort makes that
+definition ill-typed — its body does not have its declared type — and the block
+is rejected by the same check that rejects any other bad definition, with no
+inductive-specific machinery at all. The derived version is *stricter* in one
+respect: it does not grant §9.1's auxiliaries the exemption. That is one of the
+three deliberate divergences of §9.3.4, and no file has ever needed the
+exemption (§8.1).
 
 ### 8.4 The `ctor` judgement
 
-Walking a constructor's type left to right, after peeling the shared parameters:
+Walking a constructor's type left to right, after peeling the parameters:
 
-For each field `dom` with sort `l'`, where `l` is the sort of the member being
-constructed:
+For each field `dom` with sort `l'`, where `l` is the sort the family ends in:
 
 - **Universe condition**: `imax(l', l) ≤ l`. When `l = 0` this holds always — a
   proposition may quantify over anything. Otherwise it amounts to `l' ≤ l`.
-- **Classification**: if no member of the block occurs in `dom`, the field is
+- **Classification**: if the family does not occur in `dom`, the field is
   non-recursive. Otherwise `dom` must have the strictly positive shape
-  `forall x::ξ, t_k p̄ π̄` where:
-  - no member of the block occurs anywhere in `ξ` (no occurrence to the left of an
+  `forall x::ξ, t p̄ π̄` where:
+  - the family does not occur anywhere in `ξ` (no occurrence to the left of an
     arrow),
-  - `t_k` is applied to the block's own parameter locals, unchanged,
-  - `t_k`'s universe arguments are exactly the block's own,
-  - no member occurs in the indices `π̄`.
+  - `t` is applied to the family's own parameter locals, unchanged,
+  - `t`'s universe arguments are exactly the family's own,
+  - the family does not occur in the indices `π̄`.
 
-  Anything else — a negative occurrence, or a member under some other type
-  constructor — is rejected. Nested occurrences never reach here; §9 has already
-  turned them into extra members.
+  Anything else — a negative occurrence, or the family under some other type
+  constructor — is rejected. Neither a nested nor a mutual occurrence ever
+  reaches here: §9 has already turned both into an index of a single family.
 
-The result type must be `t_owner p̄ ī` for the member the constructor was declared
-for, with the same parameter and universe conditions, and with no member
-occurring in `ī`. A *recursive field* may land in any member of the block; the
-*result* may not.
+The result type must be `t p̄ ī`, with the same parameter and universe conditions,
+and with the family not occurring in `ī`.
 
 Field types are whnf'd before being peeled, so a field whose type is a definition
 that only unfolds to a function type is still analysed correctly.
 
 The "occurs in" of the classification is *syntactic*, and a syntactic occurrence
-can be one that reduction is about to erase: the specialised containers §9 builds
-routinely have fields like `(fun (x : T) => True) v`, where the block member `T`
+can be one that reduction is about to erase: the specialised containers §9.1
+builds routinely have fields like `(fun (x : T) => True) v`, where the family `T`
 survives only in the binder annotation of a redex. So whenever the syntactic
 check fires — on a field's type, or on a binder type inside `ξ` — the term is
 whnf'd and the check is asked again, and only an occurrence that survives
 reduction is treated as one. This can only accept fields that the syntactic
 reading would reject, and it accepts them because their types really are
-convertible to types the block does not occur in.
+convertible to types the family does not occur in.
 
 ### 8.5 Large elimination
 
-A block eliminates into an arbitrary `Sort` when either:
+The family eliminates into an arbitrary `Sort` when either:
 
-1. **every** member satisfies `isDefinitelyNonZero l_j` — none of them is a
-   proposition under any assignment. They share the motives, so the weakest
-   member decides; **or**
-2. the block has **exactly one** member and that member is a *subsingleton*: at
-   most one constructor, each of whose fields is either a proof or is recovered
-   from the result's indices. Formally, with the single constructor's shape
-   `sh`, every field `f` satisfies
+1. `isDefinitelyNonZero l` — it is not a proposition under any assignment; **or**
+2. it is a *subsingleton*: at most one constructor, each of whose fields is
+   either a proof or is recovered from the result's indices. Formally, with the
+   single constructor's shape `sh`, every field `f` satisfies
 
    ```
    isDefinitelyZero (sort of f)   ∨   f ∈ resultIndices(sh)
    ```
 
-   A member with **no** constructors satisfies this vacuously: an empty
+   A family with **no** constructors satisfies this vacuously: an empty
    proposition eliminates into anything.
 
 Case 2 is what makes `Eq.rec`, `And.rec` and `Acc.rec` large-eliminating while
 `Exists.rec` is not: `Exists.intro`'s witness is data that the result type
 `Exists p` does not mention, so it must not be allowed to escape.
 
-**The one-member side condition on case 2 is load-bearing.** The subsingleton
-licence is justified by reading the eliminator back as a function that recovers
-the constructor's fields from the major premise and its indices — proof
-irrelevance says there was nothing else to know. That argument is about *one*
-family. A mutual block's recursor also carries motives and minor premises for
-the block's other members, and their constructors' data is recovered from
-nothing; a `Prop`-valued member of a mutual block therefore gets small
-elimination even when its own constructor is a subsingleton. The rule is stated
-on the block *after* §9 has run, so a nested `Prop` loses the licence too, which
-is right: the container field it nests under is data.
+**Case 2 is a licence about one family, and now it is one by construction.** The
+subsingleton licence is justified by reading the eliminator back as a function
+that recovers the constructor's fields from the major premise and its indices —
+proof irrelevance says there was nothing else to know. That argument is about one
+family with one motive. When the core took mutual blocks, this case carried an
+explicit "the block has exactly one member" side condition, because a block's
+recursor also carries motives and minor premises for the *other* members, whose
+constructors' data is recovered from nothing. There is now only ever one motive,
+so the side condition has nothing left to exclude.
+
+It has not, however, been quietly dropped: §9.3 would otherwise hand a whole
+block the licence through the back door, since its flat family `F` *is* one
+family. Two things stop that. `F` collects every member's constructors, so a
+block with two constructors anywhere in it already fails "at most one
+constructor". And for the residue — a block whose members contribute one
+constructor between them — the flattening does not consult `F`'s answer at all:
+it gives the block's own recursors §8.5 case 1 and nothing more (§9.3.4). The
+rule is also applied after §9.1 has run, so a nested `Prop` loses the licence
+too, which is right: the container field it nests under is data.
 
 **"Is a proof" is read absolutely.** The field's sort must be zero under every
-assignment, not merely whenever the member itself lands in `Prop`. The weaker,
+assignment, not merely whenever the family itself lands in `Prop`. The weaker,
 relative reading `l' ≤ imax l' l` is tempting — it is what one reaches for to
 justify a universe-polymorphic structure with fields at `u` and `v` — but it is
 not the rule, and `refs/tests/good/tutorial/093_MaybeProp.mk.ndjson` settles it:
@@ -1065,35 +1086,36 @@ subsingleton test.
 
 ### 8.6 The `k` flag
 
-K-like reduction (§6.3) is available exactly when the block has **one** member,
-that member is `isDefinitelyZero`, and it has exactly **one** constructor with
-**zero** fields. This is the shape of `Eq`.
+K-like reduction (§6.3) is available exactly when the family is
+`isDefinitelyZero` and has exactly **one** constructor with **zero** fields. This
+is the shape of `Eq`. (The old "and the block has one member" clause is, again,
+structural now.)
 
 ### 8.7 Recursors
 
-One recursor per member:
+One recursor:
 
 ```
-T_j.rec.{u, l̄} : forall params,
-                 forall C::κ,           -- one motive per member of the block
-                 forall e::ε,           -- one minor premise per constructor of the block
-                 forall a::α_j,         -- the j-th member's indices
-                 forall (z : T_j params a),
-                 C_j a z
+T.rec.{u, l̄} : forall params,
+               forall (C : κ),          -- the motive
+               forall e::ε,             -- one minor premise per constructor
+               forall a::α,             -- the indices
+               forall (z : T params a),
+               C a z
 ```
 
 with
 
 ```
-κ_j = forall a::α_j, T_j params a -> Sort u
-ε_c = forall b::β, forall v::δ, C_owner(c) p̄[b] (c params b)
+κ   = forall a::α, T params a -> Sort u
+ε_c = forall b::β, forall v::δ, C p̄[b] (c params b)
 ```
 
 where the induction hypotheses `v` come after *all* the fields, one per recursive
-field, each stated with the motive of the member **that field lands in**:
+field:
 
 ```
-v_i : forall x::ξ_i, C_k π_i[b,x] (b_i x)
+v_i : forall x::ξ_i, C π_i[b,x] (b_i x)
 ```
 
 `u` is a fresh universe parameter under large elimination and `0` otherwise. Its
@@ -1101,19 +1123,20 @@ v_i : forall x::ξ_i, C_k π_i[b,x] (b_i x)
 derived type is literally the same term and comparisons are cheap; the name is
 cosmetic.
 
-The iota rule for constructor `c` of member `j`:
+The iota rule for constructor `c`:
 
 ```
-T_j.rec params C̄ ē p̄[b] (c params b)  ⟶  e_c b v̄
-    where  v_i = fun x::ξ_i => T_k.rec params C̄ ē π_i[b,x] (b_i x)
+T.rec params C ē p̄[b] (c params b)  ⟶  e_c b v̄
+    where  v_i = fun x::ξ_i => T.rec params C ē π_i[b,x] (b_i x)
 ```
 
-Note that an induction hypothesis calls the recursor of **its own** member, which
-is what makes a mutual block recurse across its types — and note that the prefix
-`params C̄ ē` is identical for every recursor of the block, which is why §6.3 can
-use one arithmetic for all of them.
+Right-hand sides are stored abstracted over `params, C, ē, fields`, in that order.
 
-Right-hand sides are stored abstracted over `params, C̄, ē, fields`, in that order.
+`RecInfo` still carries a motive *count*, which is now always 1 for a family the
+core admits. It is not vestigial: the recursors §9.3 derives for the members of a
+flattened block are one per member over a shared vector of motives, exactly as
+the export declares them, and §6.3's arithmetic reads the count off the recursor
+it is reducing rather than assuming either shape.
 
 ### 8.8 What the export must then agree with
 
@@ -1190,8 +1213,8 @@ with it — so that is literally what `Front.Lower` builds.
 3. **Rewrite.** Every occurrence in the block's own constructor types is replaced
    by the corresponding auxiliary member applied to the block's parameters.
 
-4. **Admit.** What remains is an ordinary flat mutual block, and §8 handles it
-   with no special cases.
+4. **Admit.** What remains is an ordinary flat mutual block, which §9.3 flattens
+   in turn and §8 then handles with no special cases.
 
 5. **Unnest.** After the recursors are derived, the internal names are replaced by
    the containers they stood for. An auxiliary is always applied to the block's
@@ -1214,12 +1237,13 @@ negative field, and the `ctor` judgement of §8.4 rejects it. There is no separa
 
 ### 9.3 Flattening a mutual block
 
-§8.1 explains why the core takes a mutual block as primitive rather than reducing
-it to a single indexed family: the reduction needs a tag type, and a tag type
-needs to be admitted first, and the obvious way to admit it is with the very rule
-one was trying to avoid. That objection is real but it is not fatal, because the
-tag type does not need the mutual rule — it is a plain enumeration-with-arguments.
-This section takes the reduction seriously and does it.
+§8.1 records why the core used to take a mutual block as primitive rather than
+reducing it to a single indexed family. The first objection was that the reduction
+needs a tag type, that a tag type needs to be admitted first, and that the obvious
+way to admit it is with the very rule one was trying to avoid. That objection is
+real but it is not fatal, because the tag type does not need the mutual rule — it
+is a plain enumeration-with-arguments. This section takes the reduction seriously
+and does it; §8.1 answers the other three objections.
 
 **Every** block is flattened, so `Kernel.Inductive` is only ever handed one type.
 The order is the one §9 already fixes: nesting is compiled first and flattening
@@ -1358,14 +1382,15 @@ of* it — is the load-bearing one, and §9.3.5 explains why.
 
 #### 9.3.2 What this buys
 
-**§8.3 stops being a rule.** The uniform-universe requirement — every member of a
-block lands in the same sort — is not checked here. It is *derived*, by step 3,
-from the ordinary typing rule for definitions, and the checker reports the failure
-in those terms. This is the fact the construction turns on: Lean's exporter only
-ever emits blocks whose members share a universe, and that is precisely the
-condition under which the flattening exists. §8.3's exemption for §9.1's
-auxiliaries goes with it — here they pay the rule too, which is the one place the
-fork is stricter than the core it replaces.
+**The uniform-universe rule stops being a rule.** Every member of a block lands
+in the same sort — that used to be a step of §8.3, checked directly, with an
+exemption for §9.1's auxiliaries. It is not checked here. It is *derived*, by
+step 3, from the ordinary typing rule for definitions, and the checker reports
+the failure in those terms. This is the fact the construction turns on: Lean's
+exporter only ever emits blocks whose members share a universe, and that is
+precisely the condition under which the flattening exists. The exemption goes
+with it — here the auxiliaries pay the rule too, which is one of the three places
+the front end is stricter than what it replaces (§9.3.4).
 
 **Iota is one derivation instead of `n`.** The block's recursors are read off
 `F.rec`'s single set of rules. The mutual recursion of §8.7 — an induction
@@ -1378,26 +1403,27 @@ whole rule. `F`, being one type, may qualify under case 2 where the block does
 not; the recursors are built at the block's licence and not at `F`'s, so nothing
 escapes.
 
-**The core never sees a mutual block.** Every `CoreBlock` reaching
-`Kernel.Inductive` has one member — the tag type, the flat type, or a declaration
-that was already a single type. So the core's mutual machinery — the per-member
-motive and minor-premise lists, `csOwner`, `roMember`, the `zip4` over members in
-`buildRecursors`, and step 3's uniform-universe check — now runs only at length
-one, and could be collapsed to scalars: `CoreBlock` would become a single family,
-`decideLargeElim`'s two cases would merge, and §8 would be a theory of one
-indexed family rather than of a block. That is left undone, deliberately, for two
-reasons.
+**The core became a theory of one indexed family.** Every `CoreInd` reaching
+`Kernel.Inductive` is a single family — the tag type, the flat type, or a
+declaration that was already one type. The core's mutual machinery was therefore
+running only at length one, and it has been deleted: §8.1 lists what went, and §8
+is now stated for one type throughout. `Kernel/Inductive.hs` went from 499 lines
+to 438, and `Front/Lower.hs` grew by 13 to hold the `CoreMember`-to-`CoreInd`
+conversion that used to be implicit, so the strip is worth about 48 lines net;
+against the pre-flattening kernel the module is 93 lines shorter. The flattening
+as a whole is still not a saving — it costs some 485 lines net against the mutual
+core it replaces — and the case for it is the three paragraphs above and §9.3.3,
+not the line count.
 
-The first is that the mutual path is the *reference* the flattening is checked
-against. Every claim §9.3 makes about the construction is backed by running both
-front ends over the same 1069 files and comparing verdicts; delete the mutual
-path and there is nothing left to compare to, and the flattening's correctness
-rests on this document alone. The second is that `F.rec` *is* the block's
-recursors packed into one, so the general form is what makes the derivation in
-step 5 legible: it is stated in the terms §8.7 states them in.
-
-Deleting it would remove no rule from the theory — only the generality in which
-the remaining rules are written.
+One thing was genuinely given up. For as long as both front ends existed, the
+mutual path was the *reference* the flattening was checked against: every claim
+§9.3 makes about verdicts was backed by running both over the same files and
+comparing. That comparison was run for the last time immediately before the
+deletion — 1069 files across `refs/tests`, `tests` and `validation`, 0 differing
+verdicts — and it can no longer be run from this tree. What is left as
+independent evidence is the three-layer audit chain of §9.3.3, which does not
+need a second implementation; recovering the stronger check means checking out
+the pre-flattening revision and diffing verdicts against it.
 
 **How often any of this happens.** Counts below are of *export blocks*, not of
 Lean `mutual` commands: one `{"inductive": ...}` line, classified by whether its
@@ -1957,10 +1983,11 @@ Two other places in a file reach the same procedure. A definition may state its
 type in one spelling and its value in another — `fun x => x` at the type
 `Sort (imax (max u v) w) → Sort (max (imax u w) (imax v w))` — and is accepted
 because those are two spellings of one level, case split by case split. And
-§8.3's uniform-universe rule compares the members of a mutual block up to the
-level equivalence of §3 rather than syntactically, so a block whose two members
-are declared at `max u v` and at `imax u (max u v)` is one block rather than a
-heterogeneous one.
+the uniform-universe requirement on a mutual block — now derived, by §9.3, from
+the typing of the definitions that give the block's members back their names —
+compares the members up to the level equivalence of §3 rather than syntactically,
+so a block whose two members are declared at `max u v` and at `imax u (max u v)`
+is one block rather than a heterogeneous one.
 
 ### 12.3 The quotient package is atomic
 
@@ -2368,10 +2395,11 @@ T.node : (n : Nat) -> List (T 0) -> T 0
 discovers `List (T 0)` (the container's parameter is closed with respect to bound
 variables, and a member occurs in it), adds one auxiliary member for it with
 `nil`- and `cons`-shaped constructors, and rewrites `T.node`'s field to mention
-the auxiliary. What reaches §8 is the flat mutual block `T` together with that
-auxiliary. Its `cons` field is `T 0`: a recursive occurrence of a block member,
-applied to an index in which no member of the block occurs, which is exactly and
-all that §8.4 asks. The block is strictly positive, it is admitted with no
+the auxiliary. What reaches §9.3 is the flat mutual block `T` together with that
+auxiliary, and what reaches §8 is that block flattened. Its `cons` field is
+`T 0`: a recursive occurrence of a block member, applied to an index in which no
+member of the block occurs, which is exactly and all that §8.4 asks of the
+flattened family. The block is strictly positive, it is admitted with no
 special case, and the two recursors the file declares are checked against the two
 the construction derives.
 
@@ -2395,8 +2423,7 @@ One detail of the same family is worth naming separately, because it is a
 divergence about equality rather than about nesting. A constructor may state its
 result index as a closed term that is only *convertible* to the index the
 recursor's minor premises use — `T.node ... : T (List.length [])` against a
-recursor written at `T 0`. §8.4 asks only that no member of the block occur in
-the index, so the constructor is analysed as written; the derived recursor
+recursor written at `T 0`. §8.4 asks only that the family not occur in the index, so the constructor is analysed as written; the derived recursor
 carries `List.length []` where the export carries `0`; and §8.8 compares the two
 up to definitional equality, which is what the rest of this kernel does
 everywhere else and what makes the comparison meaningful rather than syntactic.

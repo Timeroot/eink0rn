@@ -499,29 +499,47 @@ elimHint recLpss indLps = case [ h | (h : t) <- recLpss
   (h : _) -> h
   _       -> str "u"
 
+-- | One member of a block, before the block is compiled away.
+--
+-- The core has no notion of a block any more (SPEC.md §9.3), so this is the
+-- front end's own bookkeeping: everything §9.1 and §9.3 need to know about a
+-- family they are on their way to handing over as a 'CoreInd'.
+data CoreMember = CoreMember
+  { cmName    :: !Name
+  , cmArity   :: !Expr             -- ^ @forall params indices, Sort l@
+  , cmCtors   :: ![(Name, Expr)]   -- ^ in constructor-index order
+  , cmRecName :: !Name
+  }
+
+-- | Hand one member to the core.
+coreOf :: [Name] -> Int -> Name -> CoreMember -> CoreInd
+coreOf lvls nps hint m = CoreInd
+  { coreLevels    = lvls
+  , coreNumParams = nps
+  , coreName      = cmName m
+  , coreArity     = cmArity m
+  , coreCtors     = cmCtors m
+  , coreRecName   = cmRecName m
+  , coreElimHint  = hint
+  }
+
 -- | Admit a block that is already a single inductive type with no nesting:
 -- hand it to "Kernel.Inductive" as it stands.
 --
--- This is the only place the core is asked to admit a block the file wrote,
--- and it is a block of one member.  Everything else goes through
--- 'flattenBlock', which calls the core twice, each time on one member it built
--- itself.
+-- This is the only place the core is asked to admit a type the file wrote as
+-- the file wrote it.  Everything else goes through 'flattenBlock', which calls
+-- the core twice, each time on a type it built itself.
 singleBlock :: Env -> [[ExCtor]] -> [CoreMember] -> [Name] -> Int -> [ExRec]
             -> Either String BlockResult
 singleBlock env groups declMembers lvls nps recs = do
-      ab <- admitBlock env CoreBlock
-        { cbLevels      = lvls
-        , cbNumParams   = nps
-        , cbMembers     = declMembers
-        , cbNumDeclared = 1
-        , cbElimHint    = elimHint (map exrLevels recs) lvls
-        }
-      (ind, cs, r) <- case (abInds ab, abCtors ab, abRecs ab) of
-        ([i], [c], [rr]) -> Right (i, c, rr)
-        _ -> Left "internal: a one-type block did not come back as one type"
-
-      let ourCs = [ ci { ctorType = excType c }
-                  | (ci, c) <- zip cs (concat groups) ]
+      m <- case declMembers of
+        [x] -> Right x
+        _   -> Left "internal: a single-type block with more than one member"
+      ai <- admitInd env (coreOf lvls nps (elimHint (map exrLevels recs) lvls) m)
+      let ind = aiInd ai
+          r   = aiRec ai
+          ourCs = [ ci { ctorType = excType c }
+                  | (ci, c) <- zip (aiCtors ai) (concat groups) ]
       envInd <- foldM addConst env
         (CInd ind : map CCtor ourCs ++ [CRec r])
       case find ((== recName r) . exrName) recs of
@@ -532,7 +550,7 @@ singleBlock env groups declMembers lvls nps recs = do
         , brIndices = [indNumIndices ind]
         , brFields  = [map ctorNumFields ourCs]
         , brRec     = indIsRecursive ind
-        , brRefl    = or (abReflexive ab)
+        , brRefl    = aiReflexive ai
         }
 
 -- | A boolean the export restates that the kernel also derives.
@@ -771,17 +789,13 @@ flattenBlock env0 groups declMembers auxMembers nested paramTele nDecl
       pure (fnIdxCtor fn k, t)
     pure CoreMember { cmName = fnIdx fn, cmArity = ar, cmCtors = cs
                     , cmRecName = fnIdxRec fn }
-  abIdx <- admitBlock env0 CoreBlock
-    { cbLevels = lvls, cbNumParams = nps, cbMembers = [idxDecl]
-    , cbNumDeclared = 1, cbElimHint = str "u" }
+  aiIdx <- admitInd env0 (coreOf lvls nps (str "u") idxDecl)
   -- 'idxRecUs' below assumes this shape: a fresh elimination universe, then the
   -- block's own.  It holds because 'tagLvl' is a successor.
-  case abRecs abIdx of
-    [r] | length (recLevels r) == 1 + length lvls -> Right ()
-    _ -> Left (ctxt ++ "internal: the tag type does not eliminate into every sort")
+  unless (length (recLevels (aiRec aiIdx)) == 1 + length lvls) $
+    Left (ctxt ++ "internal: the tag type does not eliminate into every sort")
   envIdx <- foldM addConst env0
-    (map CInd (abInds abIdx) ++ map CCtor (concat (abCtors abIdx))
-                             ++ map CRec (abRecs abIdx))
+    (CInd (aiInd aiIdx) : map CCtor (aiCtors aiIdx) ++ [CRec (aiRec aiIdx)])
 
   -- 3. The flat type, and the block's own constructors re-headed at it.
   (flatCtorTys, flatDecl) <- runTC envIdx lvls $ withLocals paramTele $ \ps -> do
@@ -800,12 +814,11 @@ flattenBlock env0 groups declMembers auxMembers nested paramTele nDecl
         pure (cn, t)
     pure (cs, CoreMember { cmName = fnTy fn, cmArity = ar
                          , cmCtors = concat cs, cmRecName = fnTyRec fn })
-  ab <- admitBlock envIdx CoreBlock
-    { cbLevels = lvls, cbNumParams = nps, cbMembers = [flatDecl]
-    , cbNumDeclared = 1, cbElimHint = elimHint (map exrLevels recs) lvls }
-  (indF, ctorFs, recF) <- case (abInds ab, abCtors ab, abRecs ab) of
-    ([i], [cs], [r]) -> Right (i, cs, r)
-    _ -> Left (ctxt ++ "internal: the flat block is not a single type")
+  aiF <- admitInd envIdx
+           (coreOf lvls nps (elimHint (map exrLevels recs) lvls) flatDecl)
+  let indF   = aiInd aiF
+      ctorFs = aiCtors aiF
+      recF   = aiRec aiF
   envF <- foldM addConst envIdx [CInd indF, CRec recF]
 
   -- 4. Each member stands in as @fun p a => F p (Idx.mk_j p a)@ for as long as
@@ -1049,7 +1062,7 @@ flattenBlock env0 groups declMembers auxMembers nested paramTele nDecl
     , brIndices = take nDecl nIdxs
     , brFields  = map (map ctorNumFields) ourCs
     , brRec     = indIsRecursive indF
-    , brRefl    = or (abReflexive ab)
+    , brRefl    = aiReflexive aiF
     }
 
 -- | Beta-reduce a term's leading lambdas against the given arguments.
