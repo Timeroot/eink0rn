@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 -- | A minimal JSON reader, just enough for the lean4export NDJSON format.
 --
 -- Deliberately dependency-free: the whole point of this checker is that the
@@ -184,24 +185,49 @@ asObject v        = Left ("expected object, got " ++ kindOf v)
 -- then every reader downstream is free to invent a default for it — and the
 -- fields most likely to go missing (@isUnsafe@, @binderInfo@, @safety@) are
 -- exactly the ones whose default a forger would like to choose.
+-- The exporter writes a record's fields in the order the format defines them,
+-- so the check that succeeds on essentially every line is a pairwise walk down
+-- two lists.  Everything else -- the permuted-but-valid case included -- falls
+-- through to 'audit', which is the whole rule, written out.
 record :: [String] -> Json -> Either String [(B.ByteString, Json)]
 record ks v = do
   o <- asObject v
-  let got   = map fst o
-      want  = map B.pack ks
-      dups  = [k | k <- nub got, length (filter (== k) got) > 1]
-      miss  = [k | k <- want, k `notElem` got]
-      extra = [k | k <- nub got, k `notElem` want]
-  if null dups && null miss && null extra
-    then Right o
-    else Left (intercalate "; " (concat
-           [ report "repeated"   dups
-           , report "missing"    miss
-           , report "unexpected" extra ]))
+  if inOrder ks (map fst o) then Right o else audit o
   where
+    inOrder (k : ks') (g : gs) = sameKey g k && inOrder ks' gs
+    inOrder []        []       = True
+    inOrder _         _        = False
+
+    audit o =
+      let got   = map fst o
+          want  = map B.pack ks
+          dups  = [k | k <- nub got, length (filter (== k) got) > 1]
+          miss  = [k | k <- want, k `notElem` got]
+          extra = [k | k <- nub got, k `notElem` want]
+      in if null dups && null miss && null extra
+           then Right o
+           else Left (intercalate "; " (concat
+                  [ report "repeated"   dups
+                  , report "missing"    miss
+                  , report "unexpected" extra ]))
+
     report _ []  = []
     report w [k] = [w ++ " field " ++ show (B.unpack k)]
     report w kss = [w ++ " fields " ++ intercalate ", " (map (show . B.unpack) kss)]
+
+-- | Does an object key spell out this literal?
+--
+-- 'record' and 'field' run once per field of every line, which on a large
+-- export is tens of millions of times, and the literals they are given are
+-- 'String's.  Packing each one into a 'B.ByteString' just to compare it cost
+-- about six per cent of a run over @init@; comparing in place costs no
+-- allocation at all.
+sameKey :: B.ByteString -> String -> Bool
+sameKey b = go 0
+  where
+    n = B.length b
+    go !i (c : cs) = i < n && B.index b i == c && go (i + 1) cs
+    go !i []       = i == n
 
 -- | The keys of an object that are not in @ignoring@. Used to find the one tag
 -- that says what a line is, with the pool-index keys set aside.
@@ -209,12 +235,16 @@ tagsOf :: [String] -> [(B.ByteString, Json)] -> [String]
 tagsOf ignoring o = [k | (kb, _) <- o, let k = B.unpack kb, k `notElem` ignoring]
 
 field :: [(B.ByteString, Json)] -> String -> Either String Json
-field o k = case lookup (B.pack k) o of
+field o k = case optField o k of
   Just v  -> Right v
   Nothing -> Left ("missing field " ++ show k)
 
 optField :: [(B.ByteString, Json)] -> String -> Maybe Json
-optField o k = lookup (B.pack k) o
+optField o k = go o
+  where
+    go ((kb, v) : rest) | sameKey kb k = Just v
+                        | otherwise    = go rest
+    go []                              = Nothing
 
 asInt :: Json -> Either String Integer
 asInt (JInt n) = Right n

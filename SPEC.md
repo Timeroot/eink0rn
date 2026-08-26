@@ -1307,10 +1307,10 @@ own constants off them, and throws the scratch environment away.
    T_j := fun p̄ ā => F p̄ (Idx.mk_j p̄ ā)      : ∀ p̄, α_j, Sort l
    ```
 
-   checked at the arity the file declared. This is where §8.3's uniform-universe
-   rule is paid for instead of assumed: `F` lands in whatever sort the *first*
-   member does, and this definition typechecks only if the `j`-th member lands
-   there too.
+   checked at the arity the file declared. This is where the uniform-universe
+   rule §8.3 used to state is paid for instead of assumed: `F` lands in whatever
+   sort the *first* member does, and this definition typechecks only if the
+   `j`-th member lands there too.
 
 4. **The constructors, at the types the file wrote.** Two rewrites stand between
    the type `F`'s constructor was admitted at and the type the file declared, so
