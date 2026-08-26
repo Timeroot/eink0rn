@@ -1721,8 +1721,8 @@ of them fire on real Lean output:
   a kept flat form it is headed by `π.ty`. `cslib` rejects at
   `Lean.Meta.Grind.AC.DiseqCnstr.lhs`: *expected a value of type
   `Lean.Meta.Grind.AC.DiseqCnstr`, got `π.ty (π.idx.mk.0 …)`*. This is not a
-  corner: 7 of cslib's 9 flattenable blocks and 7 of mathlib's 10 have a member
-  with one constructor and no indices.
+  corner: of the blocks the construction applies to at all — 9 in cslib, 10 in
+  mathlib — 7 in each have a member with one constructor and no indices.
 - **§9.1's container lookup.** Deciding whether a *later* block is nested means
   finding an already-admitted inductive type in its constructors and reading off
   that type's arity and constructor list. A member of a kept-flat block is not
@@ -1743,11 +1743,11 @@ The construction only ever applies to a block §9.1 left alone, because `applyAu
 has to substitute a real container into a recursor's type and rules and a
 definition's body is not something that substitution may rewrite (§9.3.5, same
 argument in the other direction). So the fold survives for the nested majority
-regardless — 41 of cslib's 50 flattened blocks and 41 of mathlib's 51 — and
-nothing is deleted, only branched. And the reach is nil where it would be
-measured: `init` and `std` contain **no** block with more than one declared type,
-so the performance question the construction raises is answered by construction,
-not by a stopwatch.
+regardless — of the 50 blocks cslib flattens and the 51 mathlib flattens, 41 in
+each are nested — and nothing is deleted, only branched. And the reach is nil
+where it would be measured: `init` and `std` contain **no** block with more than
+one declared type, so the performance question the construction raises is
+answered by construction, not by a stopwatch.
 
 What does survive from the attempt is its safety argument, and it survives
 without it. The point of typechecking `T_j.rec`'s body was to put something
