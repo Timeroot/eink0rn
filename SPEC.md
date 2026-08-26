@@ -51,6 +51,11 @@ index counts, same `k` flag, definitionally equal type, and one definitionally
 equal reduction rule per constructor with no rules left over. An export cannot
 smuggle in an unwarranted large elimination, an extra iota rule, or a bogus `k`.
 
+Agreeing with us is necessary and not sufficient: two independently derived rules
+can be wrong in the same way, and a comparison would not notice. So every rule
+the kernel derives is also typechecked against the type its own left-hand side
+has, which is a claim about that rule alone and not about the exporter (§8.9).
+
 The same holds for the block's *shape*: the set of recursor names in a block must
 be exactly `{T.rec | T declared}` plus the auxiliaries nesting introduced (§9), so
 an extra eliminator cannot be parked alongside the justified ones.
@@ -1167,6 +1172,38 @@ matched to the derived recursor's positionally, so a repeated name would make
 that substitution ambiguous — `rec.{u,u}` could be read as either projection —
 and the comparison would be deciding a question the file did not ask.
 
+### 8.9 The rules must typecheck
+
+Everything above is a check on a recursor's *type*: §8.7 derives it, typechecks
+it, and §8.8 requires the export to declare the same one. Its reduction rules
+get none of that. They are terms the kernel builds and then believes, and §8.8's
+comparison is not a substitute, because it compares two terms neither of which
+anything has typechecked: it catches the exporter disagreeing with us, and says
+nothing whatever about the two of us being wrong together.
+
+So each rule is checked on its own terms. For a recursor `t.rec` with parameters
+`p̄`, motives `C̄`, minor premises `ē`, and a rule for constructor `c` with
+fields `b̄`:
+
+> reconstruct the left-hand side `t.rec p̄ C̄ ē ā (c q̄ b̄)`, where `ā` are the
+> indices `c q̄ b̄` actually has; infer its type; and require
+>
+> `rhs p̄ C̄ ē b̄  :  that type`.
+
+If the rule's right-hand side is not of the type its own left-hand side has,
+then iota does not preserve typing and everything downstream of it is worthless,
+whatever the exporter happened to write. This is checked for every recursor of
+every block, on both admission paths.
+
+The indices and the constructor's own parameters `q̄` are read off the major
+premise's type rather than assumed to be the recursor's. They need not be: §9.1
+replaces an auxiliary member's constructors by the real container's on the way
+out, so an auxiliary recursor's rules are for `List.cons` at `List`'s parameters,
+not for anything the block declared. Doing it this way is what turns the check
+into a test of §9.1's transport as well — the substitution asserts that the
+specialised copy may be retyped at the container, and here that assertion has to
+typecheck.
+
 ---
 
 ## 9. Nested inductives
@@ -1497,24 +1534,27 @@ else happens once per reduction step.
 
 The thing to audit is the by-hand fold of step 5: about sixty lines that rewrite,
 outside the core, terms the core built, and whose correctness is implied by
-nothing the core checked. Three things stand behind it, in increasing order of
+nothing the core checked. Four things stand behind it, in increasing order of
 what they catch.
 
 - Step 6's *nothing invented survives* test. Cheap, and it catches a fold step
   that failed to fire: whatever it should have rewritten is still sitting there
   under a name the final environment does not have.
 - Step 7's typecheck of each derived recursor *type* in the final environment.
-- §8.8's comparison of each derived reduction *rule* against the one the file
+- §8.9's typecheck of each derived reduction *rule*.
+- §8.8's comparison of each derived reduction rule against the one the file
   declares, up to definitional equality.
 
-The last is the one that carries the weight, and it is worth being clear that
-this is not special pleading for the flattening: **no** path in this kernel
-independently typechecks a recursor's right-hand side. On the classic path the
-right-hand side is correct because `mkRule` built it; here it is correct because
-`mkRule` built it and the fold is claimed to be identity-preserving on it. The
-claim is what §8.8 tests, on every recursor of every file, and a fold step that
-fires wrongly produces a right-hand side that is not definitionally equal to
-Lean's.
+An earlier edition of this section said that the last of these was the one
+carrying the weight, and that this was not special pleading for the flattening
+because **no** path in the kernel independently typechecked a recursor's
+right-hand side. The observation was correct and the situation it described was
+not defensible: §8.8 compares two terms neither of which anything has
+typechecked, so it says nothing at all about a rule that both this kernel and
+the exporter got wrong in the same way, and the only thing it really rules out
+is a *disagreement*. §8.9 now typechecks every rule of every recursor, derived
+or folded, against the type its own left-hand side has. That is an absolute
+check and not a relative one, and it is what the fold now has to survive.
 
 #### 9.3.4 Deliberate divergences
 

@@ -547,6 +547,7 @@ singleBlock env groups declMembers lvls nps recs = do
                   | (ci, c) <- zip (aiCtors ai) (concat groups) ]
       envInd <- foldM addConst env
         (CInd ind : map CCtor ourCs ++ [CRec r])
+      checkRecRules envInd r
       case find ((== recName r) . exrName) recs of
         Nothing -> Left ("no exported recursor named " ++ showName (recName r))
         Just rv -> checkRecursorMatches envInd [indName ind] rv r
@@ -645,6 +646,78 @@ checkRecursorMatches env allInds rv r = do
                    ++ " is not the one iota gives\n  declared "
                    ++ showExpr (theirs (exuRhs ru))
                    ++ "\n  derived  " ++ showExpr (rrRhs our))
+
+-- | Typecheck a recursor's reduction rules: for each one, the right-hand side
+-- must have the type the left-hand side has.
+--
+-- Every other check on a recursor is a check on its /type/.  §8.7 derives it and
+-- typechecks it, §9.3 folds it and typechecks it again, and §8.8 requires the
+-- export to declare the same one.  The reduction rules get none of that: they
+-- are terms this kernel builds and then believes, and the only thing standing
+-- behind them is §8.8's comparison against the rules the export declares --
+-- which is a comparison of two untypechecked terms, and says nothing at all if
+-- both were built the same wrong way.
+--
+-- Nothing about the construction makes this superfluous.  A recursor whose rule
+-- is ill-typed at the type its own left-hand side has is a recursor whose iota
+-- rule does not preserve typing, and a kernel that admits one is unsound
+-- whatever else it checked.  So: reconstruct the left-hand side from the
+-- constructor, infer its type, and check the right-hand side against it.
+--
+-- The constructor is not necessarily the one the block declared.  §9.1's
+-- unnesting replaces an auxiliary's constructors by the real container's, so an
+-- auxiliary recursor's rules are for @List.cons@ and not for a constructor of
+-- the block -- with @List@'s parameters, not the block's.  So the parameters
+-- are read off the major premise's own type rather than assumed to be the
+-- recursor's, which is also what makes this a real check on the transport:
+-- §9.1 asserts that the specialised copy may be retyped at the container, and
+-- here that assertion has to typecheck.
+checkRecRules :: Env -> RecInfo -> Either String ()
+checkRecRules env r =
+  either (\e -> Left ("the reduction rules of " ++ showName (recName r)
+                      ++ " do not typecheck: " ++ e))
+         (const (Right ())) $
+  runTC env (recLevels r) $ do
+    let us   = map LParam (recLevels r)
+        npre = recNumParams r + recNumMotives r + recNumMinors r
+        (tele, _) = unPisN (npre + recNumIndices r + 1) (recType r)
+    unless (length tele == npre + recNumIndices r + 1) $
+      throwTC "internal: its type does not have the telescope it says it has"
+    withLocals tele $ \xs -> do
+      let preArgs = map FVar (take npre xs)
+      majTy <- whnf =<< localType (last xs)
+      (ind, indUs, indArgs) <- case unApps majTy of
+        (Const c cus, as) -> getEnv >>= \e' -> case lookupConst e' c of
+          Just (CInd i) -> pure (i, cus, as)
+          _ -> throwTC ("internal: the major premise is not of an inductive type, \
+                        \but of " ++ showExpr majTy)
+        _ -> throwTC ("internal: the major premise has no head constant, its type \
+                      \is " ++ showExpr majTy)
+      let realPs = take (indNumParams ind) indArgs
+      forM_ (recRules r) $ \ru -> do
+        ci <- getEnv >>= \e' -> case lookupConst e' (rrCtor ru) of
+          Just (CCtor c) -> pure c
+          _ -> throwTC (showName (rrCtor ru) ++ " is not a constructor")
+        unless (ctorInduct ci == indName ind) $
+          throwTC (showName (rrCtor ru) ++ " is not a constructor of "
+                   ++ showName (indName ind))
+        unless (ctorNumFields ci == rrNumFields ru) $
+          throwTC ("the rule for " ++ showName (rrCtor ru) ++ " claims "
+                   ++ show (rrNumFields ru) ++ " fields, but the constructor has "
+                   ++ show (ctorNumFields ci))
+        cty <- instParams (indNumParams ind) realPs
+                 (instLevelsE (ctorLevels ci) indUs (ctorType ci))
+        withLocals (fst (unPisN (rrNumFields ru) cty)) $ \bs -> do
+          let major = mkApps (Const (rrCtor ru) indUs) (realPs ++ map FVar bs)
+          mty <- whnf =<< infer major
+          let ixs = drop (indNumParams ind) (snd (unApps mty))
+          unless (length ixs == recNumIndices r) $
+            throwTC ("applying " ++ showName (rrCtor ru) ++ " gives "
+                     ++ show (length ixs) ++ " indices, expected "
+                     ++ show (recNumIndices r))
+          want <- infer (mkApps (Const (recName r) us)
+                                    (preArgs ++ ixs ++ [major]))
+          checkType (instLams (preArgs ++ map FVar bs) (rrRhs ru)) want
 
 -- Flattening a mutual block ------------------------------------------------------------
 --
@@ -1050,11 +1123,12 @@ flattenBlock env0 groups declMembers auxMembers nested paramTele nDecl
                                     (take nDecl (regroup nCtors ctorFs)) ]
   envInd <- foldM addConst env0
     (map CInd ourInds ++ map CCtor (concat ourCs) ++ map CRec ourRs)
-  forM_ ourRs $ \r ->
+  forM_ ourRs $ \r -> do
     either (\e -> Left ("recursor " ++ showName (recName r)
                         ++ " does not typecheck after flattening: " ++ e))
            (const (Right ()))
            (runTC envInd (recLevels r) (inferSortOf (recType r)))
+    checkRecRules envInd r
   forM_ ourRs $ \r -> case find ((== recName r) . exrName) recs of
     Nothing -> Left ("no exported recursor named " ++ showName (recName r))
     Just rv -> checkRecursorMatches envInd declNames rv r
