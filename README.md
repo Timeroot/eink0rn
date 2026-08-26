@@ -25,8 +25,10 @@ format offers rather more than a type theory needs: binder annotations, metadata
 theorems, opaque definitions, nested inductive types, exported recursors with
 their reduction rules. `Front.Export` and `Front.Lower` reduce all of that to a
 core of five kinds of constant and eleven expression formers, and only then does
-the kernel run. Nested inductives are compiled into flat mutual blocks (SPEC §9),
-so the positivity checker never sees a nested occurrence. Recursors are not
+the kernel run. Nested inductives are compiled into flat mutual blocks, and every
+mutual block is then flattened into a single indexed family (SPEC §9), so the
+core sees neither a nested occurrence nor a mutual one — it is a theory of one
+inductive type, and one recursor. Recursors are not
 believed — they are re-derived from the inductive specification and the exported
 ones are required to match (SPEC §1, §8.7), so an export cannot smuggle in an
 unwarranted large elimination or an extra iota rule.
@@ -117,10 +119,10 @@ src/Kernel/Env       the environment: five kinds of constant
 src/Kernel/Cache     the mutable hash table the memo tables are made of
 src/Kernel/Canon     stored canonical forms, for the arithmetic licence and --pin-std
 src/Kernel/Check     inference, reduction, and definitional equality
-src/Kernel/Inductive admitting an inductive block, and deriving its recursor
+src/Kernel/Inductive admitting one inductive family, and deriving its recursor
 src/Front/Json       a JSON reader, streaming, for files larger than memory
 src/Front/Export     the NDJSON pools and the declaration schema
-src/Front/Lower      surface to core, including the nesting compilation
+src/Front/Lower      surface to core: the nesting compilation, and the flattening
 app/Main.hs          the command line
 ```
 

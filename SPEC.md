@@ -1469,8 +1469,20 @@ otherwise collide with them inside the scratch environment.
 What remains is one extra inductive admission per flattened block (the tag type),
 a second admission of the block itself in re-indexed form, and a second typecheck
 of each derived recursor type in the final environment. On `init` and `std`, where
-one and three blocks respectively are affected, that is not measurable against
-run-to-run noise.
+one and three blocks respectively are affected, it is not measurable — and the
+measurement to make is of *allocation*, which for a single-threaded run of a
+deterministic program is a deterministic number, rather than of wall clock, which
+on a shared machine varies by several per cent between runs of the same binary.
+Total bytes allocated over `init` moves from 227,386,318,400 before the fork to
+227,379,978,936 after it, three thousandths of a per cent, in the noise of nothing
+at all. That is what the table above predicts: 587 of `init`'s 588 blocks are
+single types that go straight through, and the flattening never runs on them.
+
+A cost-centre profile of the same run says the same thing from the other side:
+there is no inductive-admission entry in it. Admitting the types of a file, which
+is where every rule of §8 and every line of §9.3 is spent, does not appear among
+the costs of checking one, because it happens once per declaration and everything
+else happens once per reduction step.
 
 The thing to audit is the by-hand fold of step 5: about sixty lines that rewrite,
 outside the core, terms the core built, and whose correctness is implied by

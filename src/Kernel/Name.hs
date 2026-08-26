@@ -1,3 +1,4 @@
+{-# LANGUAGE MagicHash       #-}
 {-# LANGUAGE PatternSynonyms #-}
 -- | Hierarchical names.
 --
@@ -35,18 +36,51 @@ module Kernel.Name
 import           Data.Bits             (xor)
 import qualified Data.ByteString.Char8 as B
 import           Data.List             (intercalate)
+import           GHC.Exts              (isTrue#, reallyUnsafePtrEquality#)
 
 -- | The @Int@ each compound constructor carries is the cached hash.
 --
--- Deriving 'Eq' is still structural equality, since equal names hash equally;
--- the hash just decides most comparisons on its own.  Deriving 'Ord' orders by
--- hash first, which is not alphabetical but is a perfectly good total order --
--- names are only ever compared to key a map.
+-- 'Ord' is derived, which orders by hash first: not alphabetical, but a
+-- perfectly good total order, and names are only ever compared to key a map.
 data Name
   = XAnon
   | XStr !Int !Name !B.ByteString
   | XNum !Int !Name !Integer
-  deriving (Eq, Ord)
+  deriving (Ord)
+
+-- | Structural equality, which is what the derived instance would be, with a
+-- pointer test in front of each case.
+--
+-- Unequal names are settled by the cached hash, which is what it is for.  Equal
+-- names are the expensive case, and they are also the case that is usually the
+-- same object: the export format interns names in a pool, so every reference to
+-- @Nat.succ@ in a file is the very same 'Name', and the constant the reduction
+-- hot path looks up is pointer-equal to the key stored in the environment.  A
+-- pointer test settles that in one instruction instead of walking the chain and
+-- comparing a 'B.ByteString' at every link.  It is only ever a fast path: a
+-- @False@ from it means nothing, and the walk still runs.  Recursing through
+-- @(==)@ retries the test at every link, so a fresh @Foo.rec@ built by the
+-- kernel still stops at its pooled @Foo@.
+--
+-- The test comes *after* the match, not before it.  Writing it in front of the
+-- whole instance -- @ptrEq a b || slow a b@ -- costs half a per cent of the
+-- allocation of a run over @init@, because the arguments then have to be boxed
+-- for a function that does not scrutinise them.
+--
+-- 'Kernel.Expr.Expr' does the same thing with the same two tests.  The pointer
+-- primitive is spelled out again here rather than shared, because "Kernel.Expr"
+-- imports this module for 'nameHash'.
+instance Eq Name where
+  XAnon == XAnon = True
+  x@(XStr h1 p1 s1) == y@(XStr h2 p2 s2) =
+    ptrEq x y || (h1 == h2 && s1 == s2 && p1 == p2)
+  x@(XNum h1 p1 i1) == y@(XNum h2 p2 i2) =
+    ptrEq x y || (h1 == h2 && i1 == i2 && p1 == p2)
+  _ == _ = False
+
+ptrEq :: Name -> Name -> Bool
+ptrEq a b = isTrue# (reallyUnsafePtrEquality# a b)
+{-# INLINE ptrEq #-}
 
 nameHash :: Name -> Int
 nameHash XAnon        = 0
