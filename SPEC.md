@@ -1271,20 +1271,35 @@ recursion on one type.
 **Elimination is decided by §8.5 case 1 alone.** For a block of two or more
 members case 2 never applies anyway, so `isDefinitelyNonZero l` is the whole rule.
 
-**How often any of this happens.** Mutual blocks are rare, and blocks this can
-flatten are rarer:
+**How often any of this happens.** Counts below are of *export blocks*, not of
+Lean `mutual` commands: one `{"inductive": ...}` line, classified by whether its
+`types` array holds more than one entry and whether any member declares
+`numNested > 0`. The two are independent, and only the first is what §9.3
+branches on.
 
-| corpus | inductive blocks | mutual | of those, nested | flattened | member counts |
-|---|---|---|---|---|---|
-| `init` | 588 | 0 | 0 | 0 | — |
-| `std` | 908 | 0 | 0 | 0 | — |
-| `cslib` | 4336 | 12 | 3 | 9 | 2×6, 3×2, 7×1 |
-| `mathlib` | 6644 | 13 | 3 | 10 | 2×8, 3×1, 7×1 |
+| corpus | blocks | single-type | single, nested | multi-type | multi, nested | flattened | member counts |
+|---|---|---|---|---|---|---|---|
+| `init` | 588 | 588 | 1 | 0 | 0 | 0 | — |
+| `std` | 908 | 908 | 3 | 0 | 0 | 0 | — |
+| `cslib` | 4336 | 4324 | 38 | 12 | 3 | 9 | 2×6, 3×2, 7×1 |
+| `mathlib` | 6644 | 6631 | 38 | 13 | 3 | 10 | 2×8, 3×1, 7×1 |
 
-So `init` and `std` bound the fork's cost on the *common* path and say nothing
-about the flattening itself; and the validation corpus, where a hundred-odd files
-declare a mutual block on purpose, is where the construction is actually
-exercised.
+Nesting does **not** enlarge the block: every multi-type block in all four
+corpora consists of types the user declared (`EqCnstr`/`EqCnstrProof`,
+`ExBase`/`ExProd`/`ExSum`, `Lean.IR.Alt`/`FnBody`, ...), never of an
+`_nested`-style auxiliary. A nested-but-not-mutual declaration such as
+`inductive A : Prop | mk : Nonempty A -> A` arrives as a *single-type* block
+carrying `numNested = 1`, and is compiled by §9.1 exactly as before.
+
+The three multi-type blocks per corpus that also nest are skipped by the `null
+nested` guard, and they are the large ones:
+`Lean.Compiler.LCNF.{Alt,FunDecl,Cases,Code}` (4 members, 8 nested occurrences),
+`Lean.IR.{Alt,FnBody}` (2 / 4), and `Lean.Meta.Grind.Arith.Cutsat.*` (12 / 108).
+So the flattened fraction is 9 of 12 by count but distinctly the easier 9.
+
+`init` and `std` bound the fork's cost on the *common* path and say nothing about
+the flattening itself; the validation corpus, where a hundred-odd files declare a
+mutual block on purpose, is where the construction is actually exercised.
 
 #### 9.3.3 What it costs
 
