@@ -1730,7 +1730,21 @@ on real Lean output:
   all and is rejected for disagreeing with its own `numNested`. Two cases in the
   validation corpus are exactly this shape.
 
-Serving either one means carrying each member's arity, constructor list and
+Three more rules have the same shape and are latent rather than harmless: the
+`proj` rule of §6.1 matches the constructor's own inductive type against the name
+the projection carries — the very side condition §6.1 says matters — and K-like
+reduction and structure eta on the major premise (both §6.3) match the premise's
+inferred head against the recursor's inductive type. None fires on these corpora:
+every pure-mutual member in `cslib` and `mathlib` is recursive, so eta is
+unavailable regardless, and none is K-eligible. The first non-recursive
+struct-like member in a mutual block reaches all three, and the `proj` one fails
+*silently* — the projection does not reduce, where §5.3 at least rejects. Note
+that ι itself is not on this list: the file's constructors stay constructors
+under the kept flat form, and §6.3 splits a major premise by its rule's field
+count without asking which type it constructs, so `F.rec` reduces on them
+unchanged.
+
+Serving any of them means carrying each member's arity, constructor list and
 structure-likeness in a table beside the environment and consulting it wherever
 `CInd` is consulted today — which is the `envFlat`/`envUnflat` indirection
 §9.3.5 records the earlier fork needing and this one being rid of. That is not a
