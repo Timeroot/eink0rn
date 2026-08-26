@@ -14,7 +14,7 @@
 -- pattern synonyms and the real constructors stay private.
 module Kernel.Name
   ( Name
-  , pattern Anon, pattern Str, pattern Num
+  , pattern Anon, pattern Str, pattern Num, pattern Priv
   , nameHash
   , hashMix
   , anon
@@ -40,12 +40,20 @@ import           GHC.Exts              (isTrue#, reallyUnsafePtrEquality#)
 
 -- | The @Int@ each compound constructor carries is the cached hash.
 --
--- 'Ord' is derived, which orders by hash first: not alphabetical, but a
--- perfectly good total order, and names are only ever compared to key a map.
+-- 'Ord' is derived, which orders by constructor and then by hash: not
+-- alphabetical, but a perfectly good total order, and names are only ever
+-- compared to key a map.
+--
+-- @XPriv@ is a second root, alongside the anonymous one, that the export
+-- reader cannot reach: "Front.Export" builds every name it reads by 'mkStr'
+-- and 'mkNum' from 'anon', so no name coming out of a file is ever rooted
+-- there.  It is what "Front.Lower" hangs the constants it invents from -- see
+-- 'Priv'.
 data Name
   = XAnon
   | XStr !Int !Name !B.ByteString
   | XNum !Int !Name !Integer
+  | XPriv !Int !Int
   deriving (Ord)
 
 -- | Structural equality, which is what the derived instance would be, with a
@@ -76,6 +84,7 @@ instance Eq Name where
     ptrEq x y || (h1 == h2 && s1 == s2 && p1 == p2)
   x@(XNum h1 p1 i1) == y@(XNum h2 p2 i2) =
     ptrEq x y || (h1 == h2 && i1 == i2 && p1 == p2)
+  XPriv _ a == XPriv _ b = a == b
   _ == _ = False
 
 ptrEq :: Name -> Name -> Bool
@@ -83,9 +92,10 @@ ptrEq a b = isTrue# (reallyUnsafePtrEquality# a b)
 {-# INLINE ptrEq #-}
 
 nameHash :: Name -> Int
-nameHash XAnon        = 0
-nameHash (XStr h _ _) = h
-nameHash (XNum h _ _) = h
+nameHash XAnon         = 0
+nameHash (XStr h _ _)  = h
+nameHash (XNum h _ _)  = h
+nameHash (XPriv h _)   = h
 
 -- | The mixing step the caches are built from.  Exported because
 -- 'Kernel.Expr.Expr' caches a hash the same way and there is no reason for two
@@ -110,7 +120,25 @@ pattern Num :: Name -> Integer -> Name
 pattern Num p i <- XNum _ p i
   where Num p i = XNum (mix (nameHash p) (fromInteger i)) p i
 
-{-# COMPLETE Anon, Str, Num #-}
+-- | @Priv k@ is the root of the @k@th private namespace.
+--
+-- The kernel's front end has to invent constants: the nesting compilation of
+-- SPEC.md §9.1 needs a name for each specialised container, and the flattening
+-- of §9.3 needs one for the tag type, the flat type and their recursors.  An
+-- invented name must not be one the file also uses, or the file could say
+-- something about a constant the kernel meant to keep to itself.
+--
+-- Rooting them here settles that by construction rather than by searching for
+-- an unused suffix: 'Front.Export' reads names out of the file's name pool,
+-- and every entry in that pool is 'anon', a 'Str' or a 'Num', so no name a
+-- file can write is equal to one rooted at a 'Priv'.  Distinct @k@ give
+-- disjoint namespaces, which is what lets one run invent names for many blocks
+-- without them colliding with each other.
+pattern Priv :: Int -> Name
+pattern Priv k <- XPriv _ k
+  where Priv k = XPriv (mix 0x1F0 k) k
+
+{-# COMPLETE Anon, Str, Num, Priv #-}
 
 instance Show Name where show = showName
 
@@ -139,6 +167,7 @@ showName n = case parts n [] of
     parts Anon      acc = acc
     parts (Str p s) acc = parts p (B.unpack s : acc)
     parts (Num p i) acc = parts p (show i : acc)
+    parts (Priv k)  acc = ("_private" ++ show k) : acc
 
 -- Built-ins referenced by the literal expansion rules (see SPEC.md §Literals).
 

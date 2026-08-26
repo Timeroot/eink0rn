@@ -36,7 +36,7 @@ module Front.Lower
 import           Control.Monad  (foldM, forM, forM_, unless, when)
 import qualified Data.ByteString.Char8 as B
 import           Data.List      (elemIndex, find, nub, sort)
-import           Data.Maybe     (isJust, isNothing)
+import           Data.Maybe     (isJust)
 import qualified Data.Set       as S
 import           Front.Export
 import           Kernel.Canon
@@ -402,8 +402,13 @@ checkInductive env types ctors recs = do
       unless (nps >= 0 && length paramTele == nps) $
         Left ("inductive: declares " ++ show nps ++ " parameters but its type has "
               ++ show (length paramTele))
-      (declCtorTys, nested) <- runTC env lvls $
-        planNesting (exiNumNested iv0) nps lvls paramTele declNames
+      -- One private namespace for the whole block: the specialised containers
+      -- of §9.1 and, if the block is flattened, the two types of §9.3 all hang
+      -- off it.  Taking it here and using @env'@ from now on is what carries
+      -- the bump into the environment this declaration returns.
+      let (privRoot, env') = freshPriv env
+      (declCtorTys, nested) <- runTC env' lvls $
+        planNesting (exiNumNested iv0) nps lvls paramTele declNames privRoot
                     [ excType c | c <- concat groups ]
       unless (length nested == exiNumNested iv0) $
         Left ("inductive: the block has " ++ show (length nested)
@@ -446,9 +451,9 @@ checkInductive env types ctors recs = do
       -- one they derived; what is left over is the bookkeeping below, which is
       -- the same either way.
       br <- if nDecl + length nested > 1
-              then flattenBlock env groups declMembers auxMembers nested
-                                paramTele nDecl lvls nps recs
-              else singleBlock env groups declMembers lvls nps recs
+              then flattenBlock env' groups declMembers auxMembers nested
+                                paramTele nDecl lvls nps recs privRoot
+              else singleBlock env' groups declMembers lvls nps recs
 
       -- The export's own bookkeeping must agree with what we derived.
       forM_ (zip3 types (brIndices br) (brFields br)) $ \(iv, nIdx, nFields) -> do
@@ -721,45 +726,42 @@ data FlatNames = FlatNames
   , fnAll     :: ![Name]         -- ^ all of the above, for the step 7 audit
   }
 
--- | Names under @T_1._flat@, or @T_1._flat_i@ for the least @i@ that is free.
+-- | Names in the block's private namespace (see 'Kernel.Env.freshPriv').
 --
--- A file that has already declared every one of these -- for every @i@ -- is not
--- possible, so the search terminates; a file that has declared some of them
--- merely pushes the construction one suffix along.
-flatNames :: Env -> Name -> Int -> FlatNames
-flatNames env base nMem =
-  head [ fn | i <- [0 :: Integer ..], let fn = at i, free fn ]
+-- These have to be free -- of every constant the file declares, and of every
+-- name the front end has already invented -- because step 7 below rejects a
+-- derived term that still mentions one, and that audit is only meaningful if
+-- the name could not have got there from the file.  Being rooted at a 'Priv'
+-- is what makes them free, with no search and no appeal to what is in the
+-- environment at the time.
+flatNames :: Name -> Int -> FlatNames
+flatNames privRoot nMem = FlatNames
+  { fnIdx     = idx
+  , fnIdxCtor = tag
+  , fnIdxRec  = mkStr idx (B.pack "rec")
+  , fnTy      = ty
+  , fnTyRec   = mkStr ty (B.pack "rec")
+  , fnAll     = [ idx, mkStr idx (B.pack "rec"), ty, mkStr ty (B.pack "rec") ]
+                ++ map tag [0 .. nMem - 1]
+  }
   where
-    at i = FlatNames
-      { fnIdx     = idx
-      , fnIdxCtor = tag
-      , fnIdxRec  = mkStr idx (B.pack "rec")
-      , fnTy      = ty
-      , fnTyRec   = mkStr ty (B.pack "rec")
-      , fnAll     = [ idx, mkStr idx (B.pack "rec"), ty, mkStr ty (B.pack "rec") ]
-                    ++ map tag [0 .. nMem - 1]
-      }
-      where
-        root | i == 0    = mkStr base (B.pack "_flat")
-             | otherwise = mkNum (mkStr base (B.pack "_flat")) i
-        idx   = mkStr root (B.pack "idx")
-        ty    = mkStr root (B.pack "ty")
-        tag k = mkNum (mkStr idx (B.pack "mk")) (toInteger k)
-    free fn = all (isNothing . lookupConst env) (fnAll fn)
+    idx   = mkStr privRoot (B.pack "idx")
+    ty    = mkStr privRoot (B.pack "ty")
+    tag k = mkNum (mkStr idx (B.pack "mk")) (toInteger k)
 
 -- | Admit the block by flattening it: see the note above.
 flattenBlock :: Env -> [[ExCtor]] -> [CoreMember] -> [CoreMember] -> [Nested]
-             -> [(Binder, Expr)] -> Int -> [Name] -> Int -> [ExRec]
+             -> [(Binder, Expr)] -> Int -> [Name] -> Int -> [ExRec] -> Name
              -> Either String BlockResult
 flattenBlock env0 groups declMembers auxMembers nested paramTele nDecl
-             lvls nps recs = do
+             lvls nps recs privRoot = do
   let members   = declMembers ++ auxMembers
       declNames = map cmName declMembers
       memNames  = map cmName members
       nMem      = length members
       nCtors    = map (length . cmCtors) members
       selfL     = map LParam lvls
-      fn        = flatNames env0 (head memNames) nMem
+      fn        = flatNames privRoot nMem
       ctxt      = "flattening the block of " ++ showName (head declNames) ++ ": "
       ctorCtxt cn = ctxt ++ "constructor " ++ showName cn ++ ": "
       unnest | null nested = id
@@ -1174,15 +1176,15 @@ type Occ = (Name, [Level], [Expr])
 -- | Find every nested occurrence and build the members that replace them,
 -- returning also the block's own constructor types with the occurrences
 -- rewritten.  A block with no nesting is passed through untouched.
-planNesting :: Int -> Int -> [Name] -> [(Binder, Expr)] -> [Name] -> [Expr]
-            -> TC ([Expr], [Nested])
-planNesting cap nps lvls paramTele declNames declCtorTys =
+planNesting :: Int -> Int -> [Name] -> [(Binder, Expr)] -> [Name] -> Name
+            -> [Expr] -> TC ([Expr], [Nested])
+planNesting cap nps lvls paramTele declNames privRoot declCtorTys =
   withLocals paramTele $ \ps -> do
     env <- getEnv
     opened <- mapM (instParams nps (map FVar ps)) declCtorTys
     found  <- discover env [] opened
     if null found then pure (declCtorTys, []) else do
-      let auxNames = [ mkNum (mkStr (head declNames) (B.pack "_nested")) i
+      let auxNames = [ mkNum (mkStr privRoot (B.pack "nested")) i
                      | i <- [1 .. toInteger (length found)] ]
           tagged   = zip found auxNames
           rw       = rewriteNested tagged ps (map LParam lvls)

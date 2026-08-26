@@ -73,9 +73,18 @@ change a verdict at all.
 
 ### 2.1 Names
 
-Hierarchical, built from the anonymous root by string and numeral components.
-Names are compared structurally and carry a cached hash. They have no meaning to
-the theory beyond identity — with the exception of §12.1.
+```
+n ::= [anonymous] | n.s | n.i | π_k              (s a string, i and k naturals)
+```
+
+Hierarchical, built from the anonymous root by string and numeral components,
+plus one further root `π_k` per natural number. Names are compared structurally
+and carry a cached hash. They have no meaning to the theory beyond identity —
+with the exception of §12.1.
+
+The `π_k` are the **private roots**. Nothing in the theory distinguishes them;
+they exist because the front end has to invent constants and needs names the
+file provably does not use. See §9.4.
 
 ### 2.2 Levels
 
@@ -1204,9 +1213,10 @@ with it — so that is literally what `Front.Lower` builds.
    block's own name is then left where it is, and strict positivity rejects it.
 
 2. **Build.** Each distinct occurrence becomes an extra member of the block under
-   an internal name `T._nested.k`, with the container's arity specialised at those
-   arguments, and the container's constructors specialised likewise under names
-   `T._nested.k.ctor.j`. The block is required to be nested only in the
+   an internal name `π.nested.k`, where `π` is the block's *private namespace*
+   (§9.4), with the container's arity specialised at those arguments, and the
+   container's constructors specialised likewise under names
+   `π.nested.k.ctor.j`. The block is required to be nested only in the
    container's *parameters*: an index is not a positive position, and a member
    occurring in one would silently be dropped by the specialisation.
 
@@ -1440,7 +1450,7 @@ column means `b` blocks of `a` members.
 
 Nesting does not enlarge the *declared* part of a block: every multi-type block in
 all four corpora consists of types the user wrote (`EqCnstr`/`EqCnstrProof`,
-`ExBase`/`ExProd`/`ExSum`, `Lean.IR.Alt`/`FnBody`, …), never of an `_nested`-style
+`ExBase`/`ExProd`/`ExSum`, `Lean.IR.Alt`/`FnBody`, …), never of an internally generated
 auxiliary. It does enlarge the block that gets flattened, and that is where both
 ends of the size distribution come from. A nested-but-not-mutual declaration such
 as `inductive A : Prop | mk : Nonempty A -> A` arrives as a single-type block with
@@ -1461,10 +1471,11 @@ construction is actually exercised.
 `Idx`, `F`, `Idx.rec` and `F.rec` are genuinely admitted, but into a scratch
 environment that the construction drops on the way out. They never reach the
 file's environment, and §12.7's barrier has nothing extra to guard. They are still
-given fresh names — `T_1._flat.idx`, `T_1._flat.ty` and so on, derived from the
-block's own first member and bumped to `T_1._flat_i.*` until every one of them is
-free — because a file that has already declared a constant of that name would
-otherwise collide with them inside the scratch environment.
+given names that cannot collide with anything — `π.idx`, `π.ty`, `π.idx.rec`,
+`π.ty.rec` and `π.idx.mk.j` in the block's private namespace `π` (§9.4) — because
+a file that had declared a constant of that name would otherwise collide with them
+inside the scratch environment, and because step 6's audit is only worth running
+if a surviving invented name could not have come from the file.
 
 What remains is one extra inductive admission per flattened block (the tag type),
 a second admission of the block itself in re-indexed form, and a second typecheck
@@ -1557,7 +1568,7 @@ is `F p̄ (Idx.mk_1 p̄)`, because its third field would then be `Array (F p̄
 (Idx.mk_1 p̄))` — an occurrence of the type being defined underneath another type
 constructor, which is precisely what §8.4 rejects and §9 exists to remove. All of
 that is correct, and it is why the two compilations run in the order they do: what
-§9.3 flattens is the block that has `Syntax._nested.1` in that field, never the
+§9.3 flattens is the block that has the specialised copy of `Array Syntax` in that field, never the
 block the file wrote.
 
 The false step was the next one. §9.1 finishes by substituting the real containers
@@ -1593,6 +1604,33 @@ member had become a definition; members are inductive types again and the table 
 gone. And §9.1's own need to read a container's arity and constructors was said to
 need the same indirection; it is served by the ordinary environment lookup, for
 the same reason.
+
+### 9.4 Private namespaces
+
+Both transformations invent constants, and an invented name has to be free: free
+of everything the file declares, or the file could say something about a constant
+the front end meant to keep to itself, and free of everything an earlier
+transformation invented, or two blocks could collide with each other.
+
+Rather than search for an unused name, the invented ones live somewhere the file
+cannot write. §2's grammar of names is
+
+>  `n ::= [anonymous] | n.s | n.i | π_k`
+
+with the last a **private root**, one for each natural number `k`. The export
+format has no syntax for it: the format's name pool starts at the anonymous name
+and every later entry is built from an earlier one by appending a string or a
+numeral (§13.1), so every name a file can mention is rooted at `[anonymous]`, and
+`π_k.…` is not equal to any of them. Each inductive block is handed the next
+unused `k` as it is lowered, and hangs everything it invents off `π_k`: §9.1's
+specialised containers at `π_k.nested.j`, §9.3's two types at `π_k.idx` and
+`π_k.ty`.
+
+This is not a soundness argument about the constants themselves — they are
+admitted by the same rules as any other, and §9.3.3's audit still insists none of
+them survives into anything the caller gets back. It is what makes that audit
+mean something: a private name found in a derived term is necessarily one this
+pass put there.
 
 ---
 

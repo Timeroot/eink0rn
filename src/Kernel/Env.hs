@@ -19,6 +19,7 @@ module Kernel.Env
   , noLicences
   , Env (..)
   , emptyEnv
+  , freshPriv
   , lookupConst
   , addConst
   , constName
@@ -220,10 +221,23 @@ data Env = Env
   , envLicence  :: !Licences
     -- ^ what has already been established about this environment; a cache, in
     -- the sense that clearing it changes only how long the answer takes.
+  , envPriv     :: !Int
+    -- ^ how many private namespaces have been handed out; see 'freshPriv'.
   }
 
 emptyEnv :: Env
-emptyEnv = Env IM.empty False AccelCanonical S.empty noLicences
+emptyEnv = Env IM.empty False AccelCanonical S.empty noLicences 0
+
+-- | Hand out a private namespace: a name root no file can write, and that no
+-- earlier call returned.
+--
+-- The front end invents constants -- the specialised containers of SPEC.md
+-- §9.1, the tag and flat types of §9.3 -- and their names have to be free.
+-- Rooting them at a 'Priv' makes them free of anything the file says by
+-- construction, because the export reader can only build names from 'anon'
+-- (see 'Kernel.Name.Priv'); counting makes them free of each other.
+freshPriv :: Env -> (Name, Env)
+freshPriv env = (Priv (envPriv env), env { envPriv = envPriv env + 1 })
 
 lookupConst :: Env -> Name -> Maybe ConstInfo
 lookupConst env n = IM.lookup (nameHash n) (envConsts env) >>= go
