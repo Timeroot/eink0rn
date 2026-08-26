@@ -1556,6 +1556,10 @@ is a *disagreement*. §8.9 now typechecks every rule of every recursor, derived
 or folded, against the type its own left-hand side has. That is an absolute
 check and not a relative one, and it is what the fold now has to survive.
 
+The alternative — not folding at all, and keeping `Idx` and `F` in the
+environment so that the fold has nothing to rewrite — is what §9.5 is about. It
+does not work, and the reason is worth reading before proposing it again.
+
 #### 9.3.4 Deliberate divergences
 
 What is left, after all that, on which this front end and a primitive-mutual one
@@ -1671,6 +1675,86 @@ admitted by the same rules as any other, and §9.3.3's audit still insists none 
 them survives into anything the caller gets back. It is what makes that audit
 mean something: a private name found in a derived term is necessarily one this
 pass put there.
+
+### 9.5 Why the flat form is not kept
+
+§9.3 builds `Idx` and `F`, reads the block's constants off them, and throws them
+away. The obvious question is why: the flat form is the simplest shape the block
+has — one inductive type, one recursor, no mutual anything — and it is the shape
+the kernel just went to some trouble to construct. Keeping it would mean that
+what *reduction* holds afterwards is that shape and not the block, which is a
+stronger statement than "no mutual block reaches the core" and a better fit for
+what §9 is for.
+
+The construction is short. For a block §9.1 did not have to touch, admit `Idx`,
+`F` and their recursors for real, install the file's constructors as `F`'s (which
+they are, up to the type-level rewrite step 4 already checked), and make the
+block's own constants definitions:
+
+>  `T_j p̄ ā ≡ F p̄ (Idx.mk_j p̄ ā)`
+>
+>  `T_j.rec ≡ λ p̄ C̄ ē ā t. F.rec p̄ bigC ē (Idx.mk_j p̄ ā) t`
+
+The first is exactly the stand-in of §9.3.1 step 4, already built and already
+typechecked. The second is checked against the recursor type the block justifies
+— a *stronger* obligation than §8.7 discharges for a primitive recursor, which is
+handed its type by construction and never has a body to check. And the reduction
+rules stop existing as terms this kernel builds: `T_j.rec` is a definition, what
+it does is whatever δ and ι do to it, so the rule to compare against the export
+(§8.8) is read back off `whnf` of the left-hand side. The sixty-line by-hand fold
+of §9.3.1 step 5 disappears, and with it the audit obligations §9.3.3 lists.
+
+It does not work, for one reason with two consequences.
+
+**The members must become definitions, and there is no third option.** One might
+hope to keep them as primitive inductive types and demote only the recursors. The
+body of `T_j.rec` typechecks only if `T_j p̄ ā` and `F p̄ (Idx.mk_j p̄ ā)` are
+convertible, and a primitive inductive type is convertible with nothing but
+itself. So `T_j` is a definition or `F.rec` is unusable; keeping the flat form and
+keeping the members inductive are mutually exclusive.
+
+Two rules of the theory dispatch on a member *being* an inductive type, and both
+of them fire on real Lean output:
+
+- **§5.3 projections.** `Proj T i s` requires `T` to be a structure-like
+  inductive type and requires the inferred type of `s` to be headed by `T`. Under
+  a kept flat form it is headed by `π.ty`. `cslib` rejects at
+  `Lean.Meta.Grind.AC.DiseqCnstr.lhs`: *expected a value of type
+  `Lean.Meta.Grind.AC.DiseqCnstr`, got `π.ty (π.idx.mk.0 …)`*. This is not a
+  corner: 7 of cslib's 9 flattenable blocks and 7 of mathlib's 10 have a member
+  with one constructor and no indices.
+- **§9.1's container lookup.** Deciding whether a *later* block is nested means
+  finding an already-admitted inductive type in its constructors and reading off
+  that type's arity and constructor list. A member of a kept-flat block is not
+  one, so a block nested inside it is reported as having no nested occurrences at
+  all and is rejected for disagreeing with its own `numNested`. Two cases in the
+  validation corpus are exactly this shape.
+
+Serving either one means carrying each member's arity, constructor list and
+structure-likeness in a table beside the environment and consulting it wherever
+`CInd` is consulted today — which is the `envFlat`/`envUnflat` indirection
+§9.3.5 records the earlier fork needing and this one being rid of. That is not a
+smaller kernel; it is one representation replaced by two and a compatibility
+layer between them.
+
+Two further observations settle it.
+
+The construction only ever applies to a block §9.1 left alone, because `applyAux`
+has to substitute a real container into a recursor's type and rules and a
+definition's body is not something that substitution may rewrite (§9.3.5, same
+argument in the other direction). So the fold survives for the nested majority
+regardless — 41 of cslib's 50 flattened blocks and 41 of mathlib's 51 — and
+nothing is deleted, only branched. And the reach is nil where it would be
+measured: `init` and `std` contain **no** block with more than one declared type,
+so the performance question the construction raises is answered by construction,
+not by a stopwatch.
+
+What does survive from the attempt is its safety argument, and it survives
+without it. The point of typechecking `T_j.rec`'s body was to put something
+absolute behind the block's elimination rules; §8.9 now does that for every
+recursor in the kernel, folded or primitive, by typechecking each reduction rule
+against the type its own left-hand side has. The fold is audited; it just is not
+replaced.
 
 ---
 

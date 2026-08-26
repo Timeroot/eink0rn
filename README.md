@@ -28,10 +28,16 @@ core of five kinds of constant and eleven expression formers, and only then does
 the kernel run. Nested inductives are compiled into flat mutual blocks, and every
 mutual block is then flattened into a single indexed family (SPEC §9), so the
 core sees neither a nested occurrence nor a mutual one — it is a theory of one
-inductive type, and one recursor. Recursors are not
+inductive type, and one recursor. Both compilations invent constants, and they
+invent them in a namespace the export format has no syntax for (SPEC §9.4), so
+"nothing the front end invented survives into the environment" is a test the
+kernel can actually run rather than a naming convention. Recursors are not
 believed — they are re-derived from the inductive specification and the exported
 ones are required to match (SPEC §1, §8.7), so an export cannot smuggle in an
-unwarranted large elimination or an extra iota rule.
+unwarranted large elimination or an extra iota rule. Nor are they believed once
+derived: every reduction rule the kernel ends up with is typechecked against the
+type its own left-hand side has (SPEC §8.9), which is what stands behind a rule
+that both this kernel and the exporter might have got wrong the same way.
 
 **It was written without looking at a Lean kernel.** The only references used
 were Carneiro's *The Type Theory of Lean*, the NDJSON format specification, and

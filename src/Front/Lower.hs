@@ -767,6 +767,10 @@ checkRecRules env r =
 -- unnesting substitution can reach into their types and rules, which it could
 -- not if they were definitions with bodies to preserve).
 --
+-- Keeping them instead, and letting the members be definitions over @F@, is a
+-- shorter construction that deletes the fold; SPEC.md §9.5 records why it does
+-- not work, and what it costs to make it work.
+--
 -- Why this is the same theory and not a larger one:
 --
 -- * The rewrite that builds @F@ is a bijection on occurrences, so the
