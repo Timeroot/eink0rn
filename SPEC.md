@@ -1311,7 +1311,7 @@ own constants off them, and throws the scratch environment away.
    re-closed the same way. So the induction hypotheses are `F`'s, not a second
    implementation of §8.7.
 
-   Both are then rewritten by three iota steps performed **by hand**:
+   Both are then rewritten by three folding steps performed **by hand**:
 
    ```
    F p̄ (Idx.mk_j p̄ ā)               ~>  T_j p̄ ā
@@ -1319,14 +1319,23 @@ own constants off them, and throws the scratch environment away.
    F.rec p̄ bigC ē (Idx.mk_j p̄ ā) t  ~>  T_j.rec p̄ C̄ ē ā t
    ```
 
-   The first is step 3's definition unfolded; the second is iota for `Idx.rec`; the
-   third is `F.rec`'s own iota rule read against the rule being built for
-   `T_j.rec`. None of them is a new rule, and each fires only on an occurrence in
-   exactly the shape the construction put it in — at the block's own parameters, at
-   `bigC` itself, at the very motive and minor-premise locals the term is stated
-   over — so an accidental match is not possible. Every tag occurring in anything
-   `F`'s admission produced is a literal `Idx.mk_j`, because step 2's rewrite is
-   what put it there, so all three fire everywhere they must.
+   Each fires only on an occurrence in exactly the shape the construction put it
+   in — at the block's own parameters, at `bigC` itself, at the very motive and
+   minor-premise locals the term is stated over — so an accidental match is not
+   possible; and every tag occurring in anything `F`'s admission produced is a
+   literal `Idx.mk_j`, because step 2's rewrite is what put it there, so all three
+   fire everywhere they must.
+
+   Their standing is not the same, and it is worth separating. The first is step
+   3's definition read right to left, so the two sides are definitionally equal in
+   the scratch environment. The second is iota for `Idx.rec`, likewise. The third
+   is neither: `F.rec` does not exist in the environment the file will be checked
+   in and `T_j.rec` does not exist in the scratch one, so this is a *translation*
+   between two environments and not an equation in either. What makes it right is
+   that the result is the same term §8.7's rule construction would have produced
+   for the block directly — `F.rec`'s minor premises are the block's, in member
+   order and then constructor order, and its induction hypotheses land in the
+   member the tag names. §9.3.3 says what checks that.
 
 6. **Unnesting, and the audit.** §9.1's substitution puts the real containers back
    into the derived types and rules, exactly as it does for a block admitted the
@@ -1437,12 +1446,26 @@ of each derived recursor type in the final environment. On `init` and `std`, whe
 one and three blocks respectively are affected, that is not measurable against
 run-to-run noise.
 
-The thing to audit is the by-hand iota fold of step 5: about sixty lines that
-rewrite, outside the core, terms the core built, and whose correctness is implied
-by nothing the core checked. Step 6's *nothing invented survives* test is the cheap
-half of the defence, and catches a step that failed to fire. The recursor
-typecheck of step 7, together with the comparison against the file's own recursors
-(§8.8), is the expensive half, and catches a step that fired wrongly.
+The thing to audit is the by-hand fold of step 5: about sixty lines that rewrite,
+outside the core, terms the core built, and whose correctness is implied by
+nothing the core checked. Three things stand behind it, in increasing order of
+what they catch.
+
+- Step 6's *nothing invented survives* test. Cheap, and it catches a fold step
+  that failed to fire: whatever it should have rewritten is still sitting there
+  under a name the final environment does not have.
+- Step 7's typecheck of each derived recursor *type* in the final environment.
+- §8.8's comparison of each derived reduction *rule* against the one the file
+  declares, up to definitional equality.
+
+The last is the one that carries the weight, and it is worth being clear that
+this is not special pleading for the flattening: **no** path in this kernel
+independently typechecks a recursor's right-hand side. On the classic path the
+right-hand side is correct because `mkRule` built it; here it is correct because
+`mkRule` built it and the fold is claimed to be identity-preserving on it. The
+claim is what §8.8 tests, on every recursor of every file, and a fold step that
+fires wrongly produces a right-hand side that is not definitionally equal to
+Lean's.
 
 #### 9.3.4 Deliberate divergences
 
