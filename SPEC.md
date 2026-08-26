@@ -1685,6 +1685,14 @@ than on its tree unfolding:
 Both are maintained by pattern synonyms, so nothing outside `Kernel.Expr` can set
 a cache to a lie.
 
+Names are shared the same way and cache a hash the same way, and their equality
+is the same three-step test: pointer, then hash, then walk. The pointer step
+earns its keep because the export interns names in a pool, so the constant a
+reduction step looks up and the key stored for it in the environment are one
+object, and every binder of a term that came from a file is a name some other
+binder also has. None of this is load-bearing — an implementation that interned
+nothing would decide exactly the same verdicts, only slower.
+
 Each traversal also builds a memo table on the nodes it visits, so that a shared
 node is rewritten once rather than once per path to it, and so that the *result*
 is a graph too. Substitution and universe instantiation are the exception, and
