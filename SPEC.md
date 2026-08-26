@@ -1371,12 +1371,24 @@ escapes.
 
 **The core never sees a mutual block.** Every `CoreBlock` reaching
 `Kernel.Inductive` has one member — the tag type, the flat type, or a declaration
-that was already a single type. The core's mutual machinery (per-member motive
-lists, `csOwner`, `roMember`, the shared minor-premise numbering) still runs, at
-length one. It is kept rather than deleted because it is what makes the derivation
-of the flattening legible: `F.rec` *is* the block's recursors packed into one, and
-the packing is stated in the terms §8.7 states them in. Deleting it would replace
-some lists by scalars and remove no rule from the theory.
+that was already a single type. So the core's mutual machinery — the per-member
+motive and minor-premise lists, `csOwner`, `roMember`, the `zip4` over members in
+`buildRecursors`, and step 3's uniform-universe check — now runs only at length
+one, and could be collapsed to scalars: `CoreBlock` would become a single family,
+`decideLargeElim`'s two cases would merge, and §8 would be a theory of one
+indexed family rather than of a block. That is left undone, deliberately, for two
+reasons.
+
+The first is that the mutual path is the *reference* the flattening is checked
+against. Every claim §9.3 makes about the construction is backed by running both
+front ends over the same 1069 files and comparing verdicts; delete the mutual
+path and there is nothing left to compare to, and the flattening's correctness
+rests on this document alone. The second is that `F.rec` *is* the block's
+recursors packed into one, so the general form is what makes the derivation in
+step 5 legible: it is stated in the terms §8.7 states them in.
+
+Deleting it would remove no rule from the theory — only the generality in which
+the remaining rules are written.
 
 **How often any of this happens.** Counts below are of *export blocks*, not of
 Lean `mutual` commands: one `{"inductive": ...}` line, classified by whether its
