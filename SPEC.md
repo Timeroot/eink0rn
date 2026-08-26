@@ -1713,8 +1713,8 @@ convertible, and a primitive inductive type is convertible with nothing but
 itself. So `T_j` is a definition or `F.rec` is unusable; keeping the flat form and
 keeping the members inductive are mutually exclusive.
 
-Two rules of the theory dispatch on a member *being* an inductive type, and both
-of them fire on real Lean output:
+Two things dispatch on a member *being* an inductive type, and both of them fire
+on real Lean output:
 
 - **§5.3 projections.** `Proj T i s` requires `T` to be a structure-like
   inductive type and requires the inferred type of `s` to be headed by `T`. Under
@@ -1755,6 +1755,12 @@ absolute behind the block's elimination rules; §8.9 now does that for every
 recursor in the kernel, folded or primitive, by typechecking each reduction rule
 against the type its own left-hand side has. The fold is audited; it just is not
 replaced.
+
+The construction above is implemented, and works as far as it can, on the branch
+`flatten-keep`. It passes 186/186 of the arena corpus and 830/846 of the
+validation corpus against 832/846 for this one, and rejects both cslib and
+mathlib. It is kept because an argument of the form "this simpler thing does not
+work" is worth more with the simpler thing next to it.
 
 ---
 
