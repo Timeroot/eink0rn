@@ -26,6 +26,7 @@ library
                       Kernel.Inductive
                       Front.Json
                       Front.Export
+                      Front.Block
                       Front.Lower
     build-depends:    base >=4.16 && <5
                     , bytestring
