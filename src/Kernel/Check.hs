@@ -106,6 +106,7 @@ data TCState = TCState
   , tcInferA      :: !Memo     -- ^ memo for 'inferM' @Assume@
   , tcWhnf        :: !Memo     -- ^ memo for 'whnf'
   , tcDefEq       :: !EqMemo   -- ^ memo for 'isDefEq'; see 'EqMemo'
+  , tcCloseIn     :: !Memo     -- ^ memo for 'closeIn'
   , tcLevelInst   :: !LevelMemo -- ^ memo for 'instLevels'
   , tcLocalId     :: !LocalMemo -- ^ which local stands for which binder; see
                                 --   'sharedLocal'
@@ -374,6 +375,7 @@ runTCLearn env lps (TC f) = unsafePerformIO $ do
   inferA  <- newCache
   whnfM   <- newCache
   defEq   <- newCache
+  closeM  <- newCache
   lvlM    <- newCache
   locId   <- newCache
   consts  <- newCache
@@ -391,7 +393,7 @@ runTCLearn env lps (TC f) = unsafePerformIO $ do
   canonOk <- newIORef M.empty
   sortRes <- newIORef M.empty
   let s = TCState genv locals nextId lvlPs budget credit starve
-                  inferV inferA whnfM defEq lvlM locId consts scope
+                  inferV inferA whnfM defEq closeM lvlM locId consts scope
                   natOk strOk natOps canonOk sortRes
   seedLicences env s
   r <- f s
@@ -665,8 +667,9 @@ swapEnv env s = do
   writeIORef (tcEnv s) env
   seedLicences env s
 
--- | Throw away everything keyed on a term alone.  'tcLevelInst' is not among
--- them: what it remembers is a pure function of its key, and neither is
+-- | Throw away everything keyed on a term alone.  'tcLevelInst' and 'tcCloseIn'
+-- are not among them: what they remember is a pure function of the key, and
+-- neither is
 -- 'tcLocalId': what it remembers is which /name/ a binder was given, and a name
 -- means the same thing under every environment.  'tcConsts' is not either, but
 -- for the opposite reason -- it is about the environment and nothing else, so
@@ -2249,10 +2252,46 @@ substIn vs e
     supplies _ []       = False
     supplies j (_ : xs) = supplies (j - 1 :: Int) xs
 
--- | 'substIn' for the variables an environment binds.
+-- | 'substIn' for the variables an environment binds, memoised.
+--
+-- The memo is the same shape as inference's, and keyed the same way, because it
+-- is answering a question of the same two things: an open node and the
+-- environment it is read in.  It is worth having for the same reason too.
+-- 'inferM' materialises the argument of every application it reads -- @closeIn
+-- env a@ -- and it is memoised on @(a, env)@, so a node the memo already has an
+-- answer for is never inferred twice; but the /argument/ of that application was
+-- closed on the way in, and closing it again is a full rebuild of the term.
+-- Reduction hands the same spine back to inference over and over, so this was
+-- the largest single source of allocation in the checker.
+--
+-- Nothing invalidates it.  Unlike inference and whnf, what it computes does not
+-- consult the environment or the universe parameters at all: it is
+-- @instNPrefix@ of a term against a list, and 'envKey' pins that list for the
+-- lifetime of the state -- see 'freshFVar', whose supply only ever goes up.  So
+-- it sits with 'tcLevelInst' among the tables 'forgetMemos' leaves alone.
+--
+-- Only 'closeIn' may be memoised, not 'substIn': 'inferCore' substitutes a
+-- @let@ value into a body with @substIn (v' : env) b@, and @v'@ is not the
+-- 'FVar' of a binder, so 'envKey' would read the environment underneath it and
+-- name the wrong list.
 closeIn :: LEnv -> Expr -> TC Expr
-closeIn env e | looseBVarRange e == 0 = pure e
-              | otherwise             = substIn env e
+closeIn env e
+  | looseBVarRange e == 0 = pure e
+  | otherwise = lookupClose ek e >>= \case
+      Just v  -> pure v
+      Nothing -> do
+        v <- substIn env e
+        insertClose ek e v
+        pure v
+  where ek = envKey env
+
+lookupClose :: Int -> Expr -> TC (Maybe Expr)
+lookupClose ek e = TC $ \s -> Right <$> memoLookup (tcCloseIn s) ek e
+
+insertClose :: Int -> Expr -> Expr -> TC ()
+insertClose ek k v = TC $ \s -> do
+  memoInsert (tcCloseIn s) ek k v
+  pure (Right ())
 
 infer :: Expr -> TC Expr
 infer = inferM Verify []
