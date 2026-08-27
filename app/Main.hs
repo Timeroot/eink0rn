@@ -168,19 +168,30 @@ run o path = do
   input <- B.readFile path
   let cfg = defaultConfig { cfgAccel = optAccel o, cfgSealProofs = optSeal o
                           , cfgMutUniv = optMutUniv o, cfgDefer = jobs > 0 }
-  walked <- case parseExport input of
-    Left err -> pure (Left err)
-    Right ds -> walk o (checkExportTrace cfg ds)
+  -- Forced here, rather than left as a @let@, so that there is exactly one of
+  -- it.  Two threads read this list below, and they have to be reading the same
+  -- one or they each read the whole file; @$!@ is what settles that, since it
+  -- hands the bind an evaluated list rather than a recipe for one and the
+  -- optimiser has nothing left to duplicate.  Measured on @std@: as a @let@, the
+  -- reading is done twice over and the second thread buys nothing whatever.
+  ds <- pure $! parseExport input
+  -- Reading the file is the other half of a two-pass run's sequential part, and
+  -- it does not depend on the checking, so with cores to spare it is given one.
+  -- Two capabilities, not @jobs@ of them: the rest have nothing to do until pass
+  -- two and would only join the queue at every collection.
+  when (jobs > 1) $ setNumCapabilities 2 >> prefetch ds
+  walked <- walk o (checkExportTrace cfg ds)
   result <- case walked of
     Left err        -> pure (Left err)
     Right (env, []) -> pure (Right env)
     Right (env, obs) -> do
-      -- Not before now.  Pass one is one thread's work, and the capabilities
-      -- that would be waiting for it are not free: every collection has to
-      -- round them all up first.
       when (jobs > 1) (setNumCapabilities jobs)
       remark o (show (length obs) ++ " value checks on " ++ show jobs ++ " threads")
-      pure (env <$ parDischarge jobs obs)
+      t2 <- getMonotonicTime
+      r  <- pure $! (env <$ parDischarge jobs obs)
+      t3 <- getMonotonicTime
+      remark o ("values checked in " ++ showFFloat (Just 2) (t3 - t2) "s")
+      pure r
   case result of
     Left err  -> reject err
     Right env -> case if optPin o == PinOff then [] else checkStdPins env of
@@ -195,6 +206,26 @@ run o path = do
                     hPutStrLn stderr err
                     exitFailure
     unlines' = foldr1 (\a b -> a ++ "\n" ++ b)
+
+-- | Read the export ahead of whoever is checking it, on a thread of its own.
+--
+-- 'Front.Export.parseExport' is lazy, so without this the reading happens on the
+-- checker's thread, a stretch of lines at a time, in between declarations: the
+-- two phases add up where they could have overlapped.  On @std@ reading takes 11
+-- seconds and pass one 13, and overlapping them takes a @-j16@ run from 39
+-- seconds to 27 -- most of the sequential part gone.
+--
+-- Nothing is communicated back, and nothing needs to be.  The list is a pure
+-- value and both threads are asking it the same questions; whichever asks first
+-- does the work and the other finds it done.  Should the reader fall behind, the
+-- checker simply reads for itself, which is what it did before.  Should it run
+-- ahead, it stops at the end of the file -- or at the first line it cannot read,
+-- since that is the last element there is.
+prefetch :: [a] -> IO ()
+prefetch xs = () <$ forkIO (go xs)
+  where
+    go []       = pure ()
+    go (y : ys) = y `seq` go ys
 
 -- | Discharge the deferred value checks on @n@ threads.
 --

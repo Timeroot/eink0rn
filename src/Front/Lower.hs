@@ -72,7 +72,7 @@ defaultConfig = Config AccelCanonical True False False
 
 -- | Check a whole export, returning the resulting environment.
 checkExport :: Config -> [ExDecl] -> Either String Env
-checkExport cfg = verdict . checkExportTrace cfg
+checkExport cfg = verdict . checkExportTrace cfg . map Right
   where
     verdict (Failed err   : _) = Left err
     verdict (Done env obs : _) = env <$ discharge obs
@@ -132,13 +132,19 @@ discharge = foldr (\o rest -> obCheck o >> rest) (Right ())
 -- question stops being /does it pass/ and becomes /which declaration is taking
 -- all afternoon/, and a trace answers it in one run instead of a bisection over
 -- prefixes.
-checkExportTrace :: Config -> [ExDecl] -> [Progress]
+--
+-- The input is 'Front.Export.parseExport' unchanged, a 'Left' in it being a line
+-- that could not be read.  Reading is lazy, so demanding the next declaration is
+-- what reads the lines up to it, and a file is read and checked in one pass over
+-- it rather than two.
+checkExportTrace :: Config -> [Either String ExDecl] -> [Progress]
 checkExportTrace cfg =
   go (LS emptyEnv { envAccel = cfgAccel cfg } (cfgSealProofs cfg)
         (cfgMutUniv cfg) (cfgDefer cfg) Nothing Nothing [] [] [] [] 0 0)
   where
     go st [] = [either Failed (\e -> Done e (reverse (lsObs st))) (finish st)]
-    go st (d : ds) = case declName d of
+    go _  (Left err : _) = [Failed err]
+    go st (Right d : ds) = case declName d of
       !nm -> Starting nm : case step st d of
         Left err  -> [Failed err]
         Right st' -> Checked nm : go st' ds

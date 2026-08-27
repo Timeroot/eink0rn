@@ -2397,9 +2397,12 @@ the end of the declaration anyway). Both runs accept iff all of them hold.
 Two things do not carry over, and neither can change a verdict:
 
 - **Which failure is reported.** One pass stops at the first judgement that
-  fails; two passes report the first *statement* failure if there is one, and
-  otherwise the first obligation in file order. When a bad value makes a later
-  statement fail as well, the two runs name different declarations. Both reject.
+  fails; two passes report whatever pass one found — a statement, or one of the
+  checks §12.3 and §12.7 make when the file ends — and only otherwise the first
+  obligation in file order. When a bad value makes a later declaration fail as
+  well, the two runs name different ones. Both reject. On the validation corpus
+  this is ten of 881 cases, every one of them a `Quot` package that a value
+  mentions before the package is complete.
 - **Licences (§6.5).** In one pass a licence established while checking a value
   travels to every later declaration. Deferred, no value check precedes another,
   so none of them can hand a licence on. Pass one therefore calls
@@ -2419,14 +2422,25 @@ written against, and it is the path every test case runs on.
 
 What it buys is the whole point: on `std` the value checks are 81% of the time
 and 78% of the allocation, and they are a long tail rather than a few monsters,
-so they parallelise. Measured on this 64-core box, `std` takes 139s in one pass
-and 36s at `-j32`. Two passes on *one* thread cost nothing measurable and 4%
-more allocation, which is a second `TCState` per declaration; the ceiling on the
-speedup is pass one, which is inherently sequential, plus the slowest single
-declaration (8.7s of the 139s). Note that the nursery is committed per
-capability, so a large `-jN` wants a smaller `-A` than a one-thread run does:
-`-A1g` at `-j32` commits 32 GB and runs *slower* than `-A128m`, which commits
-four.
+so they parallelise. Two passes on *one* thread cost nothing measurable and 4%
+more allocation, which is a second `TCState` per declaration.
+
+What is left is sequential. Reading the file is not part of either pass and
+depends on neither, so under `-jN` it is given a thread of its own and runs while
+pass one walks what it has read; the export reader is lazy, and the two threads
+are asking one list the same questions, so whichever asks first does the work.
+Pass one itself cannot be split — the environment declaration `k` is checked in
+is the one declarations `0 … k-1` built — and neither can the file be read out of
+order, since the pools are built left to right. So the floor is
+`max(read, pass one) + slowest obligation`: on `std`, `max(11, 13) + 8.5`.
+
+Measured on this 64-core box, `std` takes 139s in one pass and 27s at
+`-j16 +RTS -A128m`: 16s of pass one, with the reading finished inside it, and
+10s of obligations. The README has the figure for each corpus.
+
+Note that the nursery is committed per capability, so a large `-jN` wants a
+smaller `-A` than a one-thread run does: `-A1g` at `-j32` commits 32 GB and runs
+*slower* than `-A128m`, which commits four.
 
 ---
 

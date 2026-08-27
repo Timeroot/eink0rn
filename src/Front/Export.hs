@@ -112,19 +112,37 @@ data Pools = Pools
 emptyPools :: Pools
 emptyPools = Pools (poolPush 0 Anon emptyPool) (poolPush 0 LZero emptyPool) emptyPool
 
--- | Parse a whole export.  Declarations come back in stream order.
-parseExport :: B.ByteString -> Either String [ExDecl]
-parseExport input = go (1 :: Int) emptyPools [] (B.lines input)
+-- | Read a whole export.  Declarations come back in stream order.
+--
+-- Lazily: reading resumes where it left off when the next declaration is asked
+-- for, and a line is looked at only once something wants what is past it.  Which
+-- is what lets a caller with a core to spare read the file and check it at the
+-- same time -- see @Main.prefetch@ -- and it is why a bad line is an element of
+-- the list rather than the whole of it.  A 'Left' is the last element there is:
+-- the pools are built left to right, so nothing after a line that could not be
+-- read can be trusted to mean what it says.
+--
+-- The order in which problems are reported is therefore file order throughout: a
+-- declaration that does not typecheck is reported ahead of a malformed line
+-- below it, where reading the file first would have reported the malformed line.
+parseExport :: B.ByteString -> [Either String ExDecl]
+parseExport input = go (1 :: Int) emptyPools (B.lines input)
   where
-    go _ _ acc [] = Right (reverse acc)
-    go ln ps acc (l : ls) = case fastLine ps l of
-      Just (Left err)  -> Left ("line " ++ show ln ++ ": " ++ err)
-      Just (Right ps') -> go (ln + 1) ps' acc ls
+    go _ _ [] = []
+    -- The line number is wanted only by the two error branches, so nothing else
+    -- forces it: without the bang a file with ten million lines in it builds ten
+    -- million additions before anything asks what line this is.
+    go !ln ps (l : ls) = case fastLine ps l of
+      Just (Left err)  -> [Left (at ln err)]
+      Just (Right ps') -> go (ln + 1) ps' ls
       Nothing
-        | B.null (B.dropWhile (`elem` " \t\r") l) -> go (ln + 1) ps acc ls
+        | B.null (B.dropWhile (`elem` " \t\r") l) -> go (ln + 1) ps ls
         | otherwise -> case step ps l of
-            Left err          -> Left ("line " ++ show ln ++ ": " ++ err)
-            Right (ps', mdec) -> go (ln + 1) ps' (maybe acc (: acc) mdec) ls
+            Left err                -> [Left (at ln err)]
+            Right (ps', Nothing)    -> go (ln + 1) ps' ls
+            Right (ps', Just dec)   -> Right dec : go (ln + 1) ps' ls
+
+    at ln err = "line " ++ show ln ++ ": " ++ err
 
 -- The three shapes that are most of a file ---------------------------------------
 --
