@@ -113,11 +113,29 @@ capped vs = if fits (slotCap - 1) vs then vs else take (slotCap - 1) vs
     fits 0 _        = False
     fits j (_ : xs) = fits (j - 1 :: Int) xs
 
--- | Double the table and reindex.  Amortised constant, and the entries are
+-- | Grow the table and reindex.  Amortised constant, and the entries are
 -- rehung in the order they were in, so the cap keeps evicting the oldest.
+--
+-- By a factor of eight and not the usual two.  Doubling is what you want when
+-- growing is a copy and the slots are the cost; here the slots are a word each
+-- and growing is a /rehang/ -- a cons cell for every entry the table holds --
+-- so the thing to minimise is how many times the entries are touched.  Ending
+-- at @S@ slots, doubling rehangs about @S@ entries in total and eightfold about
+-- @S/7@, and it allocates two thirds as many slots on the way.  What it costs
+-- is that a table may be up to eight times larger than the entries in it need,
+-- which for tables that are a word a slot and thrown away at the end of the
+-- declaration is not a cost worth paying anything to avoid.
+--
+-- Measured on @std@, bytes allocated: doubling 114.0 GB, fourfold 112.5,
+-- eightfold 112.3, sixteenfold 112.9 as the empty slots start to outweigh the
+-- rehangs saved.  The clock agrees, and by more than the allocation does --
+-- 155.4s, 151.2, 148.1, 146.2 -- because a rehang is also the least
+-- cache-friendly thing the checker does.  Raising the load factor instead was
+-- measured and rejected: at two entries a slot @std@ allocates 0.5% less and
+-- runs 3% slower, the buckets having got long enough to notice.
 grow :: forall v. (v -> Int) -> Cache v -> Int -> IOArray Int [v] -> IO ()
 grow keyOf (Cache hdr ref) mask arr = do
-  let mask' = mask `shiftL` 1 + 1
+  let mask' = mask `shiftL` 3 + 7
   arr' <- newArray (0, mask') []
   let hang :: Int -> [v] -> IO Int
       hang !c []       = pure c
