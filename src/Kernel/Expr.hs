@@ -508,17 +508,25 @@ growMemo (Memo hdr ref) mask arr = do
 {-# NOINLINE growMemo #-}
 
 -- | How many nodes a level substitution may visit before it is worth a memo
--- table.  Larger than 'instBudget' because the terms are declared types and
--- stored bodies rather than the small open terms beta reduction rewrites.
+-- table.
 levelBudget :: Int
 levelBudget = 512
 
 -- | How many nodes a substitution may visit before it is worth a memo table.
 --
--- Small enough that the work thrown away on a miss is a rounding error, large
--- enough that a table is only built when there is real sharing to exploit.
+-- The tradeoff is not the obvious one.  A budget that is too small does not
+-- merely fail to catch a little sharing: the unmemoised walk that overruns it
+-- throws away everything it has rebuilt and the memoised walk starts the term
+-- again from the top, so the price of guessing low is paid twice over.  Against
+-- that, the budget bounds the waste at one visit per node and the walk it
+-- protects against is the one that allocates a table for a term with no sharing
+-- in it at all.
+--
+-- Measured on @std@: 64 visits cost 150.1 GB of allocation, 128 cost 145.9,
+-- 256 cost 142.8, 512 cost 141.6, 1024 the same again, and 2048 cost 144.9 as
+-- the discarded rebuilds started to outweigh the tables they saved.
 instBudget :: Int
-instBudget = 64
+instBudget = 512
 
 -- de Bruijn plumbing ----------------------------------------------------------
 
