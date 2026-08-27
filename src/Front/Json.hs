@@ -42,26 +42,41 @@ parseJsonLine bs = do
     then Right v
     else Left ("trailing input after JSON value: " ++ show (B.take 32 rest'))
 
+isWs :: Char -> Bool
+isWs c = c == ' ' || c == '\t' || c == '\r' || c == '\n'
+
+-- | An NDJSON line written by an exporter has no whitespace in it at all, and
+-- 'B.dropWhile' allocates a fresh slice even when it drops nothing.  So look
+-- before dropping: the answer is almost always the argument.
 skipWs :: B.ByteString -> B.ByteString
-skipWs = B.dropWhile (\c -> c == ' ' || c == '\t' || c == '\r' || c == '\n')
+skipWs bs
+  | B.null bs || not (isWs (B.head bs)) = bs
+  | otherwise                           = B.dropWhile isWs bs
 
 pValue :: B.ByteString -> Either String (Json, B.ByteString)
-pValue bs = case B.uncons bs of
-  Nothing -> Left "unexpected end of input"
-  Just (c, r) -> case c of
-    '{' -> pObject (skipWs r)
-    '[' -> pArray (skipWs r)
-    '"' -> do (s, r') <- pString r; pure (JStr s, r')
-    't' | Just r' <- B.stripPrefix (B.pack "rue") r  -> Right (JBool True, r')
-    'f' | Just r' <- B.stripPrefix (B.pack "alse") r -> Right (JBool False, r')
-    'n' | Just r' <- B.stripPrefix (B.pack "ull") r  -> Right (JNull, r')
-    _ | c == '-' || isDigit c -> pNumber bs
-    _ -> Left ("unexpected character " ++ show c)
+pValue bs
+  | B.null bs = Left "unexpected end of input"
+  | otherwise = case B.head bs of
+      '{' -> pObject (skipWs r)
+      '[' -> pArray (skipWs r)
+      '"' -> do (s, r') <- pString r; pure (JStr s, r')
+      't' | Just r' <- B.stripPrefix (B.pack "rue") r  -> Right (JBool True, r')
+      'f' | Just r' <- B.stripPrefix (B.pack "alse") r -> Right (JBool False, r')
+      'n' | Just r' <- B.stripPrefix (B.pack "ull") r  -> Right (JNull, r')
+      c | c == '-' || isDigit c -> pNumber bs
+      c -> Left ("unexpected character " ++ show c)
+  where r = B.tail bs
+
+-- | The character the input is looking at, or @NUL@ at the end of it.  Every
+-- caller is asking whether it is some particular delimiter, and no delimiter is
+-- @NUL@, so the end of input answers \"no\" without a 'Maybe' to allocate.
+nextChar :: B.ByteString -> Char
+nextChar s = if B.null s then '\0' else B.head s
 
 pObject :: B.ByteString -> Either String (Json, B.ByteString)
 pObject bs
-  | Just ('}', r) <- B.uncons bs = Right (JObj [], r)
-  | otherwise = go [] bs
+  | nextChar bs == '}' = Right (JObj [], B.tail bs)
+  | otherwise          = go [] bs
   where
     go acc s = do
       s1 <- expect '"' (skipWs s)
@@ -69,43 +84,45 @@ pObject bs
       s3 <- expect ':' (skipWs s2)
       (v, s4) <- pValue (skipWs s3)
       let acc' = (k, v) : acc
-      case B.uncons (skipWs s4) of
-        Just (',', r) -> go acc' (skipWs r)
-        Just ('}', r) -> Right (JObj (reverse acc'), r)
-        _             -> Left "expected ',' or '}' in object"
+          s5   = skipWs s4
+      case nextChar s5 of
+        ',' -> go acc' (skipWs (B.tail s5))
+        '}' -> Right (JObj (reverse acc'), B.tail s5)
+        _   -> Left "expected ',' or '}' in object"
 
 pArray :: B.ByteString -> Either String (Json, B.ByteString)
 pArray bs
-  | Just (']', r) <- B.uncons bs = Right (JArr [], r)
-  | otherwise = go [] bs
+  | nextChar bs == ']' = Right (JArr [], B.tail bs)
+  | otherwise          = go [] bs
   where
     go acc s = do
       (v, s1) <- pValue (skipWs s)
       let acc' = v : acc
-      case B.uncons (skipWs s1) of
-        Just (',', r) -> go acc' (skipWs r)
-        Just (']', r) -> Right (JArr (reverse acc'), r)
-        _             -> Left "expected ',' or ']' in array"
+          s2   = skipWs s1
+      case nextChar s2 of
+        ',' -> go acc' (skipWs (B.tail s2))
+        ']' -> Right (JArr (reverse acc'), B.tail s2)
+        _   -> Left "expected ',' or ']' in array"
 
 expect :: Char -> B.ByteString -> Either String B.ByteString
-expect c s = case B.uncons s of
-  Just (c', r) | c == c' -> Right r
-  _                      -> Left ("expected " ++ show c)
+expect c s
+  | nextChar s == c = Right (B.tail s)
+  | otherwise       = Left ("expected " ++ show c)
 
 -- | Cursor is just past the opening quote.
 pString :: B.ByteString -> Either String (B.ByteString, B.ByteString)
 pString s0 =
   let (chunk, rest) = B.break (\c -> c == '"' || c == '\\') s0
-  in case B.uncons rest of
-       Just ('"', r)  -> Right (chunk, r)          -- fast path: no escapes
-       Just ('\\', _) -> do (parts, r) <- slow [chunk] rest
-                            pure (B.concat parts, r)
-       _              -> Left "unterminated string"
+  in case nextChar rest of
+       '"'  -> Right (chunk, B.tail rest)          -- fast path: no escapes
+       '\\' -> do (parts, r) <- slow [chunk] rest
+                  pure (B.concat parts, r)
+       _    -> Left "unterminated string"
   where
-    slow acc s = case B.uncons s of
-      Just ('"', r)  -> Right (reverse acc, r)
-      Just ('\\', r) -> do
-        (piece, r') <- pEscape r
+    slow acc s = case nextChar s of
+      '"'  -> Right (reverse acc, B.tail s)
+      '\\' -> do
+        (piece, r') <- pEscape (B.tail s)
         let (chunk, rest) = B.break (\c -> c == '"' || c == '\\') r'
         slow (chunk : piece : acc) rest
       _ -> Left "unterminated string"
@@ -155,19 +172,28 @@ utf8 cp
 
 pNumber :: B.ByteString -> Either String (Json, B.ByteString)
 pNumber bs =
-  let (neg, r0) = case B.uncons bs of
-                    Just ('-', r) -> (True, r)
-                    _             -> (False, bs)
+  let neg      = nextChar bs == '-'
+      r0       = if neg then B.tail bs else bs
       (ds, r1) = B.span isDigit r0
   in if B.null ds
        then Left "expected digits"
        else
          -- The export format only ever uses integers; reject anything fractional
          -- rather than silently truncating it.
-         case B.uncons r1 of
-           Just (c, _) | c == '.' || c == 'e' || c == 'E' -> Left "non-integer number"
-           _ -> let n = B.foldl' (\a d -> a * 10 + toInteger (digitToInt d)) 0 ds
+         case nextChar r1 of
+           c | c == '.' || c == 'e' || c == 'E' -> Left "non-integer number"
+           _ -> let n = digits ds
                 in Right (JInt (if neg then negate n else n), r1)
+  where
+    -- Almost every number in an export is a pool index of a few digits.
+    -- Accumulating those in an 'Integer' allocates a bignum per digit; an 'Int'
+    -- holds eighteen of them and costs one at the end.  Longer runs of digits
+    -- are not a shape the format has, but they are a shape a file can have, so
+    -- they get the exact arithmetic rather than a wrapped answer.
+    digits ds
+      | B.length ds <= 18 = toInteger (B.foldl' (\a d -> a * 10 + val d) (0 :: Int) ds)
+      | otherwise         = B.foldl' (\a d -> a * 10 + toInteger (val d)) 0 ds
+    val d = fromEnum d - 48
 
 -- Accessors ------------------------------------------------------------------
 
@@ -185,18 +211,34 @@ asObject v        = Left ("expected object, got " ++ kindOf v)
 -- then every reader downstream is free to invent a default for it — and the
 -- fields most likely to go missing (@isUnsafe@, @binderInfo@, @safety@) are
 -- exactly the ones whose default a forger would like to choose.
--- The exporter writes a record's fields in the order the format defines them,
--- so the check that succeeds on essentially every line is a pairwise walk down
--- two lists.  Everything else -- the permuted-but-valid case included -- falls
--- through to 'audit', which is the whole rule, written out.
+-- A record has a handful of fields, so the rule states itself as a quadratic
+-- walk over two short lists that allocates nothing at all.  'audit' says the
+-- same thing again, slowly and with a list of what went wrong, and only ever
+-- runs to write the error message.
+--
+-- Doing it the other way round -- 'audit' first, and a fast path for the
+-- expected field order -- looks cheaper and is not: the exporter writes a
+-- record's fields in alphabetical order, this module lists them in the order
+-- the format defines them, and for @app@, @lam@ and @forallE@ those two orders
+-- differ.  So the fast path missed on most lines of a real export, and the
+-- packing and 'nub'bing behind it cost about six per cent of a run.
 record :: [String] -> Json -> Either String [(B.ByteString, Json)]
 record ks v = do
   o <- asObject v
-  if inOrder ks (map fst o) then Right o else audit o
+  if sameLength ks o && every o then Right o else audit o
   where
-    inOrder (k : ks') (g : gs) = sameKey g k && inOrder ks' gs
-    inOrder []        []       = True
-    inOrder _         _        = False
+    sameLength (_ : ks') (_ : o') = sameLength ks' o'
+    sameLength []        []       = True
+    sameLength _         _        = False
+
+    -- Every key of the object is one of @ks@ and does not occur again in it.
+    -- With the lengths equal that is the whole rule: @ks@ has as many entries as
+    -- the object has distinct keys, all of them drawn from @ks@, so none of
+    -- @ks@ is missing.
+    every ((kb, _) : rest) = any (sameKey kb) ks
+                          && all ((/= kb) . fst) rest
+                          && every rest
+    every []               = True
 
     audit o =
       let got   = map fst o
@@ -235,9 +277,11 @@ tagsOf :: [String] -> [(B.ByteString, Json)] -> [String]
 tagsOf ignoring o = [k | (kb, _) <- o, let k = B.unpack kb, k `notElem` ignoring]
 
 field :: [(B.ByteString, Json)] -> String -> Either String Json
-field o k = case optField o k of
-  Just v  -> Right v
-  Nothing -> Left ("missing field " ++ show k)
+field o k = go o
+  where
+    go ((kb, v) : rest) | sameKey kb k = Right v
+                        | otherwise    = go rest
+    go []                              = Left ("missing field " ++ show k)
 
 optField :: [(B.ByteString, Json)] -> String -> Maybe Json
 optField o k = go o
