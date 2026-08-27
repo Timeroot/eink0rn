@@ -40,11 +40,15 @@ import           Data.Array.IO   (IOArray, IOUArray, newArray)
 import           Data.Bits       (shiftL, (.&.))
 import           Data.IORef      (IORef, newIORef, readIORef, writeIORef)
 
--- | Mask, number of live entries, slots.  The slot count is a power of two, so
--- the mask is one less than it and indexing is a bitwise and.
-data Rep v = Rep !Int !Int !(IOArray Int [v])
-
-newtype Cache v = Cache (IORef (Rep v))
+-- | The mask and the number of live entries, then the slots.  The slot count is
+-- a power of two, so the mask is one less than it and indexing is a bitwise and.
+--
+-- The two numbers are a pair of machine words rather than fields of a record
+-- beside the array, because an insertion changes nothing else: holding them in
+-- a boxed cell meant building a fresh one for every entry, which for a table
+-- written tens of millions of times a run came to more litter than the entries.
+-- The array still needs a cell of its own, since growing the table replaces it.
+data Cache v = Cache !(IOUArray Int Int) !(IORef (IOArray Int [v]))
 
 -- | Small: most tables are asked a handful of questions and thrown away, and
 -- the ones that are not double their way up in a few steps.
@@ -59,42 +63,59 @@ initialSlots = 64
 slotCap :: Int
 slotCap = 8
 
-newRep :: Int -> IO (Rep v)
-newRep n = Rep (n - 1) 0 <$> newArray (0, n - 1) []
-
 newCache :: IO (Cache v)
-newCache = Cache <$> (newIORef =<< newRep initialSlots)
+newCache = do
+  hdr <- newArray (0, 1) 0
+  unsafeWrite hdr 0 (initialSlots - 1)
+  arr <- newArray (0, initialSlots - 1) []
+  Cache hdr <$> newIORef arr
 
 -- | Forget everything.  Called when the environment or the universe parameters
 -- change, which is when every answer in the table stops being about the right
 -- question.
 clearCache :: Cache v -> IO ()
-clearCache (Cache ref) = writeIORef ref =<< newRep initialSlots
+clearCache (Cache hdr ref) = do
+  unsafeWrite hdr 0 (initialSlots - 1)
+  unsafeWrite hdr 1 0
+  writeIORef ref =<< newArray (0, initialSlots - 1) []
 
 -- | The entries that could match this key, most recently added first.  The
 -- caller compares them properly; a bucket is only a shortlist.
 bucket :: Cache v -> Int -> IO [v]
-bucket (Cache ref) k = do
-  Rep mask _ arr <- readIORef ref
+bucket (Cache hdr ref) k = do
+  mask <- unsafeRead hdr 0
+  arr  <- readIORef ref
   unsafeRead arr (k .&. mask)
 
 -- | Add an entry.  @keyOf@ recovers an entry's key, which is needed only when
 -- the table doubles and everything has to be reindexed.
 push :: (v -> Int) -> Cache v -> Int -> v -> IO ()
-push keyOf (Cache ref) k v = do
-  Rep mask n arr <- readIORef ref
+push keyOf c@(Cache hdr ref) k v = do
+  mask <- unsafeRead hdr 0
+  n    <- unsafeRead hdr 1
+  arr  <- readIORef ref
   let i = k .&. mask
   old <- unsafeRead arr i
-  unsafeWrite arr i (v : take (slotCap - 1) old)
+  unsafeWrite arr i (v : capped old)
   let n' = n + 1
-  if n' > mask
-    then grow keyOf ref mask arr
-    else writeIORef ref (Rep mask n' arr)
+  if n' > mask then grow keyOf c mask arr
+               else unsafeWrite hdr 1 n'
+
+-- | The bucket, shortened to leave room for one more entry.
+--
+-- @take@ would say this, and would also copy a bucket that is already short
+-- enough -- which, at a load factor of one, is almost every bucket there is.
+capped :: [v] -> [v]
+capped vs = if fits (slotCap - 1) vs then vs else take (slotCap - 1) vs
+  where
+    fits _ []       = True
+    fits 0 _        = False
+    fits j (_ : xs) = fits (j - 1 :: Int) xs
 
 -- | Double the table and reindex.  Amortised constant, and the entries are
 -- rehung in the order they were in, so the cap keeps evicting the oldest.
-grow :: forall v. (v -> Int) -> IORef (Rep v) -> Int -> IOArray Int [v] -> IO ()
-grow keyOf ref mask arr = do
+grow :: forall v. (v -> Int) -> Cache v -> Int -> IOArray Int [v] -> IO ()
+grow keyOf (Cache hdr ref) mask arr = do
   let mask' = mask `shiftL` 1 + 1
   arr' <- newArray (0, mask') []
   let hang :: Int -> [v] -> IO Int
@@ -112,7 +133,10 @@ grow keyOf ref mask arr = do
             c' <- hang c (reverse vs)
             slot c' (i + 1)
   n <- slot 0 0
-  writeIORef ref (Rep mask' n arr')
+  unsafeWrite hdr 0 mask'
+  unsafeWrite hdr 1 n
+  writeIORef ref arr'
+{-# NOINLINE grow #-}
 
 -- | A countdown that lives outside the checker's state.
 --

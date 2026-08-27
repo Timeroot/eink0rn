@@ -363,7 +363,7 @@ barrier env es
                        ++ (if S.size bad == 1 then "constant " else "constants ")
                        ++ commas (map showName (S.toList bad)))
   where
-    bad = S.intersection (S.unions (map constsOf es)) (envUnsafe env)
+    bad = S.unions (map (constsMeeting (envUnsafe env)) es)
 
 commas :: [String] -> String
 commas = foldr1 (\a b -> a ++ ", " ++ b)

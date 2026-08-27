@@ -53,7 +53,7 @@ module Kernel.Expr
   , hasLooseBVars
   , looseBVarRange
   , occursConst
-  , constsOf
+  , constsMeeting
   , instLevelsE
   , showExpr
   ) where
@@ -732,23 +732,36 @@ occursConst n e0 = runST (newMemo >>= \ref -> go ref e0)
       _           -> pure False
     kids ref ex = anyM (go ref) (children ex)
 
--- | Every constant a term names.
+-- | Which of these constants a term names.
 --
 -- @Proj@ carries the structure's name as well as its subterm, and that name is
--- included: it is a reference to a declaration exactly as a 'Const' node is,
--- and a caller asking \"what does this term depend on?\" needs it.
-constsOf :: Expr -> S.Set Name
-constsOf e0 = runST (newMemo >>= \ref -> go ref e0)
+-- looked for too: it is a reference to a declaration exactly as a 'Const' node
+-- is, and a caller asking \"does this term depend on any of these?\" means it
+-- to count.
+--
+-- The filtering is not a refinement of collecting every constant and
+-- intersecting afterwards -- it is the difference between a walk that builds
+-- nothing and one that does not.  The one caller ("Front.Lower.barrier") is
+-- asking whether a declaration mentions an unsafe constant, and almost none
+-- do, so almost every answer here is the empty set and unioning two of those
+-- costs nothing.  Building the whole set first and intersecting at the end was
+-- three per cent of a run over @std@, essentially all of it in @union@.
+constsMeeting :: S.Set Name -> Expr -> S.Set Name
+constsMeeting want e0
+  | S.null want = S.empty
+  | otherwise   = runST (newMemo >>= \ref -> go ref e0)
   where
+    keep m | S.member m want = S.singleton m
+           | otherwise       = S.empty
     go ref ex = case ex of
-      Const m _   -> pure (S.singleton m)
-      App{}       -> memoAt ref 0 ex (kids ref ex)
-      Lam{}       -> memoAt ref 0 ex (kids ref ex)
-      Pi{}        -> memoAt ref 0 ex (kids ref ex)
-      Let{}       -> memoAt ref 0 ex (kids ref ex)
-      Proj s _ _  -> memoAt ref 0 ex (S.insert s <$> kids ref ex)
+      Const m _   -> pure (keep m)
+      App f a     -> memoAt ref 0 ex (both ref f a)
+      Lam _ t b   -> memoAt ref 0 ex (both ref t b)
+      Pi  _ t b   -> memoAt ref 0 ex (both ref t b)
+      Let _ t v b -> memoAt ref 0 ex (S.union <$> both ref t v <*> go ref b)
+      Proj s _ b  -> memoAt ref 0 ex (S.union (keep s) <$> go ref b)
       _           -> pure S.empty
-    kids ref ex = S.unions <$> mapM (go ref) (children ex)
+    both ref a b = S.union <$> go ref a <*> go ref b
 
 -- | The immediate subterms, in no particular order.
 children :: Expr -> [Expr]
