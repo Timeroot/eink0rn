@@ -894,12 +894,10 @@ reduceQuot arity majorIx fnIx args
       major <- whnf (args !! majorIx)
       let (mh, margs) = unApps major
       case mh of
-        Const cn _ -> do
-          env <- getEnv
-          case lookupConst env cn of
-            Just (CQuot _ _ _ QCtor) | length margs == 3 ->
-              pure (Just (mkApps (App (args !! fnIx) (margs !! 2)) (drop arity args)))
-            _ -> pure Nothing
+        Const cn _ -> lookupConstC cn >>= \case
+          Just (CQuot _ _ _ QCtor) | length margs == 3 ->
+            pure (Just (mkApps (App (args !! fnIx) (margs !! 2)) (drop arity args)))
+          _ -> pure Nothing
         _ -> pure Nothing
 
 -- | @T.rec params motives minors indices (c params fields) --> rule_c params motives minors fields@
@@ -935,12 +933,15 @@ reduceRec r ls args
 -- literal case this is where K-like reduction and structure eta live.
 toCtorApp :: RecInfo -> [Level] -> Expr -> TC (Maybe Expr)
 toCtorApp r ls major = do
-  env <- getEnv
   m1 <- expandLit major
   case headOf m1 of
-    Const cn _ | Just (CCtor _) <- lookupConst env cn -> pure (Just m1)
-    _ | recK r          -> toCtorWhenK r ls m1
-      | otherwise       -> toCtorWhenStruct r m1
+    Const cn _ -> lookupConstC cn >>= \case
+      Just (CCtor _) -> pure (Just m1)
+      _              -> notACtor m1
+    _ -> notACtor m1
+  where
+    notACtor m1 | recK r    = toCtorWhenK r ls m1
+                | otherwise = toCtorWhenStruct r m1
 
 -- | K-like reduction.  Only for a @Prop@ with a single field-less constructor:
 -- if the major premise's type is @T params indices@ then the /canonical/
@@ -951,20 +952,20 @@ toCtorApp r ls major = do
 -- @Eq a b@ for @a@ and @b@ that are not convertible.
 toCtorWhenK :: RecInfo -> [Level] -> Expr -> TC (Maybe Expr)
 toCtorWhenK r _ls major = withFuel $ do
-  env <- getEnv
   majorTy <- inferOnly major >>= whnf
   let (h, targs) = unApps majorTy
   case h of
-    Const tn tls | tn == recInduct r
-                 , Just (CInd ind) <- lookupConst env tn
-                 , [cn] <- indCtors ind
-                 , Just (CCtor ci) <- lookupConst env cn
-                 , ctorNumFields ci == 0
-                 , length targs >= indNumParams ind -> do
-      let ctorApp = mkApps (Const cn tls) (take (indNumParams ind) targs)
-      ctorTy <- inferOnly ctorApp
-      ok <- isDefEq majorTy ctorTy
-      pure (if ok then Just ctorApp else Nothing)
+    Const tn tls | tn == recInduct r -> lookupConstC tn >>= \case
+      Just (CInd ind)
+        | [cn] <- indCtors ind
+        , length targs >= indNumParams ind -> lookupConstC cn >>= \case
+            Just (CCtor ci) | ctorNumFields ci == 0 -> do
+              let ctorApp = mkApps (Const cn tls) (take (indNumParams ind) targs)
+              ctorTy <- inferOnly ctorApp
+              ok <- isDefEq majorTy ctorTy
+              pure (if ok then Just ctorApp else Nothing)
+            _ -> pure Nothing
+      _ -> pure Nothing
     _ -> pure Nothing
 
 -- | Structure eta on the major premise: for a structure-like @T@ every element
@@ -974,31 +975,33 @@ toCtorWhenK r _ls major = withFuel $ do
 toCtorWhenStruct :: RecInfo -> Expr -> TC (Maybe Expr)
 toCtorWhenStruct r major = withFuel $ do
   env <- getEnv
-  case lookupConst env (recInduct r) of
+  lookupConstC (recInduct r) >>= \case
     Just (CInd ind)
       | isEtaReducible env (indName ind)
-      , [cn] <- indCtors ind
-      , Just (CCtor ci) <- lookupConst env cn -> do
-          majorTy <- inferOnly major >>= whnf
-          let (h, targs) = unApps majorTy
-          case h of
-            Const tn tls | tn == indName ind, length targs == indNumParams ind ->
-              pure . Just $ mkApps (Const cn tls)
-                (targs ++ [ Proj tn i major | i <- [0 .. ctorNumFields ci - 1] ])
-            _ -> pure Nothing
+      , [cn] <- indCtors ind -> lookupConstC cn >>= \case
+          Just (CCtor ci) -> do
+            majorTy <- inferOnly major >>= whnf
+            let (h, targs) = unApps majorTy
+            case h of
+              Const tn tls | tn == indName ind, length targs == indNumParams ind ->
+                pure . Just $ mkApps (Const cn tls)
+                  (targs ++ [ Proj tn i major | i <- [0 .. ctorNumFields ci - 1] ])
+              _ -> pure Nothing
+          _ -> pure Nothing
     _ -> pure Nothing
 
 -- | @(T.mk params fields).i --> fields !! i@
 reduceProj :: Expr -> TC (Maybe Expr)
 reduceProj (Proj tn i s) = do
-  env <- getEnv
   s1 <- whnf s >>= expandLit
   let (h, args) = unApps s1
   case h of
-    Const cn _ | Just (CCtor ci) <- lookupConst env cn
-               , ctorInduct ci == tn
-               , let fields = drop (ctorNumParams ci) args
-               , i < length fields -> pure (Just (fields !! i))
+    Const cn _ -> lookupConstC cn >>= \case
+      Just (CCtor ci)
+        | ctorInduct ci == tn
+        , let fields = drop (ctorNumParams ci) args
+        , i < length fields -> pure (Just (fields !! i))
+      _ -> pure Nothing
     _ -> pure Nothing
 reduceProj _ = pure Nothing
 
@@ -1797,12 +1800,12 @@ proofErasable = go (0 :: Int)
     go k _ | k > 256 = pure False
     go k ty = whnf ty >>= \ty' -> case ty' of
       Pi n dom body -> withLocal n dom $ \x -> go (k + 1) (instantiateBody x body)
-      _ -> do
-        env <- getEnv
-        pure $ case headOf ty' of
-          Const n _ | Just (CInd i) <- lookupConst env n ->
-            null (indCtors i) || not (indLargeElim i) || indK i
-          _ -> False
+      _ -> case headOf ty' of
+        Const n _ -> lookupConstC n >>= \case
+          Just (CInd i) ->
+            pure (null (indCtors i) || not (indLargeElim i) || indK i)
+          _ -> pure False
+        _ -> pure False
 
 -- | Congruence for a spine whose head cannot be unfolded -- a local constant, a
 -- projection, an axiom, a constructor, an inductive type, a stuck recursor.
@@ -2047,18 +2050,19 @@ tryStructEta :: Expr -> Expr -> TC (Maybe Bool)
 tryStructEta t s = withFuel $ do
   env <- getEnv
   case unApps t of
-    (Const cn _, as)
-      | Just (CCtor ci) <- lookupConst env cn
-      , isStructureLike env (ctorInduct ci)
-      , length as == ctorNumParams ci + ctorNumFields ci
-      , ctorNumFields ci > 0 -> do
-          sTy <- inferOnly s >>= whnf
-          case headOf sTy of
-            Const tn _ | tn == ctorInduct ci -> do
-              let fields = drop (ctorNumParams ci) as
-              b <- allM (\(i, f) -> isDefEq f (Proj tn i s)) (zip [0 ..] fields)
-              pure (if b then Just True else Nothing)
-            _ -> pure Nothing
+    (Const cn _, as) -> lookupConstC cn >>= \case
+      Just (CCtor ci)
+        | isStructureLike env (ctorInduct ci)
+        , length as == ctorNumParams ci + ctorNumFields ci
+        , ctorNumFields ci > 0 -> do
+            sTy <- inferOnly s >>= whnf
+            case headOf sTy of
+              Const tn _ | tn == ctorInduct ci -> do
+                let fields = drop (ctorNumParams ci) as
+                b <- allM (\(i, f) -> isDefEq f (Proj tn i s)) (zip [0 ..] fields)
+                pure (if b then Just True else Nothing)
+              _ -> pure Nothing
+      _ -> pure Nothing
     _ -> pure Nothing
 
 -- | A structure with no fields has exactly one element up to conversion.
@@ -2168,10 +2172,13 @@ memoKey env e | looseBVarRange e == 0 = -1
 substIn :: [Expr] -> Expr -> TC Expr
 substIn vs e
   | k == 0    = pure e
-  | otherwise = let pre = take k vs
-                in if length pre == k then pure (instN pre e)
-                   else throwTC ("loose bound variable #" ++ show (k - 1))
-  where k = looseBVarRange e
+  | supplies k vs = pure (instNPrefix k vs e)
+  | otherwise = throwTC ("loose bound variable #" ++ show (k - 1))
+  where
+    k = looseBVarRange e
+    supplies 0 _        = True
+    supplies _ []       = False
+    supplies j (_ : xs) = supplies (j - 1 :: Int) xs
 
 -- | 'substIn' for the variables an environment binds.
 closeIn :: LEnv -> Expr -> TC Expr
@@ -2343,13 +2350,15 @@ inferProj m lenv tn i s0 = do
   let (h, args) = unApps sTy
   case h of
     Const tn' ls | tn' == tn -> do
-      ind <- case lookupConst env tn of
+      ind <- lookupConstC tn >>= \case
         Just (CInd ind) -> pure ind
         _               -> throwTC ("projection: " ++ showName tn ++ " is not an inductive type")
       unless (isStructureLike env tn) $
         throwTC ("projection: " ++ showName tn ++ " is not a structure")
       ci <- case indCtors ind of
-        [cn] | Just (CCtor ci) <- lookupConst env cn -> pure ci
+        [cn] -> lookupConstC cn >>= \case
+          Just (CCtor ci) -> pure ci
+          _ -> throwTC ("projection: " ++ showName tn ++ " has no unique constructor")
         _ -> throwTC ("projection: " ++ showName tn ++ " has no unique constructor")
       let nps = indNumParams ind
       unless (length args == nps) $

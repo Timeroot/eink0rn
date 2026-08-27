@@ -45,6 +45,7 @@ module Kernel.Expr
   -- * de Bruijn plumbing
   , liftE
   , instN
+  , instNPrefix
   , inst1
   -- * Local constants
   , abstractFVars
@@ -585,13 +586,24 @@ liftE d0 k e0
 -- of the result differs, and below 'instBudget' nodes there is nothing to share.
 instN :: [Expr] -> Expr -> Expr
 instN [] e = e
-instN vs e0
+instN vs e
+  | looseBVarRange e == 0 = e
+  | otherwise             = instNPrefix (length vs) vs e
+
+-- | 'instN' against the first @n@ of @vs@, for a caller that already knows @n@.
+--
+-- @instNPrefix n vs@ is @instN (take n vs)@ whenever @vs@ has at least @n@
+-- entries.  The point is the ones it does not have to build: 'Kernel.Check' hands
+-- over its whole local environment and a term that mentions the innermost few
+-- of it, eleven million times over a run of @std@, and a @take@ at each of those
+-- allocates a list only to walk it once and drop it.
+instNPrefix :: Int -> [Expr] -> Expr -> Expr
+instNPrefix _ _ e0
   | looseBVarRange e0 == 0 = e0
+instNPrefix n vs e0
   | Step r k <- plain instBudget 0 e0, k >= 0 = r
   | otherwise = runST (newMemo >>= \ref -> go ref 0 e0)
   where
-    n = length vs
-
     -- Returns the rewritten node and what is left of the budget; a negative
     -- budget means the answer is unfinished and must be thrown away.
     plain !k !d ex
