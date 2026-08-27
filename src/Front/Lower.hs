@@ -235,25 +235,17 @@ checkDecl st d = case d of
 
   ExDef u n lps ty val h
     | u         -> quarantine st n lps ty (Just val)
-    | otherwise -> defLike st n lps ty val h Retain
-  -- A theorem must be a /proof/: its statement has to live in @Prop@.  (The
-  -- core has no theorems, so this is the one thing lost when we turn it into a
-  -- definition, and it has to be checked here.)  There is no unsafe theorem:
+    | otherwise -> defLike st n lps ty val h IsDef
+  -- A theorem must be a /proof/: its statement has to live in @Prop@.  The core
+  -- has no theorems, so that is the one thing lost when we turn one into a
+  -- definition, and 'defLike' is told to ask it.  There is no unsafe theorem:
   -- the format gives @thm@ no safety field at all.
-  ExThm n lps ty val -> do
-    checkLevelParams lps
-    barrier (lsEnv st) [ty, val]
-    run lps $ do
-      l <- inferSortOf ty
-      unless (levelEquiv l LZero) $
-        throwTC ("theorem statement is not a proposition: it lives in Sort "
-                 ++ showLevel l)
-    defLike st n lps ty val HOpaque SealIfSpent
+  ExThm n lps ty val -> defLike st n lps ty val HOpaque IsThm
   -- An opaque constant is checked exactly like a definition and then sealed:
   -- the kernel must not unfold it, so it enters the environment as an axiom.
   ExOpaque u n lps ty val
     | u         -> quarantine st n lps ty (Just val)
-    | otherwise -> defLike st n lps ty val HOpaque Seal
+    | otherwise -> defLike st n lps ty val HOpaque IsOpaque
 
   -- Queued rather than admitted on the spot: the package is one extension to
   -- the theory (SPEC.md §12.3) and the file's order within it carries no
@@ -277,30 +269,42 @@ checkDecl st d = case d of
   where
     run lps act = either Left (const (Right ())) (runTC (lsEnv st) lps act)
 
--- | What becomes of a declaration's value once it has been checked.
-data Sealing
-  = Retain        -- ^ a definition: the value stays, and delta may unfold it
-  | Seal          -- ^ @opaque@: the value is checked and then thrown away
-  | SealIfSpent   -- ^ @thm@: thrown away unless reduction could still need it
+-- | Which of the three value-carrying declaration kinds this is: what its
+-- statement has to say, and what becomes of its value once that value has been
+-- checked.
+data DeclKind
+  = IsDef      -- ^ @def@: the value stays, and delta may unfold it
+  | IsOpaque   -- ^ @opaque@: the value is checked and then thrown away
+  | IsThm      -- ^ @thm@: the statement must be a proposition, and the value is
+               --   thrown away unless reduction could still need it
   deriving Eq
 
-defLike :: LS -> Name -> [Name] -> Expr -> Expr -> Hint -> Sealing
+defLike :: LS -> Name -> [Name] -> Expr -> Expr -> Hint -> DeclKind
         -> Either String LS
-defLike st n lps ty val hint sealing = do
+defLike st n lps ty val hint kind = do
   checkLevelParams lps
   barrier (lsEnv st) [ty, val]
   (spent, lic) <- runTCLearn (lsEnv st) lps $ do
     when warming warmLicences
     sort <- inferSortOf ty
+    -- Here, rather than in 'checkDecl', because the sort is already in hand.
+    -- Asking there meant a second 'inferSortOf' over the same statement in a
+    -- run of its own, sharing no memo table with this one -- and three quarters
+    -- of the declarations in a Lean file are theorems, so on @std@ that second
+    -- reading was very nearly half of everything the statement pass did.
+    when (kind == IsThm) $
+      unless (levelEquiv sort LZero) $
+        throwTC ("theorem statement is not a proposition: it lives in Sort "
+                 ++ showLevel sort)
     unless (lsDefer st) $ checkType val ty
     -- Asked in the same run as the check, so it reuses its memo tables; asked
     -- of the /statement/, so it costs a head normalisation and nothing more.
     -- Which is also why deferring the value check does not disturb it, and so
     -- does not disturb which constants the environment ends up holding.
-    if sealing == SealIfSpent && isDefinitelyZero sort
+    if kind == IsThm && isDefinitelyZero sort
       then proofErasable ty
       else pure False
-  let sealed = sealing == Seal || (spent && lsSeal st)
+  let sealed = kind == IsOpaque || (spent && lsSeal st)
       info | sealed    = CAxiom n lps ty
            | otherwise = CDef DefInfo { defName   = n
                                       , defLevels = lps
