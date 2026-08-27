@@ -35,9 +35,8 @@ module Front.Export
 
 import qualified Data.ByteString.Char8 as B
 import           Data.Char             (isDigit)
-import           Data.IntMap.Strict    (IntMap)
-import qualified Data.IntMap.Strict    as IM
 import           Front.Json
+import           Front.Pool
 import           Kernel.Env            (Hint (..), QuotKind (..))
 import           Kernel.Expr
 import           Kernel.Level
@@ -105,13 +104,13 @@ data ExRule = ExRule
 -- The pools --------------------------------------------------------------------
 
 data Pools = Pools
-  { pNames  :: !(IntMap Name)
-  , pLevels :: !(IntMap Level)
-  , pExprs  :: !(IntMap Expr)
+  { pNames  :: !(Pool Name)
+  , pLevels :: !(Pool Level)
+  , pExprs  :: !(Pool Expr)
   }
 
 emptyPools :: Pools
-emptyPools = Pools (IM.singleton 0 Anon) (IM.singleton 0 LZero) IM.empty
+emptyPools = Pools (poolPush 0 Anon emptyPool) (poolPush 0 LZero emptyPool) emptyPool
 
 -- | Parse a whole export.  Declarations come back in stream order.
 parseExport :: B.ByteString -> Either String [ExDecl]
@@ -213,17 +212,17 @@ binderAt :: Pools -> (Binder -> Expr -> Expr -> Expr)
          -> Int -> Int -> Int -> Int -> Either String Pools
 binderAt ps con k nm t b = do
   n'   <- maybe (Left ("undefined name index " ++ show nm)) Right
-                (IM.lookup nm (pNames ps))
+                (poolAt (pNames ps) nm)
   ty   <- exprIx ps t
   body <- exprIx ps b
   Right (fileExpr k (con (Binder n') ty body) ps)
 
 exprIx :: Pools -> Int -> Either String Expr
 exprIx ps i = maybe (Left ("undefined expression index " ++ show i)) Right
-                    (IM.lookup i (pExprs ps))
+                    (poolAt (pExprs ps) i)
 
 fileExpr :: Int -> Expr -> Pools -> Pools
-fileExpr k e ps = ps { pExprs = IM.insert k e (pExprs ps) }
+fileExpr k e ps = ps { pExprs = poolPush k e (pExprs ps) }
 
 lit :: B.ByteString -> B.ByteString -> Maybe B.ByteString
 lit p s | p `B.isPrefixOf` s = Just (B.drop (B.length p) s)
@@ -327,7 +326,7 @@ entry ps t v
       f <- record [t, key] v
       k <- natOf =<< field f key
       x <- rd =<< field f t
-      pure (put (IM.insert k x (get ps)), Nothing)
+      pure (put (poolPush k x (get ps)), Nothing)
 
 exprTags :: [String]
 exprTags =
@@ -353,17 +352,17 @@ natOf j = do
 nameAt :: Pools -> Json -> Either String Name
 nameAt ps j = do
   i <- natOf j
-  maybe (Left ("undefined name index " ++ show i)) Right (IM.lookup i (pNames ps))
+  maybe (Left ("undefined name index " ++ show i)) Right (poolAt (pNames ps) i)
 
 levelAt :: Pools -> Json -> Either String Level
 levelAt ps j = do
   i <- natOf j
-  maybe (Left ("undefined level index " ++ show i)) Right (IM.lookup i (pLevels ps))
+  maybe (Left ("undefined level index " ++ show i)) Right (poolAt (pLevels ps) i)
 
 exprAt :: Pools -> Json -> Either String Expr
 exprAt ps j = do
   i <- natOf j
-  maybe (Left ("undefined expression index " ++ show i)) Right (IM.lookup i (pExprs ps))
+  maybe (Left ("undefined expression index " ++ show i)) Right (poolAt (pExprs ps) i)
 
 namesAt :: Pools -> Json -> Either String [Name]
 namesAt ps j = asArray j >>= mapM (nameAt ps)

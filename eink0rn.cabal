@@ -25,6 +25,7 @@ library
                       Kernel.Check
                       Kernel.Inductive
                       Front.Json
+                      Front.Pool
                       Front.Export
                       Front.Block
                       Front.Hetero
