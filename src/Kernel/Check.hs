@@ -254,8 +254,9 @@ eqWorthMemo :: Expr -> Expr -> Bool
 eqWorthMemo a b = big a && big b
   where big e = case e of App{} -> True; Proj{} -> True; _ -> False
 
--- | A memo on (stored body, universe arguments) pairs; see 'instLevels'.
-type LevelMemo = Cache (Expr, [Level], Expr)
+-- | A memo on (stored body, its parameters, universe arguments) triples; see
+-- 'instLevels'.
+type LevelMemo = Cache (Expr, [Name], [Level], Expr)
 
 -- | 'instLevelsE', remembered for the length of one declaration.
 --
@@ -275,29 +276,48 @@ type LevelMemo = Cache (Expr, [Level], Expr)
 -- the normal case, not a rare one, and hanging all dozen off the body's hash
 -- alone puts them in one bucket, where the cap throws them away as fast as they
 -- arrive.
+--
+-- The /parameters/ are part of it too, and that is not a nicety.  A body is
+-- named by its pointer, and two declarations can be handed the same pointer:
+-- an exporter files each distinct expression once, so @f.{u,v}@ and @g.{v,u}@
+-- with the same body get the same pool index and therefore the same heap
+-- object.  Their instantiations at the same @us@ are not the same term -- the
+-- lists say which parameter each universe is for -- and an entry that recorded
+-- only the body and the arguments would answer for one with the other.  That
+-- is not a lost hit but a wrong answer: it makes @f.{0,1}@ and @g.{0,1}@
+-- reduce alike and so convertible, which is a universe confusion and unsound.
+-- See @tests/bad/level-memo-params.ndjson@, which turns on nothing else.
 instLevels :: [Name] -> [Level] -> Expr -> TC Expr
 instLevels [] _  e = pure e
 instLevels ps ls e
-  | and (zipWith isSelf ps ls) = pure e
+  | sameLength && and (zipWith isSelf ps ls) = pure e
   | otherwise = TC $ \s -> do
       let tbl = tcLevelInst s
-          key = levelsKey e ls
-          hit ((b, ls', r) : rest) | ptrEq b e, ls' == ls = Just r
-                                   | otherwise            = hit rest
-          hit []                                          = Nothing
+          key = levelsKey e ps ls
+          hit ((b, ps', ls', r) : rest)
+            | ptrEq b e, ps' == ps, ls' == ls = Just r
+            | otherwise                       = hit rest
+          hit []                              = Nothing
       b <- bucket tbl key
       case hit b of
         Just r  -> pure (Right r)
         Nothing -> do
           let r = instLevelsE ps ls e
-          push (\(x, l, _) -> levelsKey x l) tbl key (e, ls, r)
+          push (\(x, p, l, _) -> levelsKey x p l) tbl key (e, ps, ls, r)
           pure (Right r)
   where
+    -- @zipWith@ would otherwise read a short argument list as "every parameter
+    -- stands for itself" and hand back a body with the ones it does have left
+    -- uninstantiated.  Every caller checks the arity first, so this only closes
+    -- the door.
+    sameLength = length ps == length ls
     isSelf p (LParam q) = p == q
     isSelf _ _          = False
 
-levelsKey :: Expr -> [Level] -> Int
-levelsKey e = foldl' (\h l -> hashMix h (levelHash l)) (exprHash e)
+levelsKey :: Expr -> [Name] -> [Level] -> Int
+levelsKey e ps ls = foldl' (\h l -> hashMix h (levelHash l))
+                           (foldl' (\h p -> hashMix h (nameHash p)) (exprHash e) ps)
+                           ls
 
 -- | A memo on what the environment says about a name; see 'lookupConstC'.
 type ConstMemo = Cache (Name, Maybe ConstInfo)
