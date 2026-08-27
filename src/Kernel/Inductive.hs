@@ -28,6 +28,7 @@ module Kernel.Inductive
   ( CoreInd (..)
   , AdmittedInd (..)
   , admitInd
+  , freshLevelName
   ) where
 
 import           Control.Monad (forM, forM_, unless, when)

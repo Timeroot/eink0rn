@@ -826,23 +826,53 @@ flatNames privRoot nMem = FlatNames
     ty    = mkStr privRoot (B.pack "ty")
     tag k = mkNum (mkStr idx (B.pack "mk")) (toInteger k)
 
--- | Admit the block by flattening it: see the note above.
-flattenBlock :: Env -> [[ExCtor]] -> [CoreMember] -> [CoreMember] -> [Nested]
-             -> [(Binder, Expr)] -> Int -> [Name] -> Int -> [ExRec] -> Name
-             -> Either String BlockResult
-flattenBlock env0 groups declMembers auxMembers nested paramTele nDecl
-             lvls nps recs privRoot = do
-  let members   = declMembers ++ auxMembers
-      declNames = map cmName declMembers
-      memNames  = map cmName members
+-- | What one flattening derives, before any of it is compared against a file.
+--
+-- 'flattenBlock' is one caller; the heterogeneous lowering below is the other,
+-- and it needs the same machinery pointed at blocks the file never wrote (an
+-- all-@Prop@ shadow of the block, and each strongly connected component of its
+-- data members on its own).
+data CoreBlock = CoreBlock
+  { cbNumIdx  :: ![Int]          -- ^ index count of each member
+  , cbInds    :: ![IndInfo]      -- ^ each member, at the arity it declares
+  , cbCtors   :: ![[CtorInfo]]   -- ^ each member's constructors, at its own types
+  , cbRecs    :: ![RecInfo]      -- ^ each member's recursor
+  , cbRefl    :: !Bool           -- ^ some constructor recurses under a binder
+  , cbRec     :: !Bool           -- ^ some constructor of the /block/ recurses
+  , cbScratch :: !Env
+    -- ^ the environment the flattening worked in: @Idx@, @F@, and the members
+    -- as stand-in definitions over @F@.  Only for stating comparisons about the
+    -- block that have to see through the flattening; it is not what the caller
+    -- should be admitting anything into.
+  }
+
+-- | Derive a block by flattening it: see the note above.
+--
+-- @disp@ renames a member for an error message (§9.1's auxiliaries are reported
+-- as the container they stand for), and @hint@ is the preferred name for the
+-- fresh elimination universe.
+flattenCore :: Env -> String -> (Name -> Name) -> [CoreMember] -> [(Binder, Expr)]
+            -> [Name] -> Int -> Name -> Name -> Either String CoreBlock
+flattenCore env0 _ _ [m] _ lvls nps hint _ = do
+  ai <- admitInd env0 (coreOf lvls nps hint m)
+  envS <- foldM addConst env0
+    (CInd (aiInd ai) : map CCtor (aiCtors ai) ++ [CRec (aiRec ai)])
+  pure CoreBlock
+    { cbNumIdx  = [indNumIndices (aiInd ai)]
+    , cbInds    = [aiInd ai]
+    , cbCtors   = [aiCtors ai]
+    , cbRecs    = [aiRec ai]
+    , cbRefl    = aiReflexive ai
+    , cbRec     = indIsRecursive (aiInd ai)
+    , cbScratch = envS
+    }
+flattenCore env0 ctxt disp members paramTele lvls nps hint privRoot = do
+  let memNames  = map cmName members
       nMem      = length members
       nCtors    = map (length . cmCtors) members
       selfL     = map LParam lvls
       fn        = flatNames privRoot nMem
-      ctxt      = "flattening the block of " ++ showName (head declNames) ++ ": "
       ctorCtxt cn = ctxt ++ "constructor " ++ showName cn ++ ": "
-      unnest | null nested = id
-             | otherwise   = applyAux lvls nps nested
 
   -- 1. Each member's index telescope, the sort it lands in, and the sorts its
   --    indices live in.  An arity may not mention the block -- the core checks
@@ -893,8 +923,7 @@ flattenBlock env0 groups declMembers auxMembers nested paramTele nDecl
         pure (cn, t)
     pure (cs, CoreMember { cmName = fnTy fn, cmArity = ar
                          , cmCtors = concat cs, cmRecName = fnTyRec fn })
-  aiF <- admitInd envIdx
-           (coreOf lvls nps (elimHint (map exrLevels recs) lvls) flatDecl)
+  aiF <- admitInd envIdx (coreOf lvls nps hint flatDecl)
   let indF   = aiInd aiF
       ctorFs = aiCtors aiF
       recF   = aiRec aiF
@@ -911,7 +940,7 @@ flattenBlock env0 groups declMembers auxMembers nested paramTele nDecl
         (map FVar ps ++ [ mkApps (Const (fnIdxCtor fn k) selfL)
                                  (map FVar ps ++ map FVar is) ]))
   forM_ (zip members vals) $ \(m, v) ->
-    either (\e -> Left (ctxt ++ showName (unAux nested (cmName m))
+    either (\e -> Left (ctxt ++ showName (disp (cmName m))
                         ++ " does not have the type it declares once the block is \
                            \flattened -- which is what it looks like for the members \
                            \of a mutual block to land in different universes: " ++ e))
@@ -922,15 +951,13 @@ flattenBlock env0 groups declMembers auxMembers nested paramTele nDecl
                    , defValue = v, defHint = HAbbrev }
     | (m, v) <- zip members vals ]
 
-  -- 5. The constructors, at the types the file gave them.  Two rewrites stand
-  --    between the type @F@'s constructor was admitted at and the type the file
-  --    wrote, so there are two things to check.  The flattening of §9.3 is
-  --    undone by unfolding the stand-ins of step 4, and that is asked of every
-  --    member, auxiliaries included.  The nesting compilation of §9.1 is undone
-  --    by 'applyAux', and that is asked only of the declared ones: an
-  --    auxiliary's constructors are not in the file to compare against.
-  let ctysOf ms = map (map snd . cmCtors) ms
-  forM_ (zip (concat flatCtorTys) (concat (ctysOf members))) $
+  -- 5. The constructors, at the types the block gives them.  What @F@'s
+  --    constructor was admitted at is the flattening of that, so the two are
+  --    compared with the stand-ins of step 4 available to unfold.  This is asked
+  --    of every member; whether the block's own types are in turn the ones the
+  --    /file/ wrote is the caller's question, and 'cbScratch' is handed back so
+  --    it can be asked in the same environment.
+  forM_ (zip (concat flatCtorTys) (concat (map (map snd . cmCtors) members))) $
     \((cn, flatTy), cty) ->
       either (\e -> Left (ctorCtxt cn ++ e)) (const (Right ())) $
         runTC envTy lvls $ do
@@ -938,13 +965,6 @@ flattenBlock env0 groups declMembers auxMembers nested paramTele nDecl
           unless ok $ throwTC ("the flattening does not give it the type its \
             \block gives it\n  in the block " ++ showExpr cty
             ++ "\n  flattened  " ++ showExpr flatTy)
-  forM_ (zip (concat groups) (concat (ctysOf declMembers))) $ \(c, cty) ->
-    either (\e -> Left (ctorCtxt (excName c) ++ e)) (const (Right ())) $
-      runTC envTy lvls $ do
-        ok <- isDefEq (excType c) (unnest cty)
-        unless ok $ throwTC ("the block does not give it the type it declares\
-          \\n  declared " ++ showExpr (excType c)
-          ++ "\n  derived  " ++ showExpr (unnest cty))
 
   -- 6. The recursors.  The elimination universe is the block's -- §8.5 case 1 --
   --    even when @F@, being a single type, would have been granted more.
@@ -1080,26 +1100,18 @@ flattenBlock env0 groups declMembers auxMembers nested paramTele nDecl
         , recK          = False
         }
 
-  -- 7. Put the real containers back where §9.1 put auxiliaries, and check that
-  --    nothing this pass invented is left anywhere in what the caller will get.
-  let ourRs = [ r { recType   = unnest (recType r)
-                  , recInduct = unAux nested (recInduct r)
-                  , recRules  = [ ru { rrCtor = unAux nested (rrCtor ru)
-                                     , rrRhs  = unnest (rrRhs ru) }
-                                | ru <- recRules r ]
-                  }
-              | r <- derived ]
-      invented = fnAll fn ++ map nsAux nested
-              ++ [ i | n <- nested, (i, _) <- nsCtorMap n ]
-  forM_ ourRs $ \r ->
-    case [ n | n <- invented
+  -- 7. Check that nothing this pass invented is left anywhere in what the
+  --    caller will get.
+  forM_ derived $ \r ->
+    case [ n | n <- fnAll fn
              , any (occursConst n) (recType r : map rrRhs (recRules r)) ] of
       []      -> Right ()
       (n : _) -> Left (ctxt ++ "internal: " ++ showName n ++ " survives in the \
                        \derived recursor " ++ showName (recName r))
 
-  -- 8. And so the block's own constants, on the environment we were handed:
-  --    nothing the flattening invented ever reaches it.
+  -- 8. And so the block's own constants.  They are only described here; adding
+  --    them to an environment is the caller's business, because only the caller
+  --    knows which of them the file is entitled to see.
   --
   --    'indIsRecursive' is a property of the individual member, not of the
   --    block, and @F@ only knows the block's, so it is recomputed here: does a
@@ -1120,11 +1132,70 @@ flattenBlock env0 groups declMembers auxMembers nested paramTele nDecl
                   , indLargeElim   = wantLarge
                   , indK           = False
                   }
-        | (m, ni) <- zip declMembers nIdxs ]
-      ourCs = [ [ ci { ctorType = excType c, ctorInduct = cmName m, ctorIdx = k }
-                | (k, ci, c) <- zip3 [0 ..] cis g ]
-              | (m, g, cis) <- zip3 declMembers groups
-                                    (take nDecl (regroup nCtors ctorFs)) ]
+        | (m, ni) <- zip members nIdxs ]
+      ourCs = [ [ ci { ctorType = cty, ctorInduct = cmName m, ctorIdx = k }
+                | (k, ci, (_, cty)) <- zip3 [0 ..] cis (cmCtors m) ]
+              | (m, cis) <- zip members (regroup nCtors ctorFs) ]
+  pure CoreBlock
+    { cbNumIdx  = nIdxs
+    , cbInds    = ourInds
+    , cbCtors   = ourCs
+    , cbRecs    = derived
+    , cbRefl    = aiReflexive aiF
+    , cbRec     = indIsRecursive indF
+    , cbScratch = envTy
+    }
+
+-- | Admit a block of more than one type by flattening it (SPEC.md §9.3).
+flattenBlock :: Env -> [[ExCtor]] -> [CoreMember] -> [CoreMember] -> [Nested]
+             -> [(Binder, Expr)] -> Int -> [Name] -> Int -> [ExRec] -> Name
+             -> Either String BlockResult
+flattenBlock env0 groups declMembers auxMembers nested paramTele nDecl
+             lvls nps recs privRoot = do
+  let members   = declMembers ++ auxMembers
+      declNames = map cmName declMembers
+      ctxt      = "flattening the block of " ++ showName (head declNames) ++ ": "
+      unnest | null nested = id
+             | otherwise   = applyAux lvls nps nested
+  cb <- flattenCore env0 ctxt (unAux nested) members paramTele lvls nps
+                    (elimHint (map exrLevels recs) lvls) privRoot
+
+  -- The nesting compilation of §9.1 stands between the type the block gives a
+  -- constructor and the type the file wrote; it is undone by 'applyAux'.  Only
+  -- the declared members are asked: an auxiliary's constructors are not in the
+  -- file to compare against.
+  forM_ (zip (concat groups)
+             (concat (map (map snd . cmCtors) declMembers))) $ \(c, cty) ->
+    either (\e -> Left (ctxt ++ "constructor " ++ showName (excName c)
+                        ++ ": " ++ e)) (const (Right ())) $
+      runTC (cbScratch cb) lvls $ do
+        ok <- isDefEq (excType c) (unnest cty)
+        unless ok $ throwTC ("the block does not give it the type it declares\
+          \\n  declared " ++ showExpr (excType c)
+          ++ "\n  derived  " ++ showExpr (unnest cty))
+
+  -- Put the real containers back where §9.1 put auxiliaries, and check that no
+  -- auxiliary is left anywhere in what the caller will get.
+  let ourRs = [ r { recType   = unnest (recType r)
+                  , recInduct = unAux nested (recInduct r)
+                  , recRules  = [ ru { rrCtor = unAux nested (rrCtor ru)
+                                     , rrRhs  = unnest (rrRhs ru) }
+                                | ru <- recRules r ]
+                  }
+              | r <- cbRecs cb ]
+      invented = map nsAux nested ++ [ i | n <- nested, (i, _) <- nsCtorMap n ]
+  forM_ ourRs $ \r ->
+    case [ n | n <- invented
+             , any (occursConst n) (recType r : map rrRhs (recRules r)) ] of
+      []      -> Right ()
+      (n : _) -> Left (ctxt ++ "internal: " ++ showName n ++ " survives in the \
+                       \derived recursor " ++ showName (recName r))
+
+  -- And so the block's own constants, on the environment we were handed:
+  -- nothing the flattening invented ever reaches it.
+  let ourInds = take nDecl (cbInds cb)
+      ourCs = [ [ ci { ctorType = excType c } | (ci, c) <- zip cis g ]
+              | (g, cis) <- zip groups (take nDecl (cbCtors cb)) ]
   envInd <- foldM addConst env0
     (map CInd ourInds ++ map CCtor (concat ourCs) ++ map CRec ourRs)
   forM_ ourRs $ \r -> do
@@ -1139,10 +1210,10 @@ flattenBlock env0 groups declMembers auxMembers nested paramTele nDecl
 
   pure BlockResult
     { brEnv     = envInd
-    , brIndices = take nDecl nIdxs
+    , brIndices = take nDecl (cbNumIdx cb)
     , brFields  = map (map ctorNumFields) ourCs
-    , brRec     = indIsRecursive indF
-    , brRefl    = aiReflexive aiF
+    , brRec     = cbRec cb
+    , brRefl    = cbRefl cb
     }
 
 -- | Beta-reduce a term's leading lambdas against the given arguments.
