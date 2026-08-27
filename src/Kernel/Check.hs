@@ -89,6 +89,7 @@ data TCState = TCState
   , tcLevelInst   :: !LevelMemo -- ^ memo for 'instLevels'
   , tcLocalId     :: !LocalMemo -- ^ which local stands for which binder; see
                                 --   'sharedLocal'
+  , tcConsts      :: !ConstMemo -- ^ memo for 'lookupConst' against 'tcEnv'
   , tcScope       :: !Int      -- ^ the innermost local currently in scope, or
                                --   @-1@; see 'sharedLocal'
   , tcNatOk       :: !(Maybe Bool)  -- ^ cached 'natShapeOk'; see 'expandLit'
@@ -272,6 +273,40 @@ instLevels ps ls e
 levelsKey :: Expr -> [Level] -> Int
 levelsKey e = foldl' (\h l -> hashMix h (levelHash l)) (exprHash e)
 
+-- | A memo on what the environment says about a name; see 'lookupConstC'.
+type ConstMemo = Cache (Name, Maybe ConstInfo)
+
+-- | 'lookupConst' against the current environment, remembered for as long as
+-- that environment is the current one.
+--
+-- The environment is an 'IntMap' of ninety thousand declarations, so a lookup
+-- in it is some seventeen dependent loads, nearly all of them cache misses; and
+-- reduction asks it about the head of every application it looks at, sixty-six
+-- million times over a run of @std@, almost always about a name it has just
+-- asked about.  A direct table indexed by the name's hash answers in one load
+-- and a pointer comparison, and costs six per cent of the run's /time/ while
+-- allocating essentially nothing.
+--
+-- What makes it a cache and not a second environment is that it holds no
+-- opinion of its own: 'setEnv' is the only thing that can change what
+-- 'lookupConst' would say, and it empties this.  Negative answers are kept for
+-- the same reason positive ones are -- within one environment, \"no such
+-- constant\" is just as stable a fact.
+lookupConstC :: Name -> TC (Maybe ConstInfo)
+lookupConstC n = TC $ \s -> do
+  let tbl = tcConsts s
+      key = nameHash n
+      hit ((m, r) : rest) | m == n    = Just r
+                          | otherwise = hit rest
+      hit []                          = Nothing
+  b <- bucket tbl key
+  case hit b of
+    Just r  -> pure (Right (r, s))
+    Nothing -> do
+      let r = lookupConst (tcEnv s) n
+      push (nameHash . fst) tbl key (n, r)
+      pure (Right (r, s))
+
 -- | The checking monad: state, failure, and -- because the memo tables above
 -- are mutable -- 'IO'.
 --
@@ -314,6 +349,7 @@ runTCLearn env lps (TC f) = unsafePerformIO $ do
   defEq  <- newCache
   lvlM   <- newCache
   locId  <- newCache
+  consts <- newCache
   credit <- newCounter wasteRate
   starve <- newCounter 0
   budget <- newBudget unmetered wasteBudget
@@ -321,7 +357,7 @@ runTCLearn env lps (TC f) = unsafePerformIO $ do
   nextId <- newCounter 0
   r <- f (seedLicences env
            (TCState env locals nextId lps budget credit starve
-                    inferV inferA whnfM defEq lvlM locId (-1)
+                    inferV inferA whnfM defEq lvlM locId consts (-1)
                     Nothing Nothing M.empty M.empty M.empty))
   pure (fmap readLicences <$> r)
 {-# NOINLINE runTCLearn #-}
@@ -579,12 +615,15 @@ withEnv env act = do
 setEnv :: Env -> TC ()
 setEnv env = TC $ \s -> do
   forgetMemos s
+  clearCache (tcConsts s)
   pure (Right ((), seedLicences env s { tcEnv = env }))
 
 -- | Throw away everything keyed on a term alone.  'tcLevelInst' is not among
 -- them: what it remembers is a pure function of its key, and neither is
 -- 'tcLocalId': what it remembers is which /name/ a binder was given, and a name
--- means the same thing under every environment.
+-- means the same thing under every environment.  'tcConsts' is not either, but
+-- for the opposite reason -- it is about the environment and nothing else, so
+-- 'setEnv' empties it and a change of universe parameters leaves it alone.
 forgetMemos :: TCState -> IO ()
 forgetMemos s = do
   clearCache (tcInferV s)
@@ -815,9 +854,7 @@ betaApply = go []
 unfoldDelta :: Expr -> TC (Maybe Expr)
 unfoldDelta e = outOfFuel >>= \out -> if out then pure Nothing else
   case headOf e of
-    Const n ls -> do
-      env <- getEnv
-      case lookupConst env n of
+    Const n ls -> lookupConstC n >>= \case
         Just (CDef d) | length ls == length (defLevels d) -> do
           let args = argsOf e
           held <- natBlocked n args
@@ -835,9 +872,7 @@ unfoldDelta e = outOfFuel >>= \out -> if out then pure Nothing else
 -- fires on -- which is most of them -- costs one environment lookup and nothing
 -- else.
 reduceConstApp :: Expr -> Name -> [Level] -> TC (Maybe Expr)
-reduceConstApp e n ls = do
-  env <- getEnv
-  case lookupConst env n of
+reduceConstApp e n ls = lookupConstC n >>= \case
     Just (CRec r)            -> reduceRec r ls (argsOf e)
     Just (CQuot _ _ _ QLift) -> reduceQuot 6 5 3 (argsOf e)
     Just (CQuot _ _ _ QInd)  -> reduceQuot 5 4 3 (argsOf e)
@@ -1795,9 +1830,7 @@ tryRigidSpine t s = do
 -- 'tryRigidSpine', since congruence is the only rule left for it.
 deltaHead :: Expr -> TC (Maybe Hint)
 deltaHead e = case headOf e of
-  Const n ls -> do
-    env <- getEnv
-    case lookupConst env n of
+  Const n ls -> lookupConstC n >>= \case
       Just (CDef d) | length ls == length (defLevels d) -> do
         -- The arguments are only wanted for the four operations that can be
         -- held, and taking a spine apart is not free, so the cheap half of
@@ -2199,9 +2232,7 @@ inferCore m env e = case e of
   Sort l      -> do when (m == Verify) (checkLevel l); pure (Sort (LSucc l))
   NatLit _    -> pure (Const nameNat [])
   StrLit _    -> pure (Const nameString [])
-  Const n ls  -> do
-    genv <- getEnv
-    case lookupConst genv n of
+  Const n ls  -> lookupConstC n >>= \case
       Nothing -> throwTC ("unknown constant " ++ showName n)
       Just ci -> do
         let ps = constLevels ci
