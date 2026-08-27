@@ -77,7 +77,7 @@ checkExport cfg = verdict . checkExportTrace cfg . map Right
     verdict (Failed err   : _) = Left err
     verdict (Done env obs : _) = env <$ discharge obs
     verdict (Starting _   : r) = verdict r
-    verdict (Checked _    : r) = verdict r
+    verdict (Checked _ _  : r) = verdict r
     verdict []                 = Left "internal error: export trace ended"
 
 -- | What checking a declaration produced.  A trace is a 'Starting' and a
@@ -85,7 +85,11 @@ checkExport cfg = verdict . checkExportTrace cfg . map Right
 -- 'Done' or 'Failed'.
 data Progress
   = Starting !(Maybe Name) -- ^ this declaration is about to be checked
-  | Checked !(Maybe Name)  -- ^ this declaration went in; 'Nothing' for an empty block
+  | Checked !(Maybe Name) ![Obligation]
+    -- ^ this declaration went in, putting off these value checks; 'Nothing' for
+    -- an empty block, and no obligations unless 'cfgDefer'.  They are the very
+    -- 'Obligation's 'Done' will hand back, so a consumer that starts on them here
+    -- is doing the work 'discharge' would otherwise do later, not work twice.
   | Done Env [Obligation]  -- ^ every declaration went in, bar these ('cfgDefer')
   | Failed String          -- ^ this is why it did not
 
@@ -147,7 +151,14 @@ checkExportTrace cfg =
     go st (Right d : ds) = case declName d of
       !nm -> Starting nm : case step st d of
         Left err  -> [Failed err]
-        Right st' -> Checked nm : go st' ds
+        Right st' -> Checked nm (filed st st') : go st' ds
+
+    -- What this declaration put off, for a consumer that wants to get on with it
+    -- rather than wait for 'Done'.  'lsObs' is newest first and 'lsSeen' counts
+    -- exactly the definitions that could have filed one, so the difference says
+    -- how far down the new ones reach; they come back newest first too, which
+    -- nothing minds, since 'Done' is still where the file order lives.
+    filed st st' = take (lsSeen st' - lsSeen st) (lsObs st')
 
     finish st = do
       -- A quotient primitive still held back at the end of the file never had

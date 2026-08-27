@@ -177,15 +177,15 @@ run o path = do
   ds <- pure $! parseExport input
   -- Reading the file is the other half of a two-pass run's sequential part, and
   -- it does not depend on the checking, so with cores to spare it is given one.
-  -- Two capabilities, not @jobs@ of them: the rest have nothing to do until pass
-  -- two and would only join the queue at every collection.
-  when (jobs > 1) $ setNumCapabilities 2 >> prefetch ds
-  walked <- walk o (checkExportTrace cfg ds)
+  -- The rest are turned on here too, rather than when pass two starts, because
+  -- 'sparkObs' has work for them from the first declaration onwards.
+  when (jobs > 1) $ setNumCapabilities jobs >> prefetch ds
+  let trace = checkExportTrace cfg ds
+  walked <- walk o (if jobs > 1 then sparkObs trace else trace)
   result <- case walked of
     Left err        -> pure (Left err)
     Right (env, []) -> pure (Right env)
     Right (env, obs) -> do
-      when (jobs > 1) (setNumCapabilities jobs)
       remark o (show (length obs) ++ " value checks on " ++ show jobs ++ " threads")
       t2 <- getMonotonicTime
       r  <- pure $! (env <$ parDischarge jobs obs)
@@ -226,6 +226,34 @@ prefetch xs = () <$ forkIO (go xs)
   where
     go []       = pure ()
     go (y : ys) = y `seq` go ys
+
+-- | Pass the trace through, setting the other threads on each value check as
+-- pass one files it rather than waiting for the end of the file.
+--
+-- Pass one is the sequential part of a @-jN@ run and the obligations are the
+-- parallel one, so running them after it is a queue behind a bottleneck: on
+-- @std@ pass one is sixteen seconds of one thread while fifteen threads have
+-- nothing to do, and the obligations are a hundred and thirteen seconds of work
+-- that would fit inside it seven times over.  Started here, they mostly do.
+--
+-- These are the same 'Obligation' values 'Done' hands back, so this decides
+-- nothing: 'parDischarge' still reads every one of them, in file order, and
+-- still gives the answer.  A spark that ran has left its @obCheck@ evaluated and
+-- 'parDischarge' finds it done; a spark that was dropped for want of room in the
+-- pool, or that never got a thread, leaves it to be done then.  Either way the
+-- verdict is the one §11.6 argues for.
+--
+-- One spark per obligation, and no chunking, because the thunk a chunk would be
+-- made of is reachable from nothing but the spark itself and would be collected
+-- rather than run.  An @obCheck@ is reachable: the trace's unevaluated tail holds
+-- the state that holds every obligation filed so far.  Nor does the pool overflow
+-- at ninety thousand of them -- it holds four thousand, and on @std@ the threads
+-- take them twice as fast as pass one can file them.
+sparkObs :: [Progress] -> [Progress]
+sparkObs = map fire
+  where
+    fire p@(Checked _ obs) = foldr (\o r -> obCheck o `par` r) p obs
+    fire p                 = p
 
 -- | Discharge the deferred value checks on @n@ threads.
 --
@@ -300,7 +328,7 @@ walk o ps0 = case optProgress o of
             t <- getMonotonicTime
             writeIORef cur (mn, t)
             loud ps
-          loud (Checked mn : ps) = do
+          loud (Checked mn _ : ps) = do
             t       <- getMonotonicTime
             (_, s)  <- readIORef cur
             modifyIORef' n (+ 1)
@@ -321,7 +349,7 @@ walk o ps0 = case optProgress o of
     quiet (Failed err   : _) = Left err
     quiet (Done env obs : _) = Right (env, obs)
     quiet (Starting _   : r) = quiet r
-    quiet (Checked _    : r) = quiet r
+    quiet (Checked _ _  : r) = quiet r
     quiet []                 = Left "internal error: export trace ended"
 
     note s = hPutStrLn stderr ("[ " ++ s ++ " ]")
