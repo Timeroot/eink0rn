@@ -25,6 +25,7 @@ module Kernel.Cache
   , newCounter
   , tick
   , readCounter
+  , writeCounter
   , bumpCounter
   , nextCount
   , Budget
@@ -159,6 +160,12 @@ tick (Counter a) reload = do
 
 readCounter :: Counter -> IO Int
 readCounter (Counter a) = unsafeRead a 0
+
+-- | Set it outright.  Not everything a machine word is good for is a count:
+-- "Kernel.Check" keeps the innermost local in scope in one of these, and
+-- entering a binder replaces that rather than counting anything.
+writeCounter :: Counter -> Int -> IO ()
+writeCounter (Counter a) = unsafeWrite a 0
 
 bumpCounter :: Counter -> IO ()
 bumpCounter (Counter a) = unsafeRead a 0 >>= unsafeWrite a 0 . (+ 1)
