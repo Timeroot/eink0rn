@@ -26,6 +26,13 @@ module Kernel.Cache
   , tick
   , readCounter
   , bumpCounter
+  , nextCount
+  , Budget
+  , newBudget
+  , getFuel
+  , setFuel
+  , getWaste
+  , setWaste
   ) where
 
 import           Data.Array.Base (unsafeRead, unsafeWrite)
@@ -131,3 +138,44 @@ readCounter (Counter a) = unsafeRead a 0
 
 bumpCounter :: Counter -> IO ()
 bumpCounter (Counter a) = unsafeRead a 0 >>= unsafeWrite a 0 . (+ 1)
+
+-- | Hand out the current value and move on: a supply of identifiers, none of
+-- them ever returned twice.
+nextCount :: Counter -> IO Int
+nextCount (Counter a) = do
+  n <- unsafeRead a 0
+  unsafeWrite a 0 (n + 1)
+  pure n
+
+-- | The reduction budget: two words, and for the same reason 'Counter' is one.
+--
+-- 'Kernel.Check.spend' runs on every reduction step and changes nothing but
+-- these two numbers, so keeping them among the fields of the checker's state
+-- meant rebuilding a twenty-field record to subtract one from an @Int@.  They
+-- are a pair rather than two 'Counter's because every reader of one is a reader
+-- of the other, and one array header is cheaper than two.
+--
+-- Slot 0 is the fuel and slot 1 the waste allowance; see 'Kernel.Check.spend'
+-- for what they mean.  Unlike the memo tables this is not a cache: what it
+-- holds decides how far reduction goes, and the combinators that lend a
+-- computation a budget are the ones that put the caller's back.
+newtype Budget = Budget (IOUArray Int Int)
+
+newBudget :: Int -> Int -> IO Budget
+newBudget f w = do
+  a <- newArray (0, 1) 0
+  unsafeWrite a 0 f
+  unsafeWrite a 1 w
+  pure (Budget a)
+
+getFuel :: Budget -> IO Int
+getFuel (Budget a) = unsafeRead a 0
+
+setFuel :: Budget -> Int -> IO ()
+setFuel (Budget a) = unsafeWrite a 0
+
+getWaste :: Budget -> IO Int
+getWaste (Budget a) = unsafeRead a 1
+
+setWaste :: Budget -> Int -> IO ()
+setWaste (Budget a) = unsafeWrite a 1
