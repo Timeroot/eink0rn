@@ -43,9 +43,15 @@ executable eink0rn
     main-is:          Main.hs
     build-depends:    base, bytestring, containers, eink0rn
     -- -K512m: the checker recurses over terms as deep as the file makes them.
-    -- -A512m: a nursery this size is what the allocation rate wants.  On std,
-    -- going from 64m to 512m copies half as many bytes out of it and cuts the
-    -- run by 9%; 1024m copies 6% fewer again, but holds 39% more live at the
-    -- peak and is no faster.
-    ghc-options:      -rtsopts "-with-rtsopts=-K512m -A512m"
+    -- -A1g: a nursery this size is what the allocation rate wants.  Almost
+    -- everything the checker allocates is a rebuilt term that dies before the
+    -- next declaration, so a bigger nursery is not merely fewer collections but
+    -- less promotion: on std, 512m collects 17.2s and holds 1.22 GB live at the
+    -- peak, 1g collects 15.5s and holds 1.08 GB, 2g collects 12.7s and holds
+    -- 1.01 GB.  What stops it here is that the nursery is committed at startup
+    -- whether the file needs it or not -- 24ms and 16 MB at 512m, 35ms and
+    -- 24 MB at 1g, 61ms and 40 MB at 2g -- which a corpus does not notice and a
+    -- one-declaration test case is entirely made of.  A run over something the
+    -- size of mathlib is worth another 1.5% and can ask for it: +RTS -A2g.
+    ghc-options:      -rtsopts "-with-rtsopts=-K512m -A1g"
     default-language: Haskell2010
