@@ -139,21 +139,36 @@ emptyPools = Pools (poolPush 0 Anon emptyPool) (poolPush 0 LZero emptyPool) empt
 -- declaration that does not typecheck is reported ahead of a malformed line
 -- below it, where reading the file first would have reported the malformed line.
 parseExport :: B.ByteString -> [Either String ExDecl]
-parseExport input = go (1 :: Int) emptyPools (B.lines input)
+parseExport input = go (1 :: Int) emptyPools 0
   where
-    go _ _ [] = []
-    -- The line number is wanted only by the two error branches, so nothing else
+    len = B.length input
+
+    -- Lines are found rather than made: 'fastLine' matches straight into the
+    -- file at an offset and says where the next line starts, so the nine lines
+    -- in ten it recognises never become a 'B.ByteString' of their own.  Only the
+    -- rest are cut out, for 'step' to read as before.
+    --
+    -- The line number is wanted only by the error branches, so nothing else
     -- forces it: without the bang a file with ten million lines in it builds ten
     -- million additions before anything asks what line this is.
-    go !ln ps (l : ls) = case fastLine ps l of
-      Just (Left err)  -> [Left (at ln err)]
-      Just (Right ps') -> go (ln + 1) ps' ls
-      Nothing
-        | B.null (B.dropWhile (`elem` " \t\r") l) -> go (ln + 1) ps ls
-        | otherwise -> case step ps l of
-            Left err                -> [Left (at ln err)]
-            Right (ps', Nothing)    -> go (ln + 1) ps' ls
-            Right (ps', Just dec)   -> Right dec : go (ln + 1) ps' ls
+    go !ln ps !off
+      | off >= len = []
+      | otherwise  = case fastLine ps input off of
+          FastOk ps' nxt -> go (ln + 1) ps' nxt
+          FastErr err    -> [Left (at ln err)]
+          NotFast        -> slow ln ps (B.takeWhile (/= '\n') (B.drop off input))
+      where
+        -- Past the newline, or -- on a last line that has none -- one past the
+        -- end, which the guard above reads as the end.  A file that /does/ end
+        -- in a newline leaves @off == len@, and that is the empty last line
+        -- 'B.lines' also declines to produce.
+        slow ln' ps' l
+          | B.null (B.dropWhile (`elem` " \t\r") l) = go (ln' + 1) ps' nxt
+          | otherwise = case step ps' l of
+              Left err              -> [Left (at ln' err)]
+              Right (ps'', Nothing) -> go (ln' + 1) ps'' nxt
+              Right (ps'', Just d)  -> Right d : go (ln' + 1) ps'' nxt
+          where nxt = off + B.length l + 1
 
     at ln err = "line " ++ show ln ++ ": " ++ err
 
@@ -182,71 +197,75 @@ parseExport input = go (1 :: Int) emptyPools (B.lines input)
 -- 'readExpr' makes them, so that a line with two bad indices is still reported
 -- against the same one.
 --
--- 'Nothing' is "not one of these shapes"; @Just (Left _)@ is "one of them, and
--- an index in it names a pool entry that does not exist".
+-- 'NotFast' is "not one of these shapes"; 'FastErr' is "one of them, and an
+-- index in it names a pool entry that does not exist".
+--
+-- The matching is done on the file itself, at an offset, and never on a line cut
+-- out of it: a position is an 'Int', @-1@ says the shape did not match there, and
+-- a matcher handed @-1@ passes it on.  So the chains below read as the shape they
+-- match and allocate nothing at all while they are deciding -- where the same
+-- three functions written over 'B.ByteString' slices allocated some four hundred
+-- bytes a line, on ten million lines, to say what a dozen byte comparisons say.
 
-fastLine :: Pools -> B.ByteString -> Maybe (Either String Pools)
-fastLine ps l = case appLine ps l of
-  Just r  -> Just r
-  Nothing -> case lamLine ps l of
-    Just r  -> Just r
-    Nothing -> allLine ps l
+-- | Where a fast line got to: the pools it leaves behind, and the offset the
+-- next line starts at.
+data Fast = NotFast | FastErr String | FastOk !Pools !Int
+
+fastLine :: Pools -> B.ByteString -> Int -> Fast
+fastLine ps s i = case appLine ps s i of
+  NotFast -> case lamLine ps s i of
+    NotFast -> allLine ps s i
+    r       -> r
+  r       -> r
 
 -- | @{"app":{"arg":N,"fn":M},"ie":K}@.
-appLine :: Pools -> B.ByteString -> Maybe (Either String Pools)
-appLine ps l0 = do
-  l1       <- lit appOpen l0
-  (a,  l2) <- nat l1
-  l3       <- lit appFn l2
-  (f,  l4) <- nat l3
-  l5       <- lit appIe l4
-  (k,  l6) <- nat l5
-  end =<< lit close l6
-  pure $ do
-    fn  <- exprIx ps f
-    arg <- exprIx ps a
-    Right (fileExpr k (App fn arg) ps)
+appLine :: Pools -> B.ByteString -> Int -> Fast
+appLine ps s i0 =
+  case nat s (lit appOpen s i0) of { Cur i1 a ->
+  case nat s (lit appFn   s i1) of { Cur i2 f ->
+  case nat s (lit appIe   s i2) of { Cur i3 k ->
+  case eol s (lit close   s i3) of
+    nxt | nxt < 0   -> NotFast
+        | otherwise -> case exprIx ps f of
+            Left err -> FastErr err
+            Right fn -> case exprIx ps a of
+              Left err  -> FastErr err
+              Right arg -> FastOk (fileExpr k (App fn arg) ps) nxt }}}
 
 -- | @{"ie":K,"lam":{"binderInfo":"B","body":N,"name":M,"type":T}}@.
-lamLine :: Pools -> B.ByteString -> Maybe (Either String Pools)
-lamLine ps l0 = do
-  l1       <- lit lamOpen l0
-  (k,  l2) <- nat l1
-  l3       <- lit lamMid l2
-  l4       <- binderInfoLit l3
-  (b,  l5) <- nat l4
-  l6       <- lit nameKey l5
-  (nm, l7) <- nat l6
-  l8       <- lit typeKey l7
-  (t,  l9) <- nat l8
-  la       <- lit lamEnd l9
-  end la
-  pure (binderAt ps Lam k nm t b)
+lamLine :: Pools -> B.ByteString -> Int -> Fast
+lamLine ps s i0 =
+  case nat s (lit lamOpen s i0)      of { Cur i1 k  ->
+  case nat s (binderInfoLit s
+               (lit lamMid s i1))    of { Cur i2 b  ->
+  case nat s (lit nameKey s i2)      of { Cur i3 nm ->
+  case nat s (lit typeKey s i3)      of { Cur i4 t  ->
+  case eol s (lit lamEnd  s i4) of
+    nxt | nxt < 0   -> NotFast
+        | otherwise -> binderAt ps Lam k nm t b nxt }}}}
 
 -- | @{"forallE":{"binderInfo":"B","body":N,"name":M,"type":T},"ie":K}@.
-allLine :: Pools -> B.ByteString -> Maybe (Either String Pools)
-allLine ps l0 = do
-  l1       <- lit allOpen l0
-  l2       <- binderInfoLit l1
-  (b,  l3) <- nat l2
-  l4       <- lit nameKey l3
-  (nm, l5) <- nat l4
-  l6       <- lit typeKey l5
-  (t,  l7) <- nat l6
-  l8       <- lit allMid l7
-  (k,  l9) <- nat l8
-  end =<< lit close l9
-  pure (binderAt ps Pi k nm t b)
+allLine :: Pools -> B.ByteString -> Int -> Fast
+allLine ps s i0 =
+  case nat s (binderInfoLit s
+               (lit allOpen s i0))   of { Cur i1 b  ->
+  case nat s (lit nameKey s i1)      of { Cur i2 nm ->
+  case nat s (lit typeKey s i2)      of { Cur i3 t  ->
+  case nat s (lit allMid  s i3)      of { Cur i4 k  ->
+  case eol s (lit close   s i4) of
+    nxt | nxt < 0   -> NotFast
+        | otherwise -> binderAt ps Pi k nm t b nxt }}}}
 
 -- | File a binder, resolving its three indices in the order 'readExpr' does.
 binderAt :: Pools -> (Binder -> Expr -> Expr -> Expr)
-         -> Int -> Int -> Int -> Int -> Either String Pools
-binderAt ps con k nm t b = do
-  n'   <- maybe (Left ("undefined name index " ++ show nm)) Right
-                (poolAt (pNames ps) nm)
-  ty   <- exprIx ps t
-  body <- exprIx ps b
-  Right (fileExpr k (con (Binder n') ty body) ps)
+         -> Int -> Int -> Int -> Int -> Int -> Fast
+binderAt ps con k nm t b nxt = case poolAt (pNames ps) nm of
+  Nothing -> FastErr ("undefined name index " ++ show nm)
+  Just n' -> case exprIx ps t of
+    Left err -> FastErr err
+    Right ty -> case exprIx ps b of
+      Left err   -> FastErr err
+      Right body -> FastOk (fileExpr k (con (Binder n') ty body) ps) nxt
 
 exprIx :: Pools -> Int -> Either String Expr
 exprIx ps i = maybe (Left ("undefined expression index " ++ show i)) Right
@@ -255,42 +274,65 @@ exprIx ps i = maybe (Left ("undefined expression index " ++ show i)) Right
 fileExpr :: Int -> Expr -> Pools -> Pools
 fileExpr k e ps = ps { pExprs = poolPush k e (pExprs ps) }
 
-lit :: B.ByteString -> B.ByteString -> Maybe B.ByteString
-lit p s | p `B.isPrefixOf` s = Just (B.drop (B.length p) s)
-        | otherwise          = Nothing
+-- | Match a literal at a position, and say where it ends.
+lit :: B.ByteString -> B.ByteString -> Int -> Int
+lit p s i
+  | i < 0 || i + n > B.length s = -1
+  | otherwise                   = go 0
+  where
+    n = B.length p
+    go !j | j == n                           = i + n
+          | B.index s (i + j) == B.index p j = go (j + 1)
+          | otherwise                        = -1
 
--- | Nothing left of the line.
-end :: B.ByteString -> Maybe ()
-end s = if B.null s then Just () else Nothing
+-- | The end of the line, and where the next one starts.
+--
+-- A last line with no newline after it ends at the end of the file, and the
+-- offset one past it is what the loop reads as "nothing left".
+eol :: B.ByteString -> Int -> Int
+eol s i
+  | i < 0                  = -1
+  | i == B.length s        = i
+  | B.index s i == '\n'    = i + 1
+  | otherwise              = -1
+
+-- | Where a matcher got to, and the number it read there.
+data Cur = Cur !Int !Int
 
 -- | A run of digits, as a number.
 --
--- 'B.readInt' would also take a sign, and -- despite what its name suggests
--- about the range it reads -- wraps silently on a number too large for an 'Int'
--- rather than declining to read it.  A wrapped index that landed on a pool entry
--- that happens to exist would be read as naming it.  So the run is measured
--- first, and anything but one to eighteen digits -- eighteen being as many as
--- cannot overflow -- is left to 'step', which checks the range properly and says
--- so.
-nat :: B.ByteString -> Maybe (Int, B.ByteString)
-nat s | d < 1 || d > 18 = Nothing
-      | otherwise       = B.readInt s
-  where d = digits 0
-        digits !j | j < B.length s && isDigit (B.index s j) = digits (j + 1)
-                  | otherwise                              = j
+-- One to eighteen of them -- eighteen being as many as cannot overflow an 'Int'.
+-- Nineteen is not "read the first eighteen": a number too large for the index it
+-- is going to be is left to 'step', which checks the range properly and says so,
+-- rather than being wrapped into an index that happens to exist.  Nor is a sign
+-- taken, which is why this is not 'B.readInt'.
+nat :: B.ByteString -> Int -> Cur
+nat s i
+  | i < 0     = Cur (-1) 0
+  | otherwise = go i 0 0
+  where
+    n = B.length s
+    go !j !d !v
+      | j < n, c <- B.index s j, isDigit c =
+          if d == (18 :: Int) then Cur (-1) 0
+                              else go (j + 1) (d + 1) (v * 10 + fromEnum c - 48)
+      | d == 0    = Cur (-1) 0
+      | otherwise = Cur j v
 
 -- | One of the four binder annotations, followed by the key that comes after it.
 --
 -- The annotation itself is discarded, exactly as 'binderInfoOf' discards it; it
 -- is matched only because a line carrying one this reader does not know is a
 -- line written against a format it does not know.
-binderInfoLit :: B.ByteString -> Maybe B.ByteString
-binderInfoLit s = go binderInfoLits
+binderInfoLit :: B.ByteString -> Int -> Int
+binderInfoLit s i
+  | i < 0     = -1
+  | otherwise = go binderInfoLits
   where
-    go []       = Nothing
-    go (p : pr) = case lit p s of
-      Just t  -> Just t
-      Nothing -> go pr
+    go []       = -1
+    go (p : pr) = case lit p s i of
+      -1 -> go pr
+      j  -> j
 
 -- | The literal stretches, packed once at the top level rather than at each of
 -- ten million comparisons.
