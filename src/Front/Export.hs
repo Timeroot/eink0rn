@@ -1,5 +1,18 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE LambdaCase   #-}
+-- Under @-jN@ the reader thread and pass one walk the same list, and where they
+-- meet they meet on a thunk: the tail of that list, and the parse state behind
+-- it.  GHC's default is to claim a thunk only once its evaluation is finished,
+-- which is free but lets two threads that arrive together each do the whole
+-- thing.  That is a fair bet when the thunk is small.  It is a bad one here,
+-- because every thunk in this module stands for a stretch of the file, and pass
+-- one is now fast enough to catch the reader up: on @std@ the two of them
+-- between them read the file about one and a half times over, which showed up
+-- as ten gigabytes of allocation that a @-j1@ run of the same binary did not
+-- have.  Claiming the thunk on entry costs a write per thunk and settles it.
+-- Only here, since only this module's thunks are shared across threads --
+-- an obligation is checked by whichever thread took it and no other.
+{-# OPTIONS_GHC -feager-blackholing #-}
 -- | Reading a @lean4export@ NDJSON stream into core terms.
 --
 -- The file is a sequence of lines.  Most define one entry of a pool -- a name,
