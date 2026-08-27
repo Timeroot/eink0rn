@@ -36,6 +36,7 @@ module Kernel.Check
   , setLevelParams
   , expandLit
   , canonIndMatches
+  , warmLicences
   ) where
 
 import           Control.Monad          (unless, when)
@@ -148,6 +149,28 @@ readLicences s = do
     , licCanonInd = yeses canon
     }
   where yeses = M.keysSet . M.filter id
+
+-- | Ask for every licence this environment supports, before anything needs one.
+--
+-- Nothing here decides anything: each of these questions is asked anyway, the
+-- first time reduction meets the operation it is about, and asking early changes
+-- only /when/. What it buys is that the answer is then in 'Licences', and so
+-- travels to every later declaration instead of being rediscovered by each.
+--
+-- Which matters when the value checks are deferred ('Front.Lower.Obligation'),
+-- because then no value check runs before any other and none of them can hand
+-- its licences on. Establishing an arithmetic licence is not cheap -- it
+-- type-checks the operation's defining equations, and for @div@ and @mod@ a
+-- table of probes -- and on @std@ paying for it once per declaration rather than
+-- once per file costs a third of the run.
+--
+-- Off the caller's budget, since the caller did not ask for this, and behind
+-- 'attempt', since a licence that cannot be established is an answer and not a
+-- failure.
+warmLicences :: TC ()
+warmLicences = unmeteredly $ do
+  _ <- attempt strShapeOk       -- which needs, and so establishes, 'natShapeOk'
+  mapM_ (attempt . natOpOk) natOpNames
 
 -- | A memo table on (term, local environment) pairs.
 --

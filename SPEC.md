@@ -2371,6 +2371,63 @@ and a positive one stays true as the environment grows, so they are stored in th
 environment and travel with it. Only positive answers travel; see §6.5 for why
 that is what makes it sound.
 
+### 11.6 Two passes, and why they give the same answer
+
+`-jN` checks a file in two passes. Pass one walks the declarations in order and
+admits each one on the strength of its *statement*: the type is checked to be a
+type (§5.2 `sort`), and for a theorem §12.10 is asked of the statement to decide
+whether the value will be kept. The check that the value inhabits the type is set
+aside as an *obligation* and not performed. Pass two performs the obligations,
+on N threads. The file is accepted when pass one finished and every obligation
+holds.
+
+The two passes accept exactly the files one pass does, and this is the argument.
+Write `Γ₀ ⊂ Γ₁ ⊂ …` for the environments the one-pass run builds. Nothing pass
+one does depends on a value check having happened: the constant a declaration
+contributes is determined by its name, universe parameters, type and the `spent`
+answer, and `spent` is a question about the statement alone. So the two-pass run
+builds *the same* `Γₖ`, and the obligation it files for declaration `k` is
+`Γₖ ⊢ vₖ : τₖ` — the very judgement the one-pass run made at that point, in the
+very same environment, since an obligation captures `Γₖ` and not the final
+environment. The set of judgements attempted is therefore identical; only the
+order changes, and each is decided independently of the others (the checker
+writes nothing but its own per-declaration memo tables, which §11.4 discards at
+the end of the declaration anyway). Both runs accept iff all of them hold.
+
+Two things do not carry over, and neither can change a verdict:
+
+- **Which failure is reported.** One pass stops at the first judgement that
+  fails; two passes report the first *statement* failure if there is one, and
+  otherwise the first obligation in file order. When a bad value makes a later
+  statement fail as well, the two runs name different declarations. Both reject.
+- **Licences (§6.5).** In one pass a licence established while checking a value
+  travels to every later declaration. Deferred, no value check precedes another,
+  so none of them can hand a licence on. Pass one therefore calls
+  `warmLicences` — which asks for every licence outright, at declarations
+  0, 1, 2, 4, 8, …, so a logarithmic number of times over the file — and those
+  licences travel forward in the ordinary way. This is not a
+  correctness measure: a licence only ever *enables* a reduction the kernel has
+  proved it may take, so losing one costs work and never an answer, and the
+  reduction budget of §7.4 is per declaration and is not spent on establishing
+  them. Without the warming `std` allocates a third more, every declaration
+  that touches arithmetic having re-derived `Nat.add` for itself.
+
+The one-pass path is the audited one and remains the default. It maintains the
+stronger invariant — a constant enters the environment only once *everything*
+about it has been checked — which is what the rest of the implementation is
+written against, and it is the path every test case runs on.
+
+What it buys is the whole point: on `std` the value checks are 81% of the time
+and 78% of the allocation, and they are a long tail rather than a few monsters,
+so they parallelise. Measured on this 64-core box, `std` takes 139s in one pass
+and 36s at `-j32`. Two passes on *one* thread cost nothing measurable and 4%
+more allocation, which is a second `TCState` per declaration; the ceiling on the
+speedup is pass one, which is inherently sequential, plus the slowest single
+declaration (8.7s of the 139s). Note that the nursery is committed per
+capability, so a large `-jN` wants a smaller `-A` than a one-thread run does:
+`-A1g` at `-j32` commits 32 GB and runs *slower* than `-A128m`, which commits
+four.
+
 ---
 
 ## 12. The name surface, and deliberate divergences

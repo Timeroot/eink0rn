@@ -82,6 +82,7 @@ export.
 | `--keep-proofs` | off | retain every proof term instead of sealing it (SPEC §12.10). A pure performance switch. |
 | `--enforce-mutual-univ` | off | reject a mutual inductive block whose types do not all end in the same sort, as every other Lean kernel does. By default such a block is derived from simpler declarations and accepted if the derivation checks out (SPEC §9.6, §12.14). |
 | `--progress[=SECS]` | off | report on stderr as the file is checked, naming each declaration that took at least `SECS` seconds. |
+| `-jN` | off | check in two passes, the second on `N` threads (bare `-j`: one per core). Pass one admits each declaration on its statement; pass two checks the values, which is where four fifths of the time goes and which nothing else depends on. Same verdict either way — SPEC §11.6 says why. `std` in 36s rather than 139s. |
 
 ## Tests
 
@@ -90,7 +91,7 @@ laid out as `good/*.ndjson` and `bad/*.ndjson`:
 
 ```
 bash tools/run-tests.sh                 # 186/186
-bash tools/run-tests.sh tests           # 14/14, hand-written
+bash tools/run-tests.sh tests           # 16/16, hand-written
 bash tools/run-tests.sh validation      # the validation corpus below
 ```
 

@@ -30,6 +30,8 @@ module Front.Lower
   , checkExport
   , checkExportTrace
   , Progress (..)
+  , Obligation (..)
+  , discharge
   , checkStdPins
   ) where
 
@@ -60,20 +62,23 @@ data Config = Config
     -- ^ Reject a mutual inductive block whose types do not all land in the same
     -- universe, as every other Lean kernel does.  Off by default: the block is
     -- sound and \"Front.Hetero\" derives it (SPEC.md §9.6).
+  , cfgDefer :: !Bool
+    -- ^ Hand back each definition's value check as an 'Obligation' instead of
+    -- running it where it stands.  Off by default; see 'Obligation'.
   }
 
 defaultConfig :: Config
-defaultConfig = Config AccelCanonical True False
+defaultConfig = Config AccelCanonical True False False
 
 -- | Check a whole export, returning the resulting environment.
 checkExport :: Config -> [ExDecl] -> Either String Env
 checkExport cfg = verdict . checkExportTrace cfg
   where
-    verdict (Failed err  : _) = Left err
-    verdict (Done env    : _) = Right env
-    verdict (Starting _  : r) = verdict r
-    verdict (Checked _   : r) = verdict r
-    verdict []                = Left "internal error: export trace ended"
+    verdict (Failed err   : _) = Left err
+    verdict (Done env obs : _) = env <$ discharge obs
+    verdict (Starting _   : r) = verdict r
+    verdict (Checked _    : r) = verdict r
+    verdict []                 = Left "internal error: export trace ended"
 
 -- | What checking a declaration produced.  A trace is a 'Starting' and a
 -- 'Checked' per declaration accepted, in file order, ending in exactly one
@@ -81,8 +86,40 @@ checkExport cfg = verdict . checkExportTrace cfg
 data Progress
   = Starting !(Maybe Name) -- ^ this declaration is about to be checked
   | Checked !(Maybe Name)  -- ^ this declaration went in; 'Nothing' for an empty block
-  | Done Env               -- ^ every declaration went in, and the file passed
+  | Done Env [Obligation]  -- ^ every declaration went in, bar these ('cfgDefer')
   | Failed String          -- ^ this is why it did not
+
+-- | A definition's value check, put off until the file has been walked.
+--
+-- Under 'cfgDefer' a definition is admitted on the strength of its /statement/
+-- alone -- the type is checked to be a type, and that is what the environment
+-- needs -- and the check that the value inhabits it is handed back here.  The
+-- file is accepted when every obligation is.
+--
+-- What this buys is that the obligations are independent of each other.  A
+-- value check reads an environment and returns a verdict; it writes nothing,
+-- and the environment it reads is the one its own declaration was admitted in,
+-- captured here, so no obligation can see another's result.  They may therefore
+-- be discharged in any order, or all at once on as many cores as there are --
+-- and the verdict does not depend on which, since 'discharge' always reports
+-- the first failure in file order.  On @std@ the value checks are 81% of the
+-- run.
+--
+-- It is not the default, because it is a second way to check a file and the
+-- kernel should have one.  The interleaved path is the audited one: it admits a
+-- declaration only once everything about it has been checked, which is the
+-- invariant the rest of this module is written against.
+data Obligation = Obligation
+  { obName  :: !Name
+    -- ^ whose value this is
+  , obCheck :: Either String ()
+    -- ^ the check itself, unevaluated.  Forcing this to weak head normal form
+    -- /is/ performing it; there is nothing else inside.
+  }
+
+-- | Discharge obligations in file order, reporting the first failure.
+discharge :: [Obligation] -> Either String ()
+discharge = foldr (\o rest -> obCheck o >> rest) (Right ())
 
 -- | 'checkExport', reporting as it goes.
 --
@@ -98,9 +135,9 @@ data Progress
 checkExportTrace :: Config -> [ExDecl] -> [Progress]
 checkExportTrace cfg =
   go (LS emptyEnv { envAccel = cfgAccel cfg } (cfgSealProofs cfg)
-        (cfgMutUniv cfg) Nothing Nothing [] [] [])
+        (cfgMutUniv cfg) (cfgDefer cfg) Nothing Nothing [] [] [] [] 0 0)
   where
-    go st [] = [either Failed Done (finish st)]
+    go st [] = [either Failed (\e -> Done e (reverse (lsObs st))) (finish st)]
     go st (d : ds) = case declName d of
       !nm -> Starting nm : case step st d of
         Left err  -> [Failed err]
@@ -130,6 +167,7 @@ data LS = LS
   { lsEnv     :: !Env
   , lsSeal    :: !Bool                 -- ^ 'cfgSealProofs'
   , lsMutUniv :: !Bool                 -- ^ 'cfgMutUniv'
+  , lsDefer   :: !Bool                 -- ^ 'cfgDefer'
   , lsQuotTy  :: !(Maybe Name)
   , lsQuotMk  :: !(Maybe Name)
   , lsQuots   :: ![(QuotKind, Name)]   -- ^ reverse order of admission
@@ -140,6 +178,21 @@ data LS = LS
     -- ^ @(name, universe parameters, type, value)@ of each unsafe declaration
     -- that has a value, in reverse order of declaration.  Held back until the
     -- file is finished; see 'checkQuarantined'.
+  , lsObs     :: ![Obligation]
+    -- ^ value checks put off under 'lsDefer', in reverse order of declaration.
+  , lsSeen    :: !Int
+    -- ^ how many of those there are, so 'lsWarmAt' can be reached.
+  , lsWarmAt  :: !Int
+    -- ^ the count at which to call 'warmLicences' again, doubling each time.
+    --
+    -- The licences cannot be established before the constants they are about
+    -- have been declared, and there is no telling from here when that is; the
+    -- cost of asking too early is a failed attempt, and of asking too late a
+    -- run of declarations that had to establish their own.  Doubling pays for
+    -- both: at most a logarithmic number of attempts over the whole file, and
+    -- the first successful one no later than twice as far in as it could have
+    -- been.  On @std@ everything is licensed within the first few thousand
+    -- declarations of ninety thousand.
   }
 
 declName :: ExDecl -> Maybe Name
@@ -220,10 +273,13 @@ defLike st n lps ty val hint sealing = do
   checkLevelParams lps
   barrier (lsEnv st) [ty, val]
   (spent, lic) <- runTCLearn (lsEnv st) lps $ do
+    when warming warmLicences
     sort <- inferSortOf ty
-    checkType val ty
+    unless (lsDefer st) $ checkType val ty
     -- Asked in the same run as the check, so it reuses its memo tables; asked
     -- of the /statement/, so it costs a head normalisation and nothing more.
+    -- Which is also why deferring the value check does not disturb it, and so
+    -- does not disturb which constants the environment ends up holding.
     if sealing == SealIfSpent && isDefinitelyZero sort
       then proofErasable ty
       else pure False
@@ -238,7 +294,22 @@ defLike st n lps ty val hint sealing = do
   -- arithmetic from re-establishing the same facts about @Nat.add@; see
   -- 'Licences'.
   env' <- addConst (lsEnv st) { envLicence = lic } info
-  pure st { lsEnv = env' }
+  pure st { lsEnv = env', lsObs = obs
+          , lsSeen = lsSeen st + 1
+          , lsWarmAt = if warming then max 1 (2 * lsWarmAt st) else lsWarmAt st }
+  where
+    -- The environment the obligation reads is the one this declaration was
+    -- admitted in, and not the one it is admitted into: a value may not mention
+    -- the constant it is defining, which is the whole of the termination
+    -- argument for a @def@.
+    obs | lsDefer st = Obligation n (label (runTC (lsEnv st) lps (checkType val ty)))
+                         : lsObs st
+        | otherwise  = lsObs st
+    -- 'step' does this for the checks it runs itself; an obligation outlives it.
+    label = either (Left . ((showName n ++ ": ") ++)) Right
+    -- Only when the value checks are deferred: without that the licences travel
+    -- as they always have, and the default path is left exactly as it was.
+    warming = lsDefer st && lsSeen st >= lsWarmAt st
 
 -- The unsafe fragment ---------------------------------------------------------------
 --

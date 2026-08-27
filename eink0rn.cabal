@@ -53,5 +53,8 @@ executable eink0rn
     -- 24 MB at 1g, 61ms and 40 MB at 2g -- which a corpus does not notice and a
     -- one-declaration test case is entirely made of.  A run over something the
     -- size of mathlib is worth another 1.5% and can ask for it: +RTS -A2g.
-    ghc-options:      -rtsopts "-with-rtsopts=-K512m -A1g"
+    -- -threaded: for -jN, which checks definition values on several cores once
+    -- the file has been walked.  A run without it pays a little for the
+    -- capability bookkeeping and nothing else; measured on std, under 1%.
+    ghc-options:      -threaded -rtsopts "-with-rtsopts=-K512m -A1g"
     default-language: Haskell2010

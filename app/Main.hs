@@ -8,11 +8,14 @@ import qualified Data.ByteString.Char8 as B
 import           Data.IORef            (modifyIORef', newIORef, readIORef,
                                         writeIORef)
 import           Data.List             (isPrefixOf)
+import           Data.Maybe            (isJust)
 import           Front.Export          (parseExport)
-import           Front.Lower           (Config (..), Progress (..),
-                                        checkExportTrace, checkStdPins,
-                                        defaultConfig)
+import           Front.Lower           (Config (..), Obligation (..),
+                                        Progress (..), checkExportTrace,
+                                        checkStdPins, defaultConfig, discharge)
 import           GHC.Clock             (getMonotonicTime)
+import           GHC.Conc              (getNumProcessors, par, pseq,
+                                        setNumCapabilities)
 import           Kernel.Env            (AccelMode (..), Env)
 import           Kernel.Name           (showName)
 import           Numeric               (showFFloat)
@@ -37,11 +40,14 @@ data Options = Options
   , optProgress :: Maybe Double
     -- ^ report progress on stderr, naming any declaration that took at least
     -- this many seconds
+  , optJobs     :: Maybe Int
+    -- ^ check definition values on this many threads once the file has been
+    -- walked; 'Nothing' to check each one where it stands
   , optFile     :: Maybe String
   }
 
 defaults :: Options
-defaults = Options AccelCanonical True PinOff False Nothing Nothing
+defaults = Options AccelCanonical True PinOff False Nothing Nothing Nothing
 
 usage :: String -> String
 usage prog = unlines
@@ -76,6 +82,16 @@ usage prog = unlines
   , "  --progress[=SECS]  report progress on stderr: a running count, and a"
   , "                     line naming every declaration that took at least"
   , "                     SECS seconds on its own (default 1)"
+  , ""
+  , "  -jN                check the file in two passes, the second on N threads"
+  , "                     (N omitted: one per core; -j1 for the two passes on"
+  , "                     one).  Pass one admits each declaration on its"
+  , "                     statement; pass two checks the values, which is where"
+  , "                     four fifths of the time goes and which nothing else"
+  , "                     depends on.  The verdict is the same either way.  Each"
+  , "                     thread wants a nursery of its own, so a large N on a"
+  , "                     small machine wants a smaller one than the default"
+  , "                     gigabyte: +RTS -A128m -RTS"
   ]
 
 parseArgs :: [String] -> Either String Options
@@ -89,6 +105,8 @@ parseArgs = foldl step (Right defaults)
         | arg == "--enforce-mutual-univ" -> Right o { optMutUniv = True }
         | arg == "--progress" -> Right o { optProgress = Just 1 }
         | Just v <- stripFlag "--progress="  arg -> (\s -> o { optProgress = Just s }) <$> secs v
+        | arg == "-j" -> Right o { optJobs = Just 0 }
+        | Just v <- stripFlag "-j" arg -> (\k -> o { optJobs = Just k }) <$> jobs v
         | "-" `isPrefixOf` arg -> Left ("unknown option: " ++ arg)
         | Just f <- optFile o  -> Left ("more than one input file: " ++ f ++ ", " ++ arg)
         | otherwise            -> Right o { optFile = Just arg }
@@ -111,6 +129,12 @@ parseArgs = foldl step (Right defaults)
     secs v = case reads v of
       [(s, "")] | s >= 0 -> Right s
       _                  -> Left ("not a number of seconds: " ++ v)
+
+    -- Zero means "one per core", which is what a bare @-j@ says; it is resolved
+    -- in 'run', where the core count can be asked for.
+    jobs v = case reads v of
+      [(k, "")] | k >= 1 -> Right k
+      _                  -> Left ("not a number of threads: " ++ v)
 
 main :: IO ()
 main = do
@@ -137,12 +161,26 @@ main = do
 
 run :: Options -> String -> IO ()
 run o path = do
+  jobs <- case optJobs o of
+    Nothing -> pure 0        -- one pass, no obligations, nothing to schedule
+    Just 0  -> getNumProcessors
+    Just k  -> pure k
   input <- B.readFile path
   let cfg = defaultConfig { cfgAccel = optAccel o, cfgSealProofs = optSeal o
-                          , cfgMutUniv = optMutUniv o }
-  result <- case parseExport input of
+                          , cfgMutUniv = optMutUniv o, cfgDefer = jobs > 0 }
+  walked <- case parseExport input of
     Left err -> pure (Left err)
     Right ds -> walk o (checkExportTrace cfg ds)
+  result <- case walked of
+    Left err        -> pure (Left err)
+    Right (env, []) -> pure (Right env)
+    Right (env, obs) -> do
+      -- Not before now.  Pass one is one thread's work, and the capabilities
+      -- that would be waiting for it are not free: every collection has to
+      -- round them all up first.
+      when (jobs > 1) (setNumCapabilities jobs)
+      remark o (show (length obs) ++ " value checks on " ++ show jobs ++ " threads")
+      pure (env <$ parDischarge jobs obs)
   case result of
     Left err  -> reject err
     Right env -> case if optPin o == PinOff then [] else checkStdPins env of
@@ -158,12 +196,54 @@ run o path = do
                     exitFailure
     unlines' = foldr1 (\a b -> a ++ "\n" ++ b)
 
+-- | Discharge the deferred value checks on @n@ threads.
+--
+-- An obligation is a pure @Either String ()@ and forcing it is performing it,
+-- so this is 'par' and nothing more: no thread of our own, no shared state, no
+-- order to get wrong.  The obligations are cut into runs of consecutive
+-- declarations, each run sparked, and then read back in file order -- so the
+-- answer is the first failure the sequential path would have reported, whatever
+-- the sparks got up to.  Reading a run the sparks have not reached yet simply
+-- evaluates it here.
+--
+-- Enough runs that the threads have something to steal, few enough that they
+-- fit the spark pool (4096 a capability, and a spark dropped for want of room
+-- is work this thread does alone).  Consecutive declarations rather than a
+-- round robin so that the runs are themselves in file order, which is what
+-- makes reading them back in order the same as reading the obligations back in
+-- order.  Balancing does not need the round robin: the sparks are stolen as
+-- threads come free, so a run that turns out to be expensive delays only
+-- itself.
+parDischarge :: Int -> [Obligation] -> Either String ()
+parDischarge n obs
+  | n <= 1    = discharge obs
+  | otherwise = sparkAll runs `pseq` firstFailure runs
+  where
+    runs = map discharge (chunksOf size obs)
+    size = max 1 ((length obs + slices - 1) `div` slices)
+    slices = min 2048 (n * 64)
+
+    -- 'par' on an element of a list the caller is still holding: a spark whose
+    -- thunk nothing else can reach is collected rather than run.
+    sparkAll []       = ()
+    sparkAll (r : rs) = r `par` sparkAll rs
+
+    firstFailure = foldr (>>) (Right ())
+
+chunksOf :: Int -> [a] -> [[a]]
+chunksOf _ [] = []
+chunksOf k xs = case splitAt k xs of (c, rest) -> c : chunksOf k rest
+
+-- | Say something on stderr, if the run is one that reports.
+remark :: Options -> String -> IO ()
+remark o s = when (isJust (optProgress o)) $ hPutStrLn stderr ("[ " ++ s ++ " ]")
+
 -- | Drive the trace to its verdict.
 --
 -- Without @--progress@ this is a plain fold and costs a clock read per
 -- declaration at most; with it, every declaration is timed and the slow ones are
 -- named.
-walk :: Options -> [Progress] -> IO (Either String Env)
+walk :: Options -> [Progress] -> IO (Either String (Env, [Obligation]))
 walk o ps0 = case optProgress o of
     Nothing  -> pure (quiet ps0)
     Just cut -> do
@@ -199,19 +279,19 @@ walk o ps0 = case optProgress o of
             note "stopped:"
             getMonotonicTime >>= tally
             pure (Left err)
-          loud (Done env : _) = do
+          loud (Done env obs : _) = do
             getMonotonicTime >>= tally
-            pure (Right env)
+            pure (Right (env, obs))
           loud [] = pure (Left "internal error: export trace ended")
       r <- loud ps0
       killThread beat
       pure r
   where
-    quiet (Failed err  : _) = Left err
-    quiet (Done env    : _) = Right env
-    quiet (Starting _  : r) = quiet r
-    quiet (Checked _   : r) = quiet r
-    quiet []                = Left "internal error: export trace ended"
+    quiet (Failed err   : _) = Left err
+    quiet (Done env obs : _) = Right (env, obs)
+    quiet (Starting _   : r) = quiet r
+    quiet (Checked _    : r) = quiet r
+    quiet []                 = Left "internal error: export trace ended"
 
     note s = hPutStrLn stderr ("[ " ++ s ++ " ]")
     secs t = showFFloat (Just 2) t "s"
