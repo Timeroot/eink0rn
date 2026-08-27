@@ -835,6 +835,17 @@ whnf e
   where
     -- A head that no rule applies to is its own normal form, and looking that
     -- up costs more than rediscovering it.
+    --
+    -- The test is on the node and not on 'headOf ex', which would catch far
+    -- more: a spine headed by a local or a free variable is its own normal form
+    -- too, and those are most of the terms there are.  Measured twice, it costs
+    -- 8% more allocation and 2% more time to catch them, and the reason is the
+    -- two tickets above.  Short-circuiting means 'whnfCore' and 'unfoldDelta'
+    -- never read the budget, so they never bump 'tcStarve', so a great many
+    -- results computed part-way through an exhausted speculation now look like
+    -- normal forms and get recorded.  Recording them is not wrong -- they are
+    -- reached by reduction, and 'speculate' can only answer @False@ -- but the
+    -- entries cost more than the lookups they save.
     reducible ex = case ex of
       App{} -> True; Const{} -> True; Let{} -> True; Proj{} -> True
       _     -> False
