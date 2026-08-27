@@ -238,12 +238,21 @@ eqLeaf _             _             = False
 
 -- | How many pairs of nodes 'eqE' may compare before it is worth a memo table.
 --
--- Larger than 'instBudget' because equality, unlike substitution, is asked about
--- whole declared types and stored bodies as often as it is asked about the small
--- open terms conversion produces, and because the work thrown away on a miss is
--- a walk that allocates nothing.
+-- Much larger than 'instBudget', because the two budgets buy different things.
+-- Overrunning 'instBudget' throws away a rebuilt term; overrunning this one
+-- throws away a walk that allocated nothing at all, so the only cost of setting
+-- it high is the comparisons themselves, and the table it defers is a
+-- 'Data.IntMap.IntMap' of association lists -- the most expensive memo in the
+-- checker per entry.
+--
+-- Measured on @std@, bytes allocated: 1024 comparisons cost 141.6 GB, 4096
+-- 136.5, 16384 134.1, 65536 132.7, and past that it flattens -- 262144 costs
+-- 132.5 and 1048576 costs 132.4, by which point the wasted walks are showing up
+-- in the clock.  What still protects the pathological case is that the bound
+-- holds: a comparison of two @brecOn@ unfoldings gives up after 65536 pairs and
+-- starts again with the table.
 eqBudget :: Int
-eqBudget = 1024
+eqBudget = 65536
 
 -- | Some total order agreeing with '=='.  Not alphabetical, not structural:
 -- hash first, which is fine because nothing reads an ordering on terms for
