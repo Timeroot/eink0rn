@@ -40,6 +40,7 @@ import           Data.Maybe     (isJust)
 import qualified Data.Set       as S
 import           Front.Block
 import           Front.Export
+import           Front.Hetero
 import           Kernel.Canon
 import           Kernel.Check
 import           Kernel.Env
@@ -55,10 +56,14 @@ data Config = Config
     -- 'proofErasable' says no reduction could ever ask for it again.  On by
     -- default: it takes the question of whether to unfold a proof off the table
     -- entirely, for all but a handful of propositions.  See SPEC.md §12.10.
+  , cfgMutUniv :: !Bool
+    -- ^ Reject a mutual inductive block whose types do not all land in the same
+    -- universe, as every other Lean kernel does.  Off by default: the block is
+    -- sound and \"Front.Hetero\" derives it (SPEC.md §9.6).
   }
 
 defaultConfig :: Config
-defaultConfig = Config AccelCanonical True
+defaultConfig = Config AccelCanonical True False
 
 -- | Check a whole export, returning the resulting environment.
 checkExport :: Config -> [ExDecl] -> Either String Env
@@ -93,7 +98,7 @@ data Progress
 checkExportTrace :: Config -> [ExDecl] -> [Progress]
 checkExportTrace cfg =
   go (LS emptyEnv { envAccel = cfgAccel cfg } (cfgSealProofs cfg)
-        Nothing Nothing [] [] [])
+        (cfgMutUniv cfg) Nothing Nothing [] [] [])
   where
     go st [] = [either Failed Done (finish st)]
     go st (d : ds) = case declName d of
@@ -124,6 +129,7 @@ checkExportTrace cfg =
 data LS = LS
   { lsEnv     :: !Env
   , lsSeal    :: !Bool                 -- ^ 'cfgSealProofs'
+  , lsMutUniv :: !Bool                 -- ^ 'cfgMutUniv'
   , lsQuotTy  :: !(Maybe Name)
   , lsQuotMk  :: !(Maybe Name)
   , lsQuots   :: ![(QuotKind, Name)]   -- ^ reverse order of admission
@@ -196,7 +202,7 @@ checkDecl st d = case d of
                         (  map exiType types ++ map excType ctors
                         ++ map exrType recs
                         ++ [exuRhs ru | rv <- recs, ru <- exrRules rv ])
-                      checkInductive (lsEnv st) types ctors recs
+                      checkInductive (lsMutUniv st) (lsEnv st) types ctors recs
     pure st { lsEnv = env' }
   where
     run lps act = either Left (const (Right ())) (runTC (lsEnv st) lps act)
@@ -364,9 +370,9 @@ commas = foldr1 (\a b -> a ++ ", " ++ b)
 
 -- Inductive declarations ----------------------------------------------------------
 
-checkInductive :: Env -> [ExInd] -> [ExCtor] -> [ExRec] -> Either String Env
-checkInductive _ [] _ _ = Left "inductive declaration with no types"
-checkInductive env types ctors recs = do
+checkInductive :: Bool -> Env -> [ExInd] -> [ExCtor] -> [ExRec] -> Either String Env
+checkInductive _ _ [] _ _ = Left "inductive declaration with no types"
+checkInductive mutUniv env types ctors recs = do
       let iv0       = head types
           lvls      = exiLevels iv0
           nps       = exiNumParams iv0
@@ -444,10 +450,36 @@ checkInductive env types ctors recs = do
       -- file declared and having compared every exported recursor against the
       -- one they derived; what is left over is the bookkeeping below, which is
       -- the same either way.
-      br <- if nDecl + length nested > 1
-              then flattenBlock env' groups declMembers auxMembers nested
-                                paramTele nDecl lvls nps recs privRoot
-              else singleBlock env' groups declMembers lvls nps recs
+      -- A block whose types do not all land in the same universe is one no
+      -- other Lean kernel will look at, and the flattening below assumes they
+      -- do (SPEC.md §8.3 is what enforces it: the members become one type, so
+      -- they had better have one sort).  It is nonetheless a block the type
+      -- theory has, and "Front.Hetero" derives it from ones that are already
+      -- admissible; --enforce-mutual-univ turns that off and mirrors everyone
+      -- else.  Reading the members' sorts is only worth doing for a block that
+      -- has more than one, and a block whose sorts cannot even be read is left
+      -- to the paths below to reject with their own message.
+      let resLvls = case resultLevels env' "inductive: " lvls nps paramTele
+                           (declMembers ++ auxMembers) of
+                      Right ls -> ls
+                      Left _   -> []
+          hetero  = nDecl + length nested > 1 && case resLvls of
+                      (l : ls) -> not (all (levelEquiv l) ls)
+                      []       -> False
+      br <- if hetero
+              then do
+                when mutUniv $
+                  Left "the types of a mutual inductive block must all land in \
+                       \the same universe (--enforce-mutual-univ)"
+                unless (null nested) $
+                  Left "a mutual inductive block whose types land in different \
+                       \universes may not also have nested occurrences"
+                heteroBlock env' groups declMembers resLvls paramTele lvls nps
+                            recs privRoot
+              else if nDecl + length nested > 1
+                then flattenBlock env' groups declMembers auxMembers nested
+                                  paramTele nDecl lvls nps recs privRoot
+                else singleBlock env' groups declMembers lvls nps recs
 
       -- The export's own bookkeeping must agree with what we derived.
       forM_ (zip3 types (brIndices br) (brFields br)) $ \(iv, nIdx, nFields) -> do
