@@ -39,6 +39,17 @@ derived: every reduction rule the kernel ends up with is typechecked against the
 type its own left-hand side has (SPEC §8.9), which is what stands behind a rule
 that both this kernel and the exporter might have got wrong the same way.
 
+**It takes a mutual block whose types span universes.** Every other Lean kernel
+requires them to end in the same sort. That rule is a commitment the elaborator
+makes, not a theorem: a `Prop` member cuts the chain of inequalities that would
+otherwise force a cycle of data members to share a level, and the `Prop` that
+cuts it is the same one whose proof irrelevance collapses the injection a paradox
+would need. So the block is accepted — but derived, not believed (SPEC §9.6): an
+all-`Prop` shadow of the whole block, the data members declared separately in
+topological order, and the block's recursors rebuilt over the two, with every
+constructor type and every iota rule the file declares checked definitionally
+against the derivation. `--enforce-mutual-univ` turns it off.
+
 **It was written without looking at a Lean kernel.** The only references used
 were Carneiro's *The Type Theory of Lean*, the NDJSON format specification, and
 the accept/reject verdicts of the Lean Kernel Arena test corpus. Nothing was read
@@ -69,6 +80,7 @@ export.
 | `--nat-accel=off\|canonical\|verified\|always` | `canonical` | how much evidence the arithmetic shortcuts of SPEC §6.5 demand before a `Nat` operation is computed on a bignum instead of unfolded. `always` trusts the *name* and is unsound; it exists to reproduce the behaviour of kernels that do that. |
 | `--pin-std=off\|warn\|error` | `off` | audit `False`, `Eq`, `Iff`, `Nonempty`, the quotient package and the three standard axioms against their standard forms (SPEC §12.5). |
 | `--keep-proofs` | off | retain every proof term instead of sealing it (SPEC §12.10). A pure performance switch. |
+| `--enforce-mutual-univ` | off | reject a mutual inductive block whose types do not all end in the same sort, as every other Lean kernel does. By default such a block is derived from simpler declarations and accepted if the derivation checks out (SPEC §9.6, §12.14). |
 | `--progress[=SECS]` | off | report on stderr as the file is checked, naming each declaration that took at least `SECS` seconds. |
 
 ## Tests
@@ -78,17 +90,23 @@ laid out as `good/*.ndjson` and `bad/*.ndjson`:
 
 ```
 bash tools/run-tests.sh                 # 186/186
+bash tools/run-tests.sh tests           # 14/14, hand-written
 bash tools/run-tests.sh validation      # the validation corpus below
 ```
 
+`tests/` is the hand-written corpus: cases for shapes `lean4export` cannot
+produce, so no exporter will ever hand one over. Most of it is the
+heterogeneous-universe blocks of SPEC §9.6, written by `tools/mkhetero.py`.
+
 `validation/` is a separate corpus of pathological cases built by a subagent that
 *was* allowed to read Lean's source and issue tracker, as an adversarial check on
-a kernel that was not. 832 of its 846 labelled cases get the label's verdict; the
-other 14 are divergences SPEC §12 records and defends — eight on the arithmetic
-licence (§12.6), three universe-polymorphic inductives whose fields satisfy the
-universe condition under every assignment (§12.2), two nested occurrences at a
-fixed index (§12.12), and one quotient package spelled under other names (§12.3,
-which `--pin-std` catches).
+a kernel that was not. 827 of its 846 labelled cases get the label's verdict; the
+other 19 are divergences SPEC §12 records and defends — eight on the arithmetic
+licence (§12.6), five mutual blocks whose types span universes (§12.14), three
+universe-polymorphic inductives whose fields satisfy the universe condition under
+every assignment (§12.2), two nested occurrences at a fixed index (§12.12), and
+one quotient package spelled under other names (§12.3, which `--pin-std`
+catches). With `--enforce-mutual-univ` the count is 832, as it was before §9.6.
 
 `validation/disputed/` holds 35 further cases where eink0rn and official Lean are
 expected to disagree and eink0rn is not obviously wrong. It accepts 22 and
@@ -131,6 +149,7 @@ src/Kernel/Inductive admitting one inductive family, and deriving its recursor
 src/Front/Json       a JSON reader, streaming, for files larger than memory
 src/Front/Export     the NDJSON pools and the declaration schema
 src/Front/Lower      surface to core: the nesting compilation, and the flattening
+src/Front/Hetero     deriving a mutual block whose types span universes
 app/Main.hs          the command line
 ```
 

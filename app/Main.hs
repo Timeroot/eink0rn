@@ -32,6 +32,8 @@ data Options = Options
   , optSeal     :: Bool
     -- ^ discard a theorem's value once it has been checked, where sound
   , optPin      :: PinMode
+  , optMutUniv  :: Bool
+    -- ^ reject a mutual inductive block whose types land in different universes
   , optProgress :: Maybe Double
     -- ^ report progress on stderr, naming any declaration that took at least
     -- this many seconds
@@ -39,7 +41,7 @@ data Options = Options
   }
 
 defaults :: Options
-defaults = Options AccelCanonical True PinOff Nothing Nothing
+defaults = Options AccelCanonical True PinOff False Nothing Nothing
 
 usage :: String -> String
 usage prog = unlines
@@ -65,6 +67,12 @@ usage prog = unlines
   , "      warn             report mismatches on stderr, but accept"
   , "      error            reject the file on a mismatch"
   , ""
+  , "  --enforce-mutual-univ"
+  , "                     reject a mutual inductive block whose types do not"
+  , "                     all land in the same universe, as every other Lean"
+  , "                     kernel does.  By default such a block is accepted"
+  , "                     when it can be derived from simpler types (SPEC §9.6)"
+  , ""
   , "  --progress[=SECS]  report progress on stderr: a running count, and a"
   , "                     line naming every declaration that took at least"
   , "                     SECS seconds on its own (default 1)"
@@ -78,6 +86,7 @@ parseArgs = foldl step (Right defaults)
         | Just v <- stripFlag "--nat-accel=" arg -> (\m -> o { optAccel = m }) <$> accel v
         | Just v <- stripFlag "--pin-std="   arg -> (\m -> o { optPin   = m }) <$> pin v
         | arg == "--keep-proofs" -> Right o { optSeal = False }
+        | arg == "--enforce-mutual-univ" -> Right o { optMutUniv = True }
         | arg == "--progress" -> Right o { optProgress = Just 1 }
         | Just v <- stripFlag "--progress="  arg -> (\s -> o { optProgress = Just s }) <$> secs v
         | "-" `isPrefixOf` arg -> Left ("unknown option: " ++ arg)
@@ -129,7 +138,8 @@ main = do
 run :: Options -> String -> IO ()
 run o path = do
   input <- B.readFile path
-  let cfg = defaultConfig { cfgAccel = optAccel o, cfgSealProofs = optSeal o }
+  let cfg = defaultConfig { cfgAccel = optAccel o, cfgSealProofs = optSeal o
+                          , cfgMutUniv = optMutUniv o }
   result <- case parseExport input of
     Left err -> pure (Left err)
     Right ds -> walk o (checkExportTrace cfg ds)

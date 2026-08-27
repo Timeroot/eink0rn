@@ -16,7 +16,9 @@ choice open — this document says so explicitly and gives the justification.
 **Reading order.** §1 says what the front end throws away before the core sees
 anything. §2–§4 give the syntax and the level algebra. §5–§7 give the
 judgements. §8 gives inductive types, which is where the interesting content is.
-§9 gives the nesting compilation, §10 quotients. §11 states the implementation
+§9 gives the three lowerings that stand between the export
+format and §8 — the nesting compilation, the flattening of a mutual block, and
+the derivation of one whose types span universes — and §10 quotients. §11 states the implementation
 invariants the rules quietly depend on, and §12 lists the deliberate divergences
 from what official Lean would do.
 
@@ -1001,6 +1003,13 @@ respect: it does not grant §9.1's auxiliaries the exemption. That is one of the
 three deliberate divergences of §9.3.4, and no file has ever needed the
 exemption (§8.1).
 
+The rule is nonetheless a conformance rule and not a theorem — the reading it
+protects is one the *elaborator* commits to, and §9.6.1 shows that a `Prop`
+member cuts the chain of inequalities that would otherwise force one. So the
+flattening is not the only lowering: a block whose members disagree about their
+sort goes to §9.6 instead, which derives it rather than believing it, and
+`--enforce-mutual-univ` restores the conformance rule for anyone who wants it.
+
 ### 8.4 The `ctor` judgement
 
 Walking a constructor's type left to right, after peeling the parameters:
@@ -1668,7 +1677,12 @@ numeral (§13.1), so every name a file can mention is rooted at `[anonymous]`, a
 `π_k.…` is not equal to any of them. Each inductive block is handed the next
 unused `k` as it is lowered, and hangs everything it invents off `π_k`: §9.1's
 specialised containers at `π_k.nested.j`, §9.3's two types at `π_k.idx` and
-`π_k.ty`.
+`π_k.ty`. §9.6 invents more of them and, unlike the other two passes, keeps
+them: the all-`Prop` shadow at `π_k.sh.i` (whose own flattening then takes
+`π_k.sh` as *its* private root), the pairing type at `π_k.sig`, one data
+component per `π_k.d.c`, their recursors at `π_k.dr.j` and the squash maps at
+`π_k.sq.j`. A numeral component and a string component are different names, so
+`π_k.sh.0` and `π_k.sh.idx` do not collide.
 
 This is not a soundness argument about the constants themselves — they are
 admitted by the same rules as any other, and §9.3.3's audit still insists none of
@@ -1775,6 +1789,307 @@ The construction above is implemented, and works as far as it can, on the branch
 validation corpus against 832/846 for this one, and rejects both cslib and
 mathlib. It is kept because an argument of the form "this simpler thing does not
 work" is worth more with the simpler thing next to it.
+
+### 9.6 Heterogeneous universes
+
+§9.3 turns a block of `n` members into one family `F`, so it needs the members to
+agree on a sort; §8.3 records that the check which used to say so directly is now
+a consequence of that construction. Every other Lean kernel this one has been
+compared against enforces the same rule, and `lean4export` never has to: the
+elaborator refuses the block long before the export runs.
+
+The rule is nevertheless a conformance rule and not a theorem. This section is
+the second lowering, which takes a block whose members land in different
+universes and derives it from types the kernel already admits. It runs **first**,
+ahead of the flattening, and only on a block that needs it, so the dispatch is
+
+```
+hetero   ⟺  (declared types) + (auxiliaries §9.1 added) > 1
+            ∧  the members' result sorts are not all equivalent (§3)
+flatten  ⟺  (declared types) + (auxiliaries §9.1 added) > 1   ∧  ¬hetero
+```
+
+where the sorts are read straight off the members' arities, which is possible
+before anything about the block has been admitted because an arity may not
+mention the block (§8.3 step 2). A block of one type never pays for the test —
+the conjunction short-circuits — and a block that does pay for it and comes out
+homogeneous goes to §9.3 exactly as before. `--enforce-mutual-univ` deletes the
+first branch and rejects the block the way everyone else does.
+
+Note that the test ranges over §9.1's auxiliaries too, which the classic
+uniform-universe rule exempted. It does not need an exemption here: an auxiliary
+whose sort differs from the declared member's sends the block to §9.6, which
+rejects it for having nested occurrences (§9.6.6) — the same verdict §9.3.4
+already records for that shape, reached by a different road. No corpus contains
+one.
+
+#### 9.6.1 Why such a block is well-formed
+
+§8.4's per-field condition is `imax(l', l) ≤ l`, and when `l = 0` it is vacuous: a
+proposition may quantify over anything. Around a cycle of *data* members each
+field imposes a real inequality,
+
+```
+T_i has a field of type T_j     ⟹     l_j ≤ l_i        (l_i ≠ 0)
+```
+
+so a cycle of them collapses to `l_1 = … = l_k`. Route the cycle through a `Prop`
+member and one link of the chain imposes nothing:
+
+```
+mutual
+inductive G : Prop     | base | fromH (h : H)
+inductive H : Type 1   | mk   (g : G)
+end
+```
+
+`G.fromH`'s field sits at level 2 and `imax(2,0) = 0 ≤ 0`; `H.mk`'s field sits at
+level 0 and `imax(0,2) = 2 ≤ 2`. Each member is well-formed by §8.4 read on its
+own, and the theory has no further condition that they jointly fail. The block is
+not exotic in the sense of needing a new rule; it is exotic in the sense that no
+elaborator will build one for you.
+
+#### 9.6.2 Why it is sound
+
+The `Prop` member is what makes the block possible, and it is also what makes it
+harmless. To get a paradox out of a `Type 1` member that stores a `Prop` member
+that stores a `Type 1` member, one needs the round trip to be injective — a
+`Type 1` worth of information recovered from something living in `Prop`. Proof
+irrelevance (§7) says every inhabitant of `G` is convertible to every other, so
+the map `H → G` is constant, and the recursor that would read the `H` back out is
+denied by §8.5: `G` is a proposition with two constructors, so it eliminates only
+into `Prop`.
+
+That is an argument, not a proof, and this kernel does not run on arguments. What
+the section below does is *derive* the block: build it out of declarations that
+are already admissible under §8, check every constant the file declares against
+the derivation, and check that every iota rule the block claims holds
+definitionally. If the derivation goes through, the block adds no strength,
+because everything it names is a definition or an ordinary inductive type in
+disguise.
+
+#### 9.6.3 The construction
+
+Given a block over shared parameters `p̄ :: π`
+
+```
+T_1 : ∀ p̄, α_1, Sort l_1    …    T_n : ∀ p̄, α_n, Sort l_n
+```
+
+with `n > 1` and the `l_i` not all equivalent, write `P = { i | l_i ≡ 0 }` for the
+`Prop` members and `D` for the rest. A member at `Sort u`, `u` a parameter, is in
+`D`: "is a proposition" is read absolutely here, exactly as in §8.5.
+
+1. **The shadow.** The whole block again, verbatim, with every result sort
+   replaced by `Prop` and every occurrence of `T_j` redirected to `S_j`:
+
+   ```
+   S_1 : ∀ p̄, α_1, Prop    …    S_n : ∀ p̄, α_n, Prop
+   ```
+
+   Index telescopes and constructor fields are reused unchanged, so `S̄` is a
+   block the file could not have written but §8.4 accepts field by field — every
+   condition it has to meet is `imax(l', 0) ≤ 0`. It is homogeneous, so §9.3
+   admits it, and that is deliberate: positivity, the universe conditions, and the
+   discipline that every occurrence be at the block's own parameters and *all* of
+   its indices are decided by the code the whole corpus exercises, and reported
+   against the member the file actually declared. **The shadow is built even when
+   `P` is empty**, because it is the block's positivity witness and nothing else
+   in the construction ever sees all `n` members at once.
+
+2. **The pairing.**
+
+   ```
+   Sig.{u,v} (a : Sort u) (b : a → Sort v) : Prop
+   Sig.mk    (fst : a) (snd : b fst) : Sig a b
+   ```
+
+   A proposition with one constructor and a data field, so §8.5 grants it small
+   elimination only — which is the point. `Sig` is how a proposition's recursor
+   carries a data member's motive along without ever eliminating a proof into
+   data; if it eliminated largely, the `a` could be projected back out of a proof
+   and the block really would be unsound. The construction asserts that
+   `decideLargeElim` denied it.
+
+3. **The propositions.** For `i ∈ P`, `T_i := S_i` — a *definition*, checked
+   against the arity the file declared.
+
+4. **The scan.** For each constructor, which member each field recurses into and
+   whether it does so under a binder. Done once, in an environment where every
+   member is an axiom of its declared arity, so that no member can be unfolded
+   into its shadow and hide an occurrence. The answers are reused in all three
+   views of the block, which is sound because step 1 has already refused any field
+   whose binders `ξ` or index arguments `π̄` mention a member: those parts of a
+   field are therefore the same term in every view, and only the head constant
+   moves.
+
+5. **The components.** Delete `P` from the block's dependency graph and take the
+   strongly connected components of what is left. Each is declared on its own, at
+   the universe it asks for, in topological order. Two things make this work:
+
+   * a field of a data member pointing at `T_i` for `i ∈ P` points at a
+     *definition already in the environment*, which is not part of the
+     declaration, so §8.4 sees an ordinary non-recursive field of an ordinary
+     type — this is why a component carries the block's own constructor types and
+     needs no rewriting afterwards;
+   * every remaining cycle is a data cycle, so §9.6.1's chain applies to it and
+     its members provably share a level. The construction checks this rather than
+     assuming it, and rejects the block if some component fails it — which is the
+     case where the file's universes really are inconsistent.
+
+   Each component is a homogeneous block, so §9.3 admits it, under a private
+   recursor name `Dr_j`. Its `indIsRecursive` is overwritten with the *block's*
+   answer, because a member whose only recursion leaves through a proposition and
+   comes back looks flat from inside the component; §9.3.4 gives the argument for
+   why over-reporting that flag is the safe direction.
+
+6. **The squash maps.** For `j ∈ D`,
+
+   ```
+   sq_j : ∀ p̄ ā, T_j p̄ ā → S_j p̄ ā
+   ```
+
+   by structural recursion on `j`'s component: rebuild each constructor as the
+   shadow's, squashing every field that points back into the block on the way.
+   There is no obstruction here — `sq_j` is a function, so it goes under a field's
+   binders `ξ` without trouble.
+
+7. **The constructors.** A data member's are already in the environment at the
+   block's own types, from step 5. A proposition's are definitions: the shadow's
+   constructor, with each field pointing at a data member squashed by `sq_j`.
+   Either way, the type the *file* declares for a constructor is then checked
+   definitionally equal to the type the block gives it.
+
+8. **The recursors.** Their types and reduction rules are the block's own, written
+   out exactly as §8.7 writes them for a mutual block: all `n` motives, then one
+   minor premise per constructor of the whole block, then the member's own indices
+   and major premise; and in a minor premise, all fields first, then one induction
+   hypothesis per recursive field in field order.
+
+   For `q ∈ D` the recursor is a *primitive* one, and its value is `Dr_q` applied
+   to the component's share of the block's motives and to minor premises that call
+   `T_j.rec` for every recursive field leaving the component — which is why these
+   are built in component order.
+
+   For `i ∈ P` the recursor recurses over the shadow, whose motives are
+
+   ```
+   M_j  =  the block's motive C_j                        j ∈ P
+   M_j  =  fun ā (_ : S_j p̄ ā) => Sig (T_j p̄ ā) (C_j ā)  j ∈ D
+   ```
+
+   — "there is a `T_j` here, and the motive holds of it" — and whose minor
+   premises take that pair apart again with `Sig.rec` wherever the block's own
+   minor premise wants the value. Everything stays in `Prop`.
+
+#### 9.6.4 The elimination rule does not move
+
+One motive of the block's recursor per member, and member `i`'s lands in
+`Sort u` when `l_i` is definitely non-zero and in `Prop` otherwise. There is one
+elimination parameter `u` for the whole block — it has to be one, because every
+member's recursor takes all `n` motives — placed first in the recursor's level
+parameters, and it is absent entirely when no member is definitely non-zero. That
+is §8.5 **case 1**, applied member by member, and it is all that is applied: the
+subsingleton licence of case 2 is never consulted here.
+
+This is the one thing it would be easy and wrong to do differently. Heterogeneity
+is a statement about which blocks are *well-formed*; subsingleton elimination is a
+statement about what a recursor may then eliminate *into*, and the second does not
+follow from the first. Relaxing case 2 for a `Prop` member of a heterogeneous
+block — on the grounds that it "is really" a single family now — would hand it
+motives for the block's data members whose constructors' data is recovered from
+nothing, which is exactly what the side condition §8.5 discusses was there to
+exclude. The construction cannot express the relaxation even by accident: a
+proposition's recursor is built out of the shadow's, and the shadow is an
+ordinary block whose own elimination rule §9.3 already decided.
+
+#### 9.6.5 What is checked
+
+The construction is not believed. In order:
+
+* the shadow's recursors typecheck, have `n` motives and one minor per
+  constructor of the block, do **not** eliminate largely, and their reduction
+  rules typecheck (§8.9);
+* `Sig` does not eliminate largely;
+* each proposition's definition has the arity the file declared;
+* each component's recursors typecheck and their rules typecheck; no component
+  claims the `k` rule;
+* each squash map typechecks at its stated type;
+* each constructor definition typechecks, and every constructor's *exported* type
+  is definitionally the one the block gives it;
+* each recursor's value typechecks at the recursor type the block's own shape
+  demands;
+* **every iota rule holds definitionally.** This runs in an environment where all
+  `n` recursors are still definitions, so the reduction has to go through the
+  derivation rather than through the rule being checked: the left-hand side
+  `T_i.rec p̄ C̄ ē ā (c p̄ b̄)` is inferred, the right-hand side is checked at that
+  type, and the two are compared with `isDefEq`. Only then does a data member's
+  recursor become a primitive with that rule attached;
+* the primitive recursors' rules typecheck (§8.9), and every recursor the file
+  declared is compared against the derived one by §8.8 — same counts, same level
+  parameters, definitionally equal type, and definitionally equal right-hand side
+  for each rule, in constructor order.
+
+Unlike §9.3, the invented constants **persist** into the environment the caller
+gets back. They have to: a surviving `sq_j` needs its `Dr_j`, a surviving
+proposition's recursor needs the shadow and `Sig`. This is safe for the reason
+§9.4 gives — they are rooted at a private `π_k` the export format has no syntax
+for — but it means the audit §9.3.3 performs, that no private name escapes, is
+not available here and is not performed.
+
+#### 9.6.6 Deliberate divergences
+
+* **A block with a `Prop` member may not have a functional recursive field into
+  a data member.** A field `∀ x::ξ, T_j p̄ π̄` with `ξ` non-empty and `j ∈ D`,
+  in a block with `P` non-empty, is rejected. Its minor premise would need the
+  proposition's recursor to turn `∀ x::ξ, Sig (T_j …) (C_j …)` into
+  `∀ x::ξ, T_j …`, and pulling a data value out from under a binder inside a
+  proof is what choice is for. The minimal witness is
+
+  ```
+  mutual
+  inductive P : Prop      | mk : (Nat → D) → P
+  inductive D : Type      | dm : P → D
+  end
+  ```
+
+  Squash maps are unaffected — they are functions, and go under `ξ` fine — so the
+  restriction is exactly on the recursor, and it costs nothing a homogeneous block
+  could have expressed.
+
+* **A `proj` on a `Prop` member is rejected**, and a later block may not nest
+  inside one. Such a member is a definition, not a `CInd`, and §5.3's projection
+  rule and §9.1's nesting compilation both need an inductive type. Data members
+  keep both: they are real inductive types at their declared universes.
+
+* **A heterogeneous block may not also have nested occurrences.** §9.1's
+  auxiliaries would be extra members with universes of their own and no exported
+  recursor to compare against, and no corpus contains the shape. Rejected rather
+  than guessed at.
+
+* **`--enforce-mutual-univ` restores conformance.** With it, a heterogeneous block
+  is rejected before any of this runs. It is off by default because the block is
+  sound and the derivation says so; it is available because everyone else says
+  otherwise, and a disagreement is worth being able to switch off.
+
+#### 9.6.7 Test material
+
+Nothing in the arena corpus, and nothing `lean4export` can ever produce, exercises
+any of this, so the material is synthetic: `tools/mkhetero.py` writes the pools
+and declarations directly, deriving each constructor type, recursor type and iota
+rule from a description of the block by the conventions of §8.7. It emits
+`tests/good/hetero-*.ndjson` and `tests/bad/hetero-*.ndjson` — the two-member
+minimum above, a three-member block with a data-to-data edge across the gap, an
+indexed `Acc`-shaped proposition beside a `Type 3` member, a universe-polymorphic
+pair, a heterogeneous block with no `Prop` member at all (two unrelated data
+SCCs), a parameterised one, and the rejections: the choice gap, a data cycle whose
+members disagree about their level, a field that breaks §8.4 outright, a declared
+recursor claiming large elimination for a proposition, a doctored iota rule, and a
+doctored `isReflexive`.
+
+```
+bash tools/run-tests.sh tests            # 14/14
+```
 
 ---
 
@@ -2063,8 +2378,8 @@ that is what makes it sound.
 Recorded so that a disagreement with official Lean can be diagnosed rather than
 patched. §12.1 is the part of the kernel that is *not* name-blind, and how each
 name is earned; §12.2 onwards are places where `eink0rn` knowingly answers
-differently from official Lean, in both directions: §12.2 and half of §12.6
-accept more, §12.3, §12.4 and §12.7–§12.9 accept less.
+differently from official Lean, in both directions: §12.2, §12.14 and half of
+§12.6 accept more, §12.3, §12.4 and §12.7–§12.9 accept less.
 
 ### 12.1 Names with meaning
 
@@ -2651,3 +2966,26 @@ recursor eliminating out of `Prop` (§8.5) is precisely a place where the
 difference is observable. Well-founded definitions still compute wherever their
 `Acc` argument is a closed term, which is every place in the arena corpus where
 one is asked to.
+
+### 12.14 A mutual block may span universes
+
+Every other Lean kernel requires the types of a mutual inductive block to end in
+the same sort. This one does not, by default: §9.6 derives such a block from
+declarations that are already admissible and checks every constant and every iota
+rule the file claims against the derivation. §9.6.1 is why the block is
+well-formed, §9.6.2 why it is sound, §9.6.6 the four places where the derivation
+is *narrower* than the block — a functional recursive field from a proposition
+into a data member, `proj` on a proposition, nesting inside one, and nesting in
+the same block at all.
+
+This is the accept-more direction, and it is the largest one in this document, so
+it is the one with a switch: `--enforce-mutual-univ` refuses the block before any
+of §9.6 runs, and mirrors everyone else exactly.
+
+Five cases of the validation corpus turn on it, and all five are the mildest
+shape the divergence has: two inductive types with no field of either mentioning
+the other, at unrelated universes, sharing one `mutual` keyword. Nothing about
+them needs §9.6's machinery except the dispatch — the derivation reduces to
+declaring each of them on its own, which is what the file already says they are.
+The interesting shapes, the ones where a `Prop` member is load-bearing, are in
+`tests/` (§9.6.7) because no corpus contains one.

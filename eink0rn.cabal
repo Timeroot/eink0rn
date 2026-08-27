@@ -27,6 +27,7 @@ library
                       Front.Json
                       Front.Export
                       Front.Block
+                      Front.Hetero
                       Front.Lower
     build-depends:    base >=4.16 && <5
                     , bytestring
