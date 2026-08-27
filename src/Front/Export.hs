@@ -1,4 +1,5 @@
-{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE LambdaCase   #-}
 -- | Reading a @lean4export@ NDJSON stream into core terms.
 --
 -- The file is a sequence of lines.  Most define one entry of a pool -- a name,
@@ -117,11 +118,70 @@ parseExport :: B.ByteString -> Either String [ExDecl]
 parseExport input = go (1 :: Int) emptyPools [] (B.lines input)
   where
     go _ _ acc [] = Right (reverse acc)
-    go ln ps acc (l : ls)
-      | B.null (B.dropWhile (`elem` " \t\r") l) = go (ln + 1) ps acc ls
-      | otherwise = case step ps l of
-          Left err          -> Left ("line " ++ show ln ++ ": " ++ err)
-          Right (ps', mdec) -> go (ln + 1) ps' (maybe acc (: acc) mdec) ls
+    go ln ps acc (l : ls) = case appLine ps l of
+      Just (Left err)  -> Left ("line " ++ show ln ++ ": " ++ err)
+      Just (Right ps') -> go (ln + 1) ps' acc ls
+      Nothing
+        | B.null (B.dropWhile (`elem` " \t\r") l) -> go (ln + 1) ps acc ls
+        | otherwise -> case step ps l of
+            Left err          -> Left ("line " ++ show ln ++ ": " ++ err)
+            Right (ps', mdec) -> go (ln + 1) ps' (maybe acc (: acc) mdec) ls
+
+-- | @{"app":{"arg":N,"fn":M},"ie":K}@ -- read without parsing.
+--
+-- Three quarters of the lines in an export are applications, and every one of
+-- them is written in exactly this shape: 7.6 million of the 10.0 million lines
+-- of @std@, 81.2 million of @mathlib@, and in all four corpora not one
+-- application line that differs from it by a byte.  Building a 'Json' value for
+-- each of those -- a list of pairs, a boxed 'Integer' per index, a 'String' per
+-- key, all of it dead the moment the two lookups are done -- is most of what
+-- reading an export costs.
+--
+-- What makes the shortcut safe is that it is a match and not a parse.  The
+-- literal stretches are compared byte for byte and every number must begin with
+-- a digit; a space, a reordered key, a sign, a number too large for an 'Int',
+-- anything at all that is not this exact shape returns 'Nothing' and the line
+-- goes to 'step', which decides the format as before.  So this cannot admit a
+-- line the general reader rejects -- only skip the work of agreeing with it.
+--
+-- 'Nothing' is "not this shape"; @Just (Left _)@ is "this shape, and one of the
+-- indices names an expression that does not exist".
+appLine :: Pools -> B.ByteString -> Maybe (Either String Pools)
+appLine ps l0 = do
+  l1       <- lit appOpen l0
+  (a,  l2) <- nat l1
+  l3       <- lit appFn l2
+  (f,  l4) <- nat l3
+  l5       <- lit appIe l4
+  (k,  l6) <- nat l5
+  if B.length l6 /= 1 || B.head l6 /= '}' then Nothing else Just $ do
+    fn  <- look f
+    arg <- look a
+    Right ps { pExprs = IM.insert k (App fn arg) (pExprs ps) }
+  where
+    lit p s | p `B.isPrefixOf` s = Just (B.drop (B.length p) s)
+            | otherwise          = Nothing
+    -- 'B.readInt' would also take a sign, and -- despite what its name suggests
+    -- about the range it reads -- wraps silently on a number too large for an
+    -- 'Int' rather than declining to read it.  A wrapped index that landed on a
+    -- pool entry that happens to exist would be read as naming it.  So the run
+    -- of digits is measured first, and anything but one to eighteen of them --
+    -- eighteen being as many as cannot overflow -- is left to 'step', which
+    -- checks the range properly and says so.
+    nat s | d < 1 || d > 18 = Nothing
+          | otherwise       = B.readInt s
+      where d = digits 0
+            digits !j | j < B.length s && isDigit (B.index s j) = digits (j + 1)
+                      | otherwise                              = j
+    look i = maybe (Left ("undefined expression index " ++ show i)) Right
+                   (IM.lookup i (pExprs ps))
+
+-- | The literal stretches of an application line.  Packed once, at the top
+-- level, rather than at each of ten million comparisons.
+appOpen, appFn, appIe :: B.ByteString
+appOpen = B.pack "{\"app\":{\"arg\":"
+appFn   = B.pack ",\"fn\":"
+appIe   = B.pack "},\"ie\":"
 
 -- | The keys that say where a pool entry is filed, as opposed to what it is.
 poolKeys :: [String]
