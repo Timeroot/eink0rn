@@ -251,6 +251,16 @@ eqLeaf _             _             = False
 -- in the clock.  What still protects the pathological case is that the bound
 -- holds: a comparison of two @brecOn@ unfoldings gives up after 65536 pairs and
 -- starts again with the table.
+--
+-- Confirmed against the worst declaration in @mathlib@ -- the @Scheme@ theorem
+-- the README names, which is where a bad choice here would hurt most.  Checked
+-- on its own at @-j2 +RTS -A128m@: 4096 takes 347.5s and allocates 224.5 GB,
+-- 65536 takes 351.5s and 223.1 GB, 1048576 takes 499.6s and 226.6 GB.  So the
+-- flat middle of the @std@ curve is flat here too, and the walks the budget
+-- pays for on that theorem are genuine comparisons rather than waste: dividing
+-- the budget by sixteen buys about one per cent, and multiplying it by sixteen
+-- costs forty.  The structural fix would be hash-consing 'Expr', not a number
+-- here.
 eqBudget :: Int
 eqBudget = 65536
 

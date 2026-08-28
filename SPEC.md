@@ -2468,7 +2468,7 @@ nothing else reads, so it can be started the moment pass one has filed it, and
 `sparkObs` sparks each one as it goes by. The other threads therefore begin on
 declaration 0's judgements while pass one is still walking declaration 1, and by
 the time pass one finishes most of the file has already been checked — on `std`,
-all but 0.4s of it.
+all but about four seconds of it.
 
 What is left is sequential. Reading the file is not part of either pass and
 depends on neither, so under `-jN` it is given a thread of its own and runs while
@@ -2481,15 +2481,37 @@ thread was there to avoid.
 
 Pass one itself cannot be split — the environment declaration `k` is checked in
 is the one declarations `0 … k-1` built — and neither can the file be read out of
-order, since the pools are built left to right. So the floor is
-`max(read, walk)`, plus however far the longest single obligation reaches past
-the end of pass one from wherever pass one filed it. On the three smaller
-corpora nothing reaches past it at all and the floor is the read: `std` reads in
-8.6s and runs in 9.4s at `-j32 +RTS -A128m`, against 125s in one pass.
+order, since the pools are built left to right. So what the reader thread adds is
+not a second stage of a pipeline but a second worker on one stage: the two
+threads ask the same list the same questions, so the walker does whatever reading
+it catches up with, and pass one ends when the walk has consumed the last
+declaration. Its cost is therefore somewhere between `max(read, walk)` and
+`read + walk`, and the run is that plus however far the longest single obligation
+reaches past the end of pass one from wherever pass one filed it. Measured at
+`-j32 +RTS -A128m`, against a build that does nothing but force the whole
+declaration list on one thread:
+
+| corpus | pass one | list alone | pass two | run |
+| --- | --- | --- | --- | --- |
+| `init` | 3.2s | 4.1s | 0.4s | 4.8s |
+| `std` | 5.7s | 6.7s | 3.8s | 9.5s |
+| `cslib` | 23.5s | 24s | 6.5s | 32.0s |
+| `mathlib` | 75s | 50s | 210s | 5m 04s |
+
+On the three smaller corpora pass one costs *less* than reading the file does on
+one thread, which is the sharing above and is as far as it can go: the read is
+the whole of pass one and the walk is free. `std` used to spend 8.7s there and is
+the corpus the reader was tuned against; the run only fell from 10.5s to 9.5s,
+because a pass one three seconds shorter also covers three seconds fewer of the
+obligations it sparked, and pass two grew by about as much as pass one lost.
+`std` is no longer read-bound, and `-j62` in place of `-j32` costs about a second
+rather than saving one.
 
 `mathlib` is the one corpus where the tail is not a tail but a single
-declaration. It reads in 90s, walks in 101s, and takes 316s: the remaining 208s
-is one theorem, and `-j62` instead of `-j32` takes 5s off the whole run. Nothing
+declaration, and the only one where the walk is the larger half of pass one. Of
+its 210s of pass two, nearly all is one theorem — and `-j62` there does take
+about 5s off the run, the opposite of what it does to `std`, because what the
+extra threads are competing for is a queue that never empties early. Nothing
 about how the obligations are scheduled can help with that; only checking that
 one declaration faster can.
 
