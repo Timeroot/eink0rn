@@ -16,7 +16,10 @@ False: the block's recursors are ["False.rec","rogue"], expected ["False.rec"]
 ```
 
 The verdict goes to stdout and the reason, if there is one, to stderr. Exit
-status is 0 for `ACCEPT`, 1 for `REJECT`, 2 for a bad command line.
+status is 0 for `ACCEPT` and 1 for `REJECT`; 2 says no verdict was reached
+because a limit given on the command line was hit (`+RTS -M`, `+RTS -K`), and 3
+that the checker faulted or could not read its arguments. Nothing else exits 1,
+in particular: a crash is never reported as a rejection.
 
 ## What is different about it
 
@@ -90,7 +93,7 @@ The arena corpus lives in `refs/tests/` (extracted from `refs/tests.tar.gz`),
 laid out as `good/*.ndjson` and `bad/*.ndjson`:
 
 ```
-bash tools/run-tests.sh                 # 186/186
+bash tools/run-tests.sh                 # 193/193
 bash tools/run-tests.sh tests           # 16/16, hand-written
 bash tools/run-tests.sh validation      # the validation corpus below
 ```
@@ -148,6 +151,59 @@ One mathlib theorem —
 — accounts for 4m 27s of the one-pass figure on its own, and for two thirds of
 the `-j32` one. The next slowest takes 1m 01s, and only five declarations in the
 whole export take longer than 20 seconds.
+
+### Submitting to the arena
+
+`tools/arena-checker.yaml` is the entry for
+[`leanprover/lean-kernel-arena`](https://github.com/leanprover/lean-kernel-arena),
+kept here so the recipe travels with the thing it builds; submitting is copying
+it to that repository's `checkers/eink0rn.yaml` and bumping `rev`. The two
+commands in it are:
+
+```
+bash tools/arena-build.sh                              # build:
+./arena/eink0rn -j8 "$IN" +RTS -A32m -M12g -c30 -RTS   # run:
+```
+
+`tools/arena-build.sh` is one `ghc --make` — there is no package index to fetch
+and nothing to resolve, because the checker depends on the GHC boot libraries
+and nothing else. It tries every GHC it can find in turn and installs 9.6.6 with
+ghcup if none of them can build it, which is the case that matters: the arena
+builds each checker on an 8-vCPU, 16 GB `nscloud-ubuntu-22.04` runner inside a
+nix shell that provides elan, cargo, node, ocaml and zig, but no Haskell.
+
+The RTS options are all about that 16 GB. `-M` is a limit rather than a wish:
+over it the checker prints `DECLINE` and exits 2 instead of taking the runner
+down with it, which is a resource limit reported as one rather than as a wrong
+verdict or a crash. `-c30` asks for a compacting collection once the live set
+passes 30% of the limit, which keeps the peak near the live set rather than at
+twice it. `-Mgrace=256m` is built into the binary, so it applies whenever `-M`
+does: it is the room the overflow handler needs in order to speak, the default
+1M being gone before the exception is even delivered when eight threads are
+allocating.
+
+Its own two limits are the reason the entry rewrites two exit statuses to 2.
+One is the `timeout`. The other is 251, which is the RTS exiting on the heap
+limit by itself, and it happens when the live set grows past `-M` by more than
+the grace in the gap between two collections — `-c⟨n⟩` decides one collection
+too late, so a live set that doubles each time can commit to a copy it has no
+room to finish. Both are `-M` and the clock doing their job, and neither is a
+judgement about the file.
+
+Through that run line, on eight threads:
+
+| corpus | verdict | time | peak RSS |
+| --- | --- | --- | --- |
+| `init.ndjson` | ACCEPT | 12.3s | 1.74 GB |
+| `std.ndjson` | ACCEPT | 23.3s | 3.65 GB |
+| `cslib.ndjson` | ACCEPT | 1m 24s | 8.30 GB |
+
+**`mathlib` is declined up front**, which is the one real limitation. Its live
+set is 11.6 GB: at `-j8` with room to spare it is accepted in 10m 01s, but the
+peak is 25.6 GB, and a compacting collector holding it to 13.4 GB was still
+short of finishing after 53 minutes. Nothing else is close — `cslib`, the next
+largest, has a 4 GB live set and peaks at 8.4 GB — so this is about that one
+file rather than about the runner being small.
 
 ## Layout
 

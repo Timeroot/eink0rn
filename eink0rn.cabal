@@ -57,5 +57,10 @@ executable eink0rn
     -- -threaded: for -jN, which checks definition values on several cores once
     -- the file has been walked.  A run without it pays a little for the
     -- capability bookkeeping and nothing else; measured on std, under 1%.
-    ghc-options:      -threaded -rtsopts "-with-rtsopts=-K512m -A1g"
+    -- -Mgrace is the room the heap-overflow handler gets to print DECLINE and
+    -- exit 2 in.  The default is 1M, which eight allocating threads blow
+    -- through before the exception is delivered, and then the RTS kills the
+    -- process itself -- exit 251, which reads as a fault in the checker rather
+    -- than as the limit doing its job.
+    ghc-options:      -threaded -rtsopts "-with-rtsopts=-K512m -A1g -Mgrace=256m"
     default-language: Haskell2010

@@ -1,4 +1,5 @@
 # Build output
+arena/
 dist-newstyle/
 dist-prof/
 dist-late/

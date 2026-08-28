@@ -3,6 +3,9 @@
 module Main (main) where
 
 import           Control.Concurrent    (forkIO, killThread, threadDelay)
+import           Control.Exception     (AsyncException (..), SomeException,
+                                        catch, displayException, fromException,
+                                        throwIO)
 import           Control.Monad         (forever, when)
 import qualified Data.ByteString.Char8 as B
 import           Data.IORef            (modifyIORef', newIORef, readIORef,
@@ -94,6 +97,10 @@ usage prog = unlines
   , "                     thread wants a nursery of its own, so a large N on a"
   , "                     small machine wants a smaller one than the default"
   , "                     gigabyte: +RTS -A128m -RTS"
+  , ""
+  , "Exit status: 0 accepted, 1 rejected, 2 declined -- a limit given on the"
+  , "command line was reached and no verdict follows -- and 3 for a fault in"
+  , "the checker or in this command line."
   ]
 
 parseArgs :: [String] -> Either String Options
@@ -138,8 +145,50 @@ parseArgs = foldl step (Right defaults)
       [(k, "")] | k >= 1 -> Right k
       _                  -> Left ("not a number of threads: " ++ v)
 
+-- | The exit status says what happened, and the four possibilities are kept
+-- apart on purpose.
+--
+--   [@0@] the file was accepted, and @ACCEPT@ is on stdout
+--   [@1@] the file was rejected, and @REJECT@ is on stdout with the reason on
+--         stderr.  This is a judgement about the file
+--   [@2@] declined: no judgement was reached, because the run hit a limit it
+--         was given rather than a fault in the file.  The only ways to get one
+--         are @+RTS -M@ and @-K@ (see 'declined')
+--   [@3@] a fault in the checker, or a command line it could not read.  Not a
+--         judgement about the file either, but not the file's fault
+--
+-- The numbering is the Lean Kernel Arena's, which reads exit 2 as declined and
+-- anything above it as a checker fault.  GHC's own handler would exit 1 for an
+-- uncaught exception -- indistinguishable from @REJECT@, which is the one
+-- mistake worth going out of the way to avoid -- and 2 for a stack overflow,
+-- which would claim a limit was reached deliberately.  So nothing is left to
+-- it: 'main' catches everything and decides which of the two it was.
 main :: IO ()
-main = do
+main = checker `catch` fault
+  where
+    fault :: SomeException -> IO a
+    fault e
+        -- exitSuccess and friends come through here; they are the answer, not
+        -- a fault, and are simply passed on.
+      | Just code <- fromException e = throwIO (code :: ExitCode)
+      | Just HeapOverflow <- fromException e =
+          declined "ran out of heap (the limit is +RTS -M)"
+      | Just StackOverflow <- fromException e =
+          declined "ran out of stack (the limit is +RTS -K)"
+      | otherwise = do
+          hPutStrLn stderr ("internal error: " ++ displayException e)
+          exitWith (ExitFailure 3)
+
+    -- Neither ACCEPT nor REJECT: the checker is not saying anything about this
+    -- file.  Running out of room is a fact about the run, and reporting it as a
+    -- verdict either way would be a claim the run did not establish.
+    declined why = do
+      putStrLn "DECLINE"
+      hPutStrLn stderr (why ++ "; no verdict")
+      exitWith (ExitFailure 2)
+
+checker :: IO ()
+checker = do
   -- A 'Kernel.Name.Name' holds the bytes the export file held, undecoded: the
   -- kernel never looks inside one except to compare it, and a byte string
   -- compares the same either way.  Diagnostics have to put those bytes back on
@@ -159,7 +208,7 @@ main = do
       Nothing   -> die (usage prog)
       Just path -> run o path
   where
-    die msg = hPutStrLn stderr msg >> exitWith (ExitFailure 2)
+    die msg = hPutStrLn stderr msg >> exitWith (ExitFailure 3)
 
 run :: Options -> String -> IO ()
 run o path = do

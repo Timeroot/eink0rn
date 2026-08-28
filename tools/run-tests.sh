@@ -22,7 +22,10 @@ while [ $# -gt 0 ]; do
 done
 
 [ -f "$HOME/.ghcup/env" ] && . "$HOME/.ghcup/env"
-BIN=$(cabal list-bin eink0rn 2>/dev/null) || { echo "build first: cabal build"; exit 2; }
+# EINK0RN_BIN names a binary to test instead of the cabal build -- arena/eink0rn,
+# say, which tools/arena-build.sh puts there.
+BIN=${EINK0RN_BIN:-$(cabal list-bin eink0rn 2>/dev/null)} \
+  || { echo "build first: cabal build"; exit 2; }
 
 pass=0; fail=0
 declare -a failures=()
