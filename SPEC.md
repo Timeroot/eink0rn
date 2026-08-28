@@ -2371,6 +2371,201 @@ and a positive one stays true as the environment grows, so they are stored in th
 environment and travel with it. Only positive answers travel; see §6.5 for why
 that is what makes it sound.
 
+### 11.6 Two passes, and why they give the same answer
+
+`-jN` checks a file in two passes. Pass one walks the declarations in order and
+puts each one into the environment *without checking anything about it*. Pass two
+makes the judgements, on N threads. The file is accepted when pass one got to the
+end and every judgement holds.
+
+What pass one has to know about declaration `k` is what the environment records:
+its name, its universe parameters, its type `τₖ`, and — for a theorem — whether
+the proof can be dropped (§12.10), which is a question about which sort `τₖ`
+lives in. So pass one needs a sort for `τₖ` and nothing else. It takes one on
+trust, by inferring in *`Assume` mode* (§11.4): every premise is skipped, and the
+one that matters is the premise at an application, so the argument of an
+application is never looked at and only the function's telescope is walked. Pass
+one therefore reads one path through each statement — the leftmost spine — where
+checking it reads the whole of it.
+
+The two judgements about declaration `k` are set aside together as one
+*obligation*: that `τₖ` is a type (§5.2 `sort`), and then that `Γₖ ⊢ vₖ : τₖ`.
+One obligation rather than two, so that the two share their memo tables and so
+that the value is never compared against a type nobody has read.
+
+The two passes accept exactly the files one pass does. Both halves of that are
+the same induction, run from opposite ends, and it turns on one fact about
+`Assume` mode: **on a type that is a type, it gives the sort the real judgement
+gives**, since the two readings differ only in the premises they check and a
+premise does not enter the result.
+
+*One pass accepts ⟹ two do.* Write `Γ₀ ⊂ Γ₁ ⊂ …` for the constants the one-pass
+run enters. Suppose `Γₖ` is what pass one has entered too. The one-pass run
+checked `τₖ` in `Γₖ` and it passed, so pass one's assumed sort for `τₖ` is the
+real one, so the sealing decision and the `Sort 0` test on a theorem come out the
+same way, so pass one enters the same constant and `Γₖ₊₁` agrees. Pass one
+therefore reaches the end of the file, and every obligation it filed is a
+judgement the one-pass run made in the environment it made it in — and which
+held. So both accept.
+
+*Two passes accept ⟹ one does.* Same induction, with the hypothesis coming from
+the other side: obligation `k` held, so `τₖ` is a type in `Γₖ`, so the assumed
+sort was the real one, so the environments agree at `k+1`. Every judgement the
+one-pass run makes is then an obligation that held.
+
+The verdict is therefore the same, but the two runs are no longer doing the same
+thing declaration for declaration. On a file that is *rejected*, pass one may
+have walked on for some distance through an environment containing a type nobody
+could check, and the judgements it made along the way are about a theory the file
+does not describe. What that costs is bounded: reading a statement in `Assume`
+mode inspects a spine of the term it is given, reduction to expose a `Π` or a
+`Sort` is the same terminating reduction as anywhere else (delta unfolds
+constants that were declared strictly earlier, §7.1), and the answer it produces
+is used for exactly two things — the sealing decision and the `Sort 0` test on a
+theorem — both of which a failing obligation overrides.
+
+Two further things do not carry over, and neither can change a verdict:
+
+- **Which failure is reported.** One pass stops at the first judgement that
+  fails; two passes report whatever stopped pass one — an inductive it could not
+  admit, a statement it could not get a sort out of at all, a theorem whose
+  assumed sort is not `Sort 0`, or one of the checks §12.3 and §12.7 make when
+  the file ends — and only otherwise the first obligation in file order. Both
+  reject; they may name different faults, in two ways. When a bad value makes a
+  later declaration fail as well, the two runs name different declarations: on
+  the validation corpus that is ten of 881 cases, every one of them a `Quot`
+  package that a value mentions before the package is complete. And on a
+  statement that is wrong in more than one way, the two runs may name different
+  faults *in the same declaration*, because `Assume` mode reads a different part
+  of it — the leftmost spine, and no argument. `refs/tests/bad/constlevels.ndjson`
+  is the one case of that in the arena corpus, one of 186: reading the whole
+  statement finds an argument of the wrong type, and reading the spine gets past
+  that argument to a constant applied to the wrong number of universes.
+- **Licences (§6.5).** In one pass a licence established while checking a value
+  travels to every later declaration. Deferred, no value check precedes another,
+  so none of them can hand a licence on. Pass one therefore calls
+  `warmLicences` — which asks for every licence outright, at declarations
+  0, 1, 2, 4, 8, …, so a logarithmic number of times over the file — and those
+  licences travel forward in the ordinary way. This is not a
+  correctness measure: a licence only ever *enables* a reduction the kernel has
+  proved it may take, so losing one costs work and never an answer, and the
+  reduction budget of §7.4 is per declaration and is not spent on establishing
+  them. Without the warming `std` allocates a third more, every declaration
+  that touches arithmetic having re-derived `Nat.add` for itself.
+
+The one-pass path is the audited one and remains the default. It maintains the
+stronger invariant — a constant enters the environment only once *everything*
+about it has been checked — which is what the rest of the implementation is
+written against, and it is the path every test case runs on.
+
+What it buys is the whole point: on `std` the value checks are 81% of the time
+and 78% of the allocation, and they are a long tail rather than a few monsters,
+so they parallelise. Two passes on *one* thread cost nothing measurable and 4%
+more allocation, which is a second `TCState` per declaration.
+
+An obligation is not held back to the end of the file. It is a pure value that
+nothing else reads, so it can be started the moment pass one has filed it, and
+`sparkObs` sparks each one as it goes by. The other threads therefore begin on
+declaration 0's judgements while pass one is still walking declaration 1, and by
+the time pass one finishes most of the file has already been checked — on `std`,
+all but about four seconds of it.
+
+What is left is sequential. Reading the file is not part of either pass and
+depends on neither, so under `-jN` it is given a thread of its own and runs while
+pass one walks what it has read; the export reader is lazy, and the two threads
+are asking one list the same questions, so whichever asks first does the work.
+That last point wants `-feager-blackholing`, which "Front.Export" turns on for
+itself: without it the two threads can enter the same thunk at the same moment
+and each build the answer, which is precisely the duplicated reading the extra
+thread was there to avoid.
+
+Pass one itself cannot be split — the environment declaration `k` is checked in
+is the one declarations `0 … k-1` built — and neither can the file be read out of
+order, since the pools are built left to right. So what the reader thread adds is
+not a second stage of a pipeline but a second worker on one stage: the two
+threads ask the same list the same questions, so the walker does whatever reading
+it catches up with, and pass one ends when the walk has consumed the last
+declaration. Its cost is therefore somewhere between `max(read, walk)` and
+`read + walk`, and the run is that plus however far the longest single obligation
+reaches past the end of pass one from wherever pass one filed it. Measured at
+`-j32 +RTS -A128m`, against a build that does nothing but force the whole
+declaration list on one thread:
+
+| corpus | pass one | list alone | pass two | run |
+| --- | --- | --- | --- | --- |
+| `init` | 3.2s | 4.1s | 0.4s | 4.8s |
+| `std` | 5.7s | 6.7s | 3.8s | 9.5s |
+| `cslib` | 23.5s | 24s | 6.5s | 32.0s |
+| `mathlib` | 75s | 50s | 210s | 5m 04s |
+
+On the three smaller corpora pass one costs *less* than reading the file does on
+one thread, which is the sharing above and is as far as it can go: the read is
+the whole of pass one and the walk is free. `std` used to spend 8.7s there and is
+the corpus the reader was tuned against; the run only fell from 10.5s to 9.5s,
+because a pass one three seconds shorter also covers three seconds fewer of the
+obligations it sparked, and pass two grew by about as much as pass one lost.
+`std` is no longer read-bound, and `-j62` in place of `-j32` costs about a second
+rather than saving one.
+
+`mathlib` is the one corpus where the tail is not a tail but a single
+declaration, and the only one where the walk is the larger half of pass one. Of
+its 210s of pass two, nearly all is one theorem — and `-j62` there does take
+about 5s off the run, the opposite of what it does to `std`, because what the
+extra threads are competing for is a queue that never empties early. Nothing
+about how the obligations are scheduled can help with that; only checking that
+one declaration faster can.
+
+Note that the nursery is committed per capability, so a large `-jN` wants a
+smaller `-A` than a one-thread run does: `-A1g` at `-j32` commits 32 GB and runs
+*slower* than `-A128m`, which commits four. Between those two the curve is flat
+and the memory is not: `-A256m` won all five interleaved pairs on `std` and both
+on `cslib`, by 1.5% and 7% respectively, for half again as much resident memory —
+7.5 GB against 11.3 on `std`, 10.5 against 15.2 on `cslib`. `-A128m` is the
+recommendation because that is the wrong side of the trade at `mathlib`'s size.
+
+---
+
+### 11.7 Where the time goes
+
+Not normative — a record of what a `-fprof-late` build of one pass over `std` on
+one thread reports, so that the next attempt at making it faster starts from a
+measurement rather than a guess. Cost centres inflate the small hot functions,
+so the run takes 257s against 123s without them: read the shares, not the
+seconds.
+
+| | %time | %alloc |
+| --- | --- | --- |
+| `instNPrefix` — substituting locals for bound variables | 17.3 | 29.5 |
+| `eqE`'s budgeted recursion (§11.3) | 8.2 | 0.0 |
+| `whnfCore` | 7.6 | 2.0 |
+| `sharedLocal` (§11.5) | 6.5 | 4.1 |
+| `isDefEq`'s loop | 5.4 | 3.0 |
+| `instLevelsE` — substituting universe parameters | 4.9 | 7.9 |
+| the memo tables: lookup, insert, grow | 4.7 | 7.3 |
+| looking a constant up in the environment | 3.8 | 1.4 |
+| reading the file and filling the pools (§11.6) | 3.8 | 2.0 |
+| taking spines apart and putting them back | 2.7 | 6.2 |
+
+Inherited, 88% of the run is under `checkTypeIn` and 49% under `isDefEq`. The
+counts are what the shape of the thing looks like: over 800 million node
+comparisons inside `eqE`, over a billion `exprHash` reads, over 300 million times
+asking a term for its head, over 45 million substitutions.
+
+So the checker's remaining time is building terms and comparing them, in about
+equal measure, and both are what a hash-consed representation would attack: `==`
+would become the pointer test it already tries first, and a substitution that
+rebuilds a term the checker has seen would hand back the one it has. That is a
+change to the core representation with a mutable global table behind it, which
+is a large thing to weigh against an audit, and it has not been made.
+
+Four smaller things were measured and not taken. `-A256m` in place of `-A128m`
+(§11.6). `-j62` in place of `-j32`, which costs `std` about a second. The
+budgets of §11.3, which are already at the bottom of a flat curve. And the
+chunked pool of `Front.Pool` for the local context, which is the same dense
+counter-keyed table the export pools are — but the context is rebuilt per
+declaration and averages a couple of dozen entries, so it saved 0.6% of `std`'s
+allocation, no time at all, and ran 7% slower on `mathlib`.
+
 ---
 
 ## 12. The name surface, and deliberate divergences

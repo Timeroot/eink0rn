@@ -82,6 +82,7 @@ export.
 | `--keep-proofs` | off | retain every proof term instead of sealing it (SPEC §12.10). A pure performance switch. |
 | `--enforce-mutual-univ` | off | reject a mutual inductive block whose types do not all end in the same sort, as every other Lean kernel does. By default such a block is derived from simpler declarations and accepted if the derivation checks out (SPEC §9.6, §12.14). |
 | `--progress[=SECS]` | off | report on stderr as the file is checked, naming each declaration that took at least `SECS` seconds. |
+| `-jN` | off | check in two passes, the second on `N` threads (bare `-j`: one per core). Pass one only reads each declaration into the environment, taking its statement on trust; pass two makes both judgements about it, which is where all but a few per cent of the time goes and which nothing else depends on. Each obligation is started as pass one files it, and the file is read on a thread of its own alongside. Same verdict either way — SPEC §11.6 says why. On the three smaller corpora pass one costs no more than reading the file: `std` in 9.5s rather than 133s. |
 
 ## Tests
 
@@ -90,7 +91,7 @@ laid out as `good/*.ndjson` and `bad/*.ndjson`:
 
 ```
 bash tools/run-tests.sh                 # 186/186
-bash tools/run-tests.sh tests           # 14/14, hand-written
+bash tools/run-tests.sh tests           # 16/16, hand-written
 bash tools/run-tests.sh validation      # the validation corpus below
 ```
 
@@ -122,17 +123,31 @@ instance. The file is parsed strictly before checking starts, which is most of
 the memory. Read the times to about ±10%, and do not compare two of them: over a
 morning, repeated runs of *one* binary over `init` spread by eight per cent.
 
-| corpus | declarations | verdict | time | peak RSS |
-| --- | --- | --- | --- | --- |
-| `init.ndjson` (325 MB) | 53,093 | ACCEPT | 2m 49s | 1.6 GB |
-| `std.ndjson` (552 MB) | 90,778 | ACCEPT | 6m 4s | 3.3 GB |
-| `cslib.ndjson` (2.1 GB) | 370,939 | ACCEPT | 20m 32s | 9.6 GB |
-| `mathlib.ndjson` (5.6 GB) | 654,504 | ACCEPT | 1h 44m | 25.3 GB |
+| corpus | declarations | verdict | time | peak RSS | `-j32` |
+| --- | --- | --- | --- | --- | --- |
+| `init.ndjson` (325 MB) | 53,093 | ACCEPT | 1m 07s | 1.8 GB | 4.8s |
+| `std.ndjson` (552 MB) | 90,778 | ACCEPT | 2m 13s | 2.7 GB | 9.5s |
+| `cslib.ndjson` (2.1 GB) | 370,939 | ACCEPT | 8m 04s | 6.5 GB | 32.0s |
+| `mathlib.ndjson` (5.6 GB) | 654,504 | ACCEPT | 44m 00s | 24.2 GB | 5m 04s |
+
+The last column is the same run at `-j32 +RTS -A128m`, on all 64 cores rather
+than one. On the three smaller corpora most of it is reading the file (SPEC
+§11.6), so it is the reader that moves it: against the commit before this one,
+measured back to back on an idle box, `init` went 5.6s to 4.8s, `std` 10.5s to
+9.5s, `cslib` 36.7s to 32.0s, and `mathlib` — which is not read-bound and never
+was — 5m 15s to 5m 04s. The reader itself got rather more than that: forcing the
+declaration list of `std` and doing nothing else fell 27%, from 9.2s to 6.7s.
+What eats the difference is that the first pass is also what covers the checks it
+sparks, so finishing it three seconds sooner leaves three seconds more of them to
+finish afterwards. Which is also why the one-core column is unchanged: reading
+`std` is seven seconds of the two minutes and thirteen it takes there, well
+inside the spread of the figure.
 
 One mathlib theorem —
 `AlgebraicGeometry.Scheme.exists_π_app_comp_eq_of_locallyOfFinitePresentation_of_isAffine`
-— accounts for 11 minutes of that on its own. The next slowest takes 48 seconds,
-and only six declarations in the whole export take longer than 20.
+— accounts for 4m 27s of the one-pass figure on its own, and for two thirds of
+the `-j32` one. The next slowest takes 1m 01s, and only five declarations in the
+whole export take longer than 20 seconds.
 
 ## Layout
 

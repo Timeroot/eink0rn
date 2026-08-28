@@ -217,19 +217,33 @@ substLevel p v = go
     go (LSucc a)    = LSucc (go a)
     go (LMax a b)   = LMax (go a) (go b)
     go (LIMax a b)  = LIMax (go a) (go b)
-    go (LParam q)   | q == p    = v
-                    | otherwise = LParam q
+    go l@(LParam q) | q == p    = v
+                    | otherwise = l
 
 -- | Simultaneous substitution of a declaration's level parameters.
+--
+-- The two lists are walked side by side rather than packed into a map first.
+-- A declaration has a handful of universe parameters -- most have none and
+-- almost all the rest have one -- so the map was a tree of one node, built
+-- afresh at every call, and looked up with a 'compare' that has to walk two
+-- whole names to report that they are equal.  @(==)@ on a 'Name' answers that
+-- one from the pointers.
+--
+-- The first occurrence of a parameter wins, where the map kept the last.  No
+-- declaration binds one twice -- 'Front.Block.checkLevelParams' is a premise of
+-- every rule that admits one -- so nothing this is ever called on can tell.
 instLevelParams :: [Name] -> [Level] -> Level -> Level
 instLevelParams ps vs = go
   where
-    m = M.fromList (zip ps vs)
-    go LZero       = LZero
-    go (LSucc a)   = LSucc (go a)
-    go (LMax a b)  = LMax (go a) (go b)
-    go (LIMax a b) = LIMax (go a) (go b)
-    go (LParam q)  = M.findWithDefault (LParam q) q m
+    go LZero        = LZero
+    go (LSucc a)    = LSucc (go a)
+    go (LMax a b)   = LMax (go a) (go b)
+    go (LIMax a b)  = LIMax (go a) (go b)
+    go l@(LParam q) = look ps vs
+      where
+        look (p : ps') (v : vs') | p == q    = v
+                                 | otherwise = look ps' vs'
+        look _         _                     = l
 
 levelParamsOf :: Level -> [Name]
 levelParamsOf = nub . go

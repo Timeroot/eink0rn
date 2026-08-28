@@ -42,6 +42,7 @@ module Kernel.Canon
     -- * The arithmetic surface
   , NatOpCanon (..)
   , natOpCanon
+  , natOpNames
   , natProbeArgs
     -- * The standard constants
   , StdPin (..)
@@ -230,6 +231,18 @@ natOpCanon n
     z     = Const nameNatZero []
     true  = Const nameBoolTrue []
     false = Const nameBoolFalse []
+
+-- | Every name 'natOpCanon' has an entry for.
+--
+-- The list exists so that the licences can be established all at once rather
+-- than one at a time as reduction happens on them; see
+-- 'Kernel.Check.warmLicences'.  Keep it in step with 'natOpCanon' -- a name
+-- missing from here costs a licence, never a wrong one, since nothing consults
+-- the list to decide anything.
+natOpNames :: [Name]
+natOpNames =
+  [ nameNatPred, nameNatAdd, nameNatSub, nameNatMul, nameNatPow
+  , nameNatBEq, nameNatBLe, nameNatBLt, nameNatDiv, nameNatMod ]
 
 -- | The numeral pairs @div@ and @mod@ are tried on.
 --
