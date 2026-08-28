@@ -85,10 +85,12 @@ usage prog = unlines
   , ""
   , "  -jN                check the file in two passes, the second on N threads"
   , "                     (N omitted: one per core; -j1 for the two passes on"
-  , "                     one).  Pass one admits each declaration on its"
-  , "                     statement; pass two checks the values, which is where"
-  , "                     four fifths of the time goes and which nothing else"
-  , "                     depends on.  The verdict is the same either way.  Each"
+  , "                     one).  Pass one only reads each declaration into the"
+  , "                     environment; pass two checks it, which is where all"
+  , "                     but a few per cent of the time goes and which nothing"
+  , "                     else depends on.  The verdict is the same either"
+  , "                     way, and pass one is now the slower of reading the"
+  , "                     file and walking it.  Each"
   , "                     thread wants a nursery of its own, so a large N on a"
   , "                     small machine wants a smaller one than the default"
   , "                     gigabyte: +RTS -A128m -RTS"
@@ -186,11 +188,11 @@ run o path = do
     Left err        -> pure (Left err)
     Right (env, []) -> pure (Right env)
     Right (env, obs) -> do
-      remark o (show (length obs) ++ " value checks on " ++ show jobs ++ " threads")
+      remark o (show (length obs) ++ " declarations to check on " ++ show jobs ++ " threads")
       t2 <- getMonotonicTime
       r  <- pure $! (env <$ parDischarge jobs obs)
       t3 <- getMonotonicTime
-      remark o ("values checked in " ++ showFFloat (Just 2) (t3 - t2) "s")
+      remark o ("checked in " ++ showFFloat (Just 2) (t3 - t2) "s")
       pure r
   case result of
     Left err  -> reject err
@@ -227,7 +229,7 @@ prefetch xs = () <$ forkIO (go xs)
     go []       = pure ()
     go (y : ys) = y `seq` go ys
 
--- | Pass the trace through, setting the other threads on each value check as
+-- | Pass the trace through, setting the other threads on each obligation as
 -- pass one files it rather than waiting for the end of the file.
 --
 -- Pass one is the sequential part of a @-jN@ run and the obligations are the
@@ -255,7 +257,7 @@ sparkObs = map fire
     fire p@(Checked _ obs) = foldr (\o r -> obCheck o `par` r) p obs
     fire p                 = p
 
--- | Discharge the deferred value checks on @n@ threads.
+-- | Discharge the deferred obligations on @n@ threads.
 --
 -- An obligation is a pure @Either String ()@ and forcing it is performing it,
 -- so this is 'par' and nothing more: no thread of our own, no shared state, no

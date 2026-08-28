@@ -2374,35 +2374,73 @@ that is what makes it sound.
 ### 11.6 Two passes, and why they give the same answer
 
 `-jN` checks a file in two passes. Pass one walks the declarations in order and
-admits each one on the strength of its *statement*: the type is checked to be a
-type (§5.2 `sort`), and for a theorem §12.10 is asked of the statement to decide
-whether the value will be kept. The check that the value inhabits the type is set
-aside as an *obligation* and not performed. Pass two performs the obligations,
-on N threads. The file is accepted when pass one finished and every obligation
-holds.
+puts each one into the environment *without checking anything about it*. Pass two
+makes the judgements, on N threads. The file is accepted when pass one got to the
+end and every judgement holds.
 
-The two passes accept exactly the files one pass does, and this is the argument.
-Write `Γ₀ ⊂ Γ₁ ⊂ …` for the environments the one-pass run builds. Nothing pass
-one does depends on a value check having happened: the constant a declaration
-contributes is determined by its name, universe parameters, type and the `spent`
-answer, and `spent` is a question about the statement alone. So the two-pass run
-builds *the same* `Γₖ`, and the obligation it files for declaration `k` is
-`Γₖ ⊢ vₖ : τₖ` — the very judgement the one-pass run made at that point, in the
-very same environment, since an obligation captures `Γₖ` and not the final
-environment. The set of judgements attempted is therefore identical; only the
-order changes, and each is decided independently of the others (the checker
-writes nothing but its own per-declaration memo tables, which §11.4 discards at
-the end of the declaration anyway). Both runs accept iff all of them hold.
+What pass one has to know about declaration `k` is what the environment records:
+its name, its universe parameters, its type `τₖ`, and — for a theorem — whether
+the proof can be dropped (§12.10), which is a question about which sort `τₖ`
+lives in. So pass one needs a sort for `τₖ` and nothing else. It takes one on
+trust, by inferring in *`Assume` mode* (§11.4): every premise is skipped, and the
+one that matters is the premise at an application, so the argument of an
+application is never looked at and only the function's telescope is walked. Pass
+one therefore reads one path through each statement — the leftmost spine — where
+checking it reads the whole of it.
 
-Two things do not carry over, and neither can change a verdict:
+The two judgements about declaration `k` are set aside together as one
+*obligation*: that `τₖ` is a type (§5.2 `sort`), and then that `Γₖ ⊢ vₖ : τₖ`.
+One obligation rather than two, so that the two share their memo tables and so
+that the value is never compared against a type nobody has read.
+
+The two passes accept exactly the files one pass does. Both halves of that are
+the same induction, run from opposite ends, and it turns on one fact about
+`Assume` mode: **on a type that is a type, it gives the sort the real judgement
+gives**, since the two readings differ only in the premises they check and a
+premise does not enter the result.
+
+*One pass accepts ⟹ two do.* Write `Γ₀ ⊂ Γ₁ ⊂ …` for the constants the one-pass
+run enters. Suppose `Γₖ` is what pass one has entered too. The one-pass run
+checked `τₖ` in `Γₖ` and it passed, so pass one's assumed sort for `τₖ` is the
+real one, so the sealing decision and the `Sort 0` test on a theorem come out the
+same way, so pass one enters the same constant and `Γₖ₊₁` agrees. Pass one
+therefore reaches the end of the file, and every obligation it filed is a
+judgement the one-pass run made in the environment it made it in — and which
+held. So both accept.
+
+*Two passes accept ⟹ one does.* Same induction, with the hypothesis coming from
+the other side: obligation `k` held, so `τₖ` is a type in `Γₖ`, so the assumed
+sort was the real one, so the environments agree at `k+1`. Every judgement the
+one-pass run makes is then an obligation that held.
+
+The verdict is therefore the same, but the two runs are no longer doing the same
+thing declaration for declaration. On a file that is *rejected*, pass one may
+have walked on for some distance through an environment containing a type nobody
+could check, and the judgements it made along the way are about a theory the file
+does not describe. What that costs is bounded: reading a statement in `Assume`
+mode inspects a spine of the term it is given, reduction to expose a `Π` or a
+`Sort` is the same terminating reduction as anywhere else (delta unfolds
+constants that were declared strictly earlier, §7.1), and the answer it produces
+is used for exactly two things — the sealing decision and the `Sort 0` test on a
+theorem — both of which a failing obligation overrides.
+
+Two further things do not carry over, and neither can change a verdict:
 
 - **Which failure is reported.** One pass stops at the first judgement that
-  fails; two passes report whatever pass one found — a statement, or one of the
-  checks §12.3 and §12.7 make when the file ends — and only otherwise the first
-  obligation in file order. When a bad value makes a later declaration fail as
-  well, the two runs name different ones. Both reject. On the validation corpus
-  this is ten of 881 cases, every one of them a `Quot` package that a value
-  mentions before the package is complete.
+  fails; two passes report whatever stopped pass one — an inductive it could not
+  admit, a statement it could not get a sort out of at all, a theorem whose
+  assumed sort is not `Sort 0`, or one of the checks §12.3 and §12.7 make when
+  the file ends — and only otherwise the first obligation in file order. Both
+  reject; they may name different faults, in two ways. When a bad value makes a
+  later declaration fail as well, the two runs name different declarations: on
+  the validation corpus that is ten of 881 cases, every one of them a `Quot`
+  package that a value mentions before the package is complete. And on a
+  statement that is wrong in more than one way, the two runs may name different
+  faults *in the same declaration*, because `Assume` mode reads a different part
+  of it — the leftmost spine, and no argument. `refs/tests/bad/constlevels.ndjson`
+  is the one case of that in the arena corpus, one of 186: reading the whole
+  statement finds an argument of the wrong type, and reading the spine gets past
+  that argument to a constant applied to the wrong number of universes.
 - **Licences (§6.5).** In one pass a licence established while checking a value
   travels to every later declaration. Deferred, no value check precedes another,
   so none of them can hand a licence on. Pass one therefore calls
@@ -2425,18 +2463,35 @@ and 78% of the allocation, and they are a long tail rather than a few monsters,
 so they parallelise. Two passes on *one* thread cost nothing measurable and 4%
 more allocation, which is a second `TCState` per declaration.
 
+An obligation is not held back to the end of the file. It is a pure value that
+nothing else reads, so it can be started the moment pass one has filed it, and
+`sparkObs` sparks each one as it goes by. The other threads therefore begin on
+declaration 0's judgements while pass one is still walking declaration 1, and by
+the time pass one finishes most of the file has already been checked — on `std`,
+all but 0.4s of it.
+
 What is left is sequential. Reading the file is not part of either pass and
 depends on neither, so under `-jN` it is given a thread of its own and runs while
 pass one walks what it has read; the export reader is lazy, and the two threads
 are asking one list the same questions, so whichever asks first does the work.
+That last point wants `-feager-blackholing`, which "Front.Export" turns on for
+itself: without it the two threads can enter the same thunk at the same moment
+and each build the answer, which is precisely the duplicated reading the extra
+thread was there to avoid.
+
 Pass one itself cannot be split — the environment declaration `k` is checked in
 is the one declarations `0 … k-1` built — and neither can the file be read out of
 order, since the pools are built left to right. So the floor is
-`max(read, pass one) + slowest obligation`: on `std`, `max(11, 13) + 8.5`.
+`max(read, walk)`, plus however far the longest single obligation reaches past
+the end of pass one from wherever pass one filed it. On the three smaller
+corpora nothing reaches past it at all and the floor is the read: `std` reads in
+8.6s and runs in 9.4s at `-j32 +RTS -A128m`, against 125s in one pass.
 
-Measured on this 64-core box, `std` takes 139s in one pass and 27s at
-`-j16 +RTS -A128m`: 16s of pass one, with the reading finished inside it, and
-10s of obligations. The README has the figure for each corpus.
+`mathlib` is the one corpus where the tail is not a tail but a single
+declaration. It reads in 90s, walks in 101s, and takes 316s: the remaining 208s
+is one theorem, and `-j62` instead of `-j32` takes 5s off the whole run. Nothing
+about how the obligations are scheduled can help with that; only checking that
+one declaration faster can.
 
 Note that the nursery is committed per capability, so a large `-jN` wants a
 smaller `-A` than a one-thread run does: `-A1g` at `-j32` commits 32 GB and runs

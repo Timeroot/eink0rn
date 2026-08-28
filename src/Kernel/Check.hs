@@ -14,6 +14,7 @@ module Kernel.Check
   , infer
   , checkType
   , inferSortOf
+  , assumedSortOf
   , isDefEq
   , proofErasable
   , whnf
@@ -2399,14 +2400,24 @@ inferCore m env e = case e of
                    ++ " universe arguments, got " ++ show (length ls))
         when (m == Verify) (mapM_ checkLevel ls)
         instLevels ps ls (constType ci)
-  App f a -> do
-    tf <- inferM m env f
-    (dom, cod) <- ensurePi tf
-    when (m == Verify) (checkTypeIn env a dom)
-    -- The argument is only needed as a term when the codomain looks at it.
-    if looseBVarRange cod == 0 then pure cod
-                               else do a' <- closeIn env a
-                                       pure (inst1 a' cod)
+  -- A whole spine at once, and not one application node at a time.  Taken a
+  -- node at a time, the type of @h a1 ... an@ is built by substituting @a1@
+  -- into the telescope of @h@'s type, then @a2@ into what is left of it, and so
+  -- on: @n@ copies of a telescope @n@ binders long, to arrive at a type that
+  -- mentions each argument once.  Here the binders are peeled off as the
+  -- arguments are read and the arguments are held back in @vs@, so each
+  -- /domain/ is instantiated -- those are one argument's type each, and small --
+  -- and the body is instantiated once at the end.
+  --
+  -- Mathlib is where this shows: a typeclass-heavy statement is a spine of ten
+  -- or fifteen arguments over a long telescope, and rebuilding that telescope
+  -- for each of them was a third of everything the statement pass allocated.
+  --
+  -- What is given up is the memo entry for each proper prefix of the spine.
+  -- @h a1@ is still inferred, and memoised, wherever it occurs as a term in its
+  -- own right; it is no longer inferred as a step towards @h a1 a2@.
+  App{} -> case unApps e of
+    (h, as) -> inferM m env h >>= \th -> spine th as []
   Lam n t b -> do
     when (m == Verify) (() <$ inferSortOfIn env t)
     sharedLocal env n t $ \x t' -> do
@@ -2429,6 +2440,36 @@ inferCore m env e = case e of
     b' <- substIn (v' : env) b
     inferM m [] b'
   Proj tn i s -> inferProj m env tn i s
+  where
+    -- @spine ty as vs@ types a head already applied to some arguments, and now
+    -- applied to @as@ as well.  @ty@ is what is left of the head's type after
+    -- the binders those earlier arguments used were peeled off, so its loose
+    -- variables stand for them, innermost first; @vs@ is what they stand for,
+    -- in that order, waiting to be put in.
+    --
+    -- The invariant is @looseBVarRange ty <= length vs@: the head's type is
+    -- closed, and peeling one binder off it can leave at most one more variable
+    -- loose than the last, which is exactly what taking one more argument adds
+    -- to @vs@.  So 'instN' below always has something for every variable it
+    -- meets and nothing is left over to be lowered.
+    spine ty [] vs = pure (instN vs ty)
+    spine ty (a : as) vs = case ty of
+      Pi _ dom cod -> next dom cod a as vs
+      -- Not a binder yet.  Whatever it reduces to is closed -- the pending
+      -- arguments went in on the way -- so the rest of the spine starts over
+      -- with nothing pending.
+      _ -> do (dom, cod) <- ensurePi (instN vs ty)
+              next dom cod a as []
+
+    next dom cod a as vs = do
+      when (m == Verify) (checkTypeIn env a (instN vs dom))
+      -- The argument is only needed as a term when what follows looks at it --
+      -- and if nothing that follows looks at anything, the ones held back so
+      -- far are not needed either.
+      if looseBVarRange cod == 0
+        then spine cod as []
+        else do a' <- closeIn env a
+                spine cod as (a' : vs)
 
 -- | @checkType e t@ fails unless @e : t@.
 checkType :: Expr -> Expr -> TC ()
@@ -2461,6 +2502,26 @@ inferSortOf = inferSortOfIn []
 
 inferSortOfIn :: LEnv -> Expr -> TC Level
 inferSortOfIn env e = inferM Verify env e >>= ensureSort
+
+-- | Which sort a type will turn out to live in, taken on trust.
+--
+-- This is 'inferSortOf' in @Assume@ mode, and the difference is not a shortcut
+-- but a change of shape.  Every premise is skipped, and the largest of them is
+-- the one at an application: the argument is never looked at, only the
+-- function's telescope is walked.  So where the real judgement reads the whole
+-- of a term, this reads one path through it -- the leftmost spine -- and a
+-- statement of a hundred nodes costs about as much as a statement of ten.
+--
+-- Whenever 'inferSortOf' succeeds this agrees with it, because the two differ
+-- only by checks whose result is @()@ (see 'InferMode').  On a type that is not
+-- well formed the answer is a guess: it may be a level no reading of the type
+-- justifies, or the walk may fail where the real judgement would not have got
+-- that far.  A caller may therefore use it only if it also arranges for
+-- 'inferSortOf' to be asked of the same type somewhere, and rejects the file if
+-- that fails.  \"Front.Lower\" does exactly that under @-jN@; SPEC.md §11.6 has
+-- the argument.
+assumedSortOf :: Expr -> TC Level
+assumedSortOf e = inferM Assume [] e >>= ensureSort
 
 ensureSort :: Expr -> TC Level
 ensureSort t = whnf t >>= \case

@@ -63,8 +63,8 @@ data Config = Config
     -- universe, as every other Lean kernel does.  Off by default: the block is
     -- sound and \"Front.Hetero\" derives it (SPEC.md §9.6).
   , cfgDefer :: !Bool
-    -- ^ Hand back each definition's value check as an 'Obligation' instead of
-    -- running it where it stands.  Off by default; see 'Obligation'.
+    -- ^ Hand back each definition's checks as an 'Obligation' instead of
+    -- running them where they stand.  Off by default; see 'Obligation'.
   }
 
 defaultConfig :: Config
@@ -86,28 +86,43 @@ checkExport cfg = verdict . checkExportTrace cfg . map Right
 data Progress
   = Starting !(Maybe Name) -- ^ this declaration is about to be checked
   | Checked !(Maybe Name) ![Obligation]
-    -- ^ this declaration went in, putting off these value checks; 'Nothing' for
+    -- ^ this declaration went in, putting off these checks; 'Nothing' for
     -- an empty block, and no obligations unless 'cfgDefer'.  They are the very
     -- 'Obligation's 'Done' will hand back, so a consumer that starts on them here
     -- is doing the work 'discharge' would otherwise do later, not work twice.
   | Done Env [Obligation]  -- ^ every declaration went in, bar these ('cfgDefer')
   | Failed String          -- ^ this is why it did not
 
--- | A definition's value check, put off until the file has been walked.
+-- | Everything a definition has to be checked for, put off until the file has
+-- been walked.
 --
--- Under 'cfgDefer' a definition is admitted on the strength of its /statement/
--- alone -- the type is checked to be a type, and that is what the environment
--- needs -- and the check that the value inhabits it is handed back here.  The
--- file is accepted when every obligation is.
+-- Under 'cfgDefer' a definition is admitted on the strength of what its
+-- statement /says/, and not of anything having been checked about it.  What the
+-- environment wants of a declaration is its name, its universe parameters, its
+-- type, and -- for a theorem -- whether the proof can be dropped, which is a
+-- question about the statement's sort; 'assumedSortOf' answers that without
+-- reading the statement through.  Both real judgements, that the type is a type
+-- and that the value inhabits it, are handed back here.  The file is accepted
+-- when every obligation is.
 --
--- What this buys is that the obligations are independent of each other.  A
--- value check reads an environment and returns a verdict; it writes nothing,
--- and the environment it reads is the one its own declaration was admitted in,
--- captured here, so no obligation can see another's result.  They may therefore
--- be discharged in any order, or all at once on as many cores as there are --
--- and the verdict does not depend on which, since 'discharge' always reports
--- the first failure in file order.  On @std@ the value checks are 81% of the
--- run.
+-- What this buys is that the obligations are independent of each other.  One
+-- reads an environment and returns a verdict; it writes nothing, and the
+-- environment it reads is the one its own declaration was admitted in, captured
+-- here, so no obligation can see another's result.  They may therefore be
+-- discharged in any order, or all at once on as many cores as there are -- and
+-- the verdict does not depend on which, since 'discharge' always reports the
+-- first failure in file order.  What is left in front is the walk itself, which
+-- on every corpus we have is now slower to /read/ off the disk than to do.
+--
+-- The price is that the environment the walk builds is only known to be the
+-- right one once the obligations have held.  Where they do, it is: an obligation
+-- that holds says the statement is a type, and 'assumedSortOf' agrees with
+-- 'inferSortOf' on those, so declaration by declaration the two paths build the
+-- same environment and attempt the same judgements.  Where one fails the file is
+-- rejected, which is also what the interleaved path does with it, so the verdict
+-- is the same either way -- but the walk may have gone on for some distance
+-- through an environment holding a type nobody could check.  SPEC.md §11.6 sets
+-- this out properly.
 --
 -- It is not the default, because it is a second way to check a file and the
 -- kernel should have one.  The interleaved path is the audited one: it admits a
@@ -115,10 +130,10 @@ data Progress
 -- invariant the rest of this module is written against.
 data Obligation = Obligation
   { obName  :: !Name
-    -- ^ whose value this is
+    -- ^ whose declaration this is
   , obCheck :: Either String ()
-    -- ^ the check itself, unevaluated.  Forcing this to weak head normal form
-    -- /is/ performing it; there is nothing else inside.
+    -- ^ the checks themselves, unevaluated.  Forcing this to weak head normal
+    -- form /is/ performing them; there is nothing else inside.
   }
 
 -- | Discharge obligations in file order, reporting the first failure.
@@ -196,7 +211,7 @@ data LS = LS
     -- that has a value, in reverse order of declaration.  Held back until the
     -- file is finished; see 'checkQuarantined'.
   , lsObs     :: ![Obligation]
-    -- ^ value checks put off under 'lsDefer', in reverse order of declaration.
+    -- ^ checks put off under 'lsDefer', in reverse order of declaration.
   , lsSeen    :: !Int
     -- ^ how many of those there are, so 'lsWarmAt' can be reached.
   , lsWarmAt  :: !Int
@@ -286,7 +301,11 @@ defLike st n lps ty val hint kind = do
   barrier (lsEnv st) [ty, val]
   (spent, lic) <- runTCLearn (lsEnv st) lps $ do
     when warming warmLicences
-    sort <- inferSortOf ty
+    -- Deferred, the statement is not checked here either: 'assumedSortOf' says
+    -- which sort it will live in, which is all the environment wants, and
+    -- 'obs' below asks 'inferSortOf' of the very same type in the very same
+    -- environment.  See 'Obligation'.
+    sort <- if lsDefer st then assumedSortOf ty else inferSortOf ty
     -- Here, rather than in 'checkDecl', because the sort is already in hand.
     -- Asking there meant a second 'inferSortOf' over the same statement in a
     -- run of its own, sharing no memo table with this one -- and three quarters
@@ -299,8 +318,9 @@ defLike st n lps ty val hint kind = do
     unless (lsDefer st) $ checkType val ty
     -- Asked in the same run as the check, so it reuses its memo tables; asked
     -- of the /statement/, so it costs a head normalisation and nothing more.
-    -- Which is also why deferring the value check does not disturb it, and so
-    -- does not disturb which constants the environment ends up holding.
+    -- Which is also why deferring disturbs neither this nor the test above it,
+    -- and so does not disturb which constants the environment ends up holding:
+    -- both are questions about the statement, and the statement is here.
     if kind == IsThm && isDefinitelyZero sort
       then proofErasable ty
       else pure False
@@ -323,12 +343,20 @@ defLike st n lps ty val hint kind = do
     -- admitted in, and not the one it is admitted into: a value may not mention
     -- the constant it is defining, which is the whole of the termination
     -- argument for a @def@.
-    obs | lsDefer st = Obligation n (label (runTC (lsEnv st) lps (checkType val ty)))
+    --
+    -- Both judgements about this declaration are in here, in the order the
+    -- interleaved path makes them: that the statement is a type, and that the
+    -- value inhabits it.  One run rather than two, so they share their memo
+    -- tables, and the second is not attempted when the first has failed -- a
+    -- value checked against a type nobody has read is a comparison against
+    -- whatever the export happened to write down.
+    obs | lsDefer st = Obligation n (label (runTC (lsEnv st) lps
+                                             (inferSortOf ty >> checkType val ty)))
                          : lsObs st
         | otherwise  = lsObs st
     -- 'step' does this for the checks it runs itself; an obligation outlives it.
     label = either (Left . ((showName n ++ ": ") ++)) Right
-    -- Only when the value checks are deferred: without that the licences travel
+    -- Only when the checks are deferred: without that the licences travel
     -- as they always have, and the default path is left exactly as it was.
     warming = lsDefer st && lsSeen st >= lsWarmAt st
 
