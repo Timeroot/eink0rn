@@ -2517,7 +2517,54 @@ one declaration faster can.
 
 Note that the nursery is committed per capability, so a large `-jN` wants a
 smaller `-A` than a one-thread run does: `-A1g` at `-j32` commits 32 GB and runs
-*slower* than `-A128m`, which commits four.
+*slower* than `-A128m`, which commits four. Between those two the curve is flat
+and the memory is not: `-A256m` won all five interleaved pairs on `std` and both
+on `cslib`, by 1.5% and 7% respectively, for half again as much resident memory —
+7.5 GB against 11.3 on `std`, 10.5 against 15.2 on `cslib`. `-A128m` is the
+recommendation because that is the wrong side of the trade at `mathlib`'s size.
+
+---
+
+### 11.7 Where the time goes
+
+Not normative — a record of what a `-fprof-late` build of one pass over `std` on
+one thread reports, so that the next attempt at making it faster starts from a
+measurement rather than a guess. Cost centres inflate the small hot functions,
+so the run takes 257s against 123s without them: read the shares, not the
+seconds.
+
+| | %time | %alloc |
+| --- | --- | --- |
+| `instNPrefix` — substituting locals for bound variables | 17.3 | 29.5 |
+| `eqE`'s budgeted recursion (§11.3) | 8.2 | 0.0 |
+| `whnfCore` | 7.6 | 2.0 |
+| `sharedLocal` (§11.5) | 6.5 | 4.1 |
+| `isDefEq`'s loop | 5.4 | 3.0 |
+| `instLevelsE` — substituting universe parameters | 4.9 | 7.9 |
+| the memo tables: lookup, insert, grow | 4.7 | 7.3 |
+| looking a constant up in the environment | 3.8 | 1.4 |
+| reading the file and filling the pools (§11.6) | 3.8 | 2.0 |
+| taking spines apart and putting them back | 2.7 | 6.2 |
+
+Inherited, 88% of the run is under `checkTypeIn` and 49% under `isDefEq`. The
+counts are what the shape of the thing looks like: over 800 million node
+comparisons inside `eqE`, over a billion `exprHash` reads, over 300 million times
+asking a term for its head, over 45 million substitutions.
+
+So the checker's remaining time is building terms and comparing them, in about
+equal measure, and both are what a hash-consed representation would attack: `==`
+would become the pointer test it already tries first, and a substitution that
+rebuilds a term the checker has seen would hand back the one it has. That is a
+change to the core representation with a mutable global table behind it, which
+is a large thing to weigh against an audit, and it has not been made.
+
+Four smaller things were measured and not taken. `-A256m` in place of `-A128m`
+(§11.6). `-j62` in place of `-j32`, which costs `std` about a second. The
+budgets of §11.3, which are already at the bottom of a flat curve. And the
+chunked pool of `Front.Pool` for the local context, which is the same dense
+counter-keyed table the export pools are — but the context is rebuilt per
+declaration and averages a couple of dozen entries, so it saved 0.6% of `std`'s
+allocation, no time at all, and ran 7% slower on `mathlib`.
 
 ---
 
