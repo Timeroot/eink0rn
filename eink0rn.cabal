@@ -6,6 +6,7 @@ description:        Consumes lean4export .ndjson files and accepts or rejects th
                     Everything the export format offers is normalised down to a small
                     core calculus (see SPEC.md) before any type checking happens.
 license:            Apache-2.0
+license-file:       LICENSE
 build-type:         Simple
 
 common warnings

@@ -168,6 +168,14 @@ src/Front/Hetero     deriving a mutual block whose types span universes
 app/Main.hs          the command line
 ```
 
+## License
+
+Apache 2.0, the same license Lean and Mathlib use. See [`LICENSE`](LICENSE).
+
+Two directories are not original to this repository and are redistributed under
+their own terms: `refs/tests/` is the Lean Kernel Arena corpus, and
+`refs/format_ndjson.md` is `leanprover/lean4export`'s format specification.
+
 ## References
 
 `refs/lean-type-theory/` is Carneiro's thesis, cloned separately and not
