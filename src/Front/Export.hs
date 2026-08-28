@@ -211,12 +211,23 @@ parseExport input = go (1 :: Int) emptyPools 0
 -- next line starts at.
 data Fast = NotFast | FastErr String | FastOk !Pools !Int
 
+-- | Try the three shapes, the one that could match first.
+--
+-- @{\"a@, @{\"i@, @{\"f@: the three openings differ at the third byte, so a line
+-- with something else there matches none of them and a line with one of them
+-- can match only the one.  This is a filter and not a decision -- whichever
+-- matcher is picked still matches its whole opening, that byte included, and
+-- still returns 'NotFast' if the rest of the line is not the shape.  It is here
+-- because otherwise every @forallE@ line, and there are three million of them
+-- in @std@, is walked twice over by matchers that gave up at the third byte.
 fastLine :: Pools -> B.ByteString -> Int -> Fast
-fastLine ps s i = case appLine ps s i of
-  NotFast -> case lamLine ps s i of
-    NotFast -> allLine ps s i
-    r       -> r
-  r       -> r
+fastLine ps s i
+  | i + 3 > B.length s = NotFast
+  | otherwise = case B.index s (i + 2) of
+      'a' -> appLine ps s i
+      'i' -> lamLine ps s i
+      'f' -> allLine ps s i
+      _   -> NotFast
 
 -- | @{"app":{"arg":N,"fn":M},"ie":K}@.
 appLine :: Pools -> B.ByteString -> Int -> Fast

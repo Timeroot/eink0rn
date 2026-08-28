@@ -42,7 +42,7 @@ import qualified Data.IntMap.Strict as IM
 -- @n `mod` chunkSize@ entries, which is what lets the split point be recovered
 -- from @n@ alone.
 data Pool a
-  = Dense !Int !(IntMap (Array Int a)) [a]
+  = Dense {-# UNPACK #-} !Int !(IntMap (Array Int a)) [a]
   | Sparse !(IntMap a)
 
 -- | Big enough that the per-chunk costs are divided by something, small enough
@@ -72,13 +72,16 @@ poolPush k !x (Dense n cs tl)
   where freeze vs = listArray (0, chunkMask) (reverse vs)
 poolPush k x p = Sparse (IM.insert k x (toMap p))
 
+-- Every entry is in whnf already -- 'poolPush' saw to that -- so the @$!@ costs
+-- nothing and saves the thunk the reader would otherwise wrap around each of
+-- the twenty-two million lookups an export of @std@ makes.
 poolAt :: Pool a -> Int -> Maybe a
 poolAt (Sparse m) i = IM.lookup i m
 poolAt (Dense n cs tl) i
   | i < 0 || i >= n     = Nothing
-  | i >= n - (n .&. chunkMask) = Just (tl !! (n - 1 - i))
+  | i >= n - (n .&. chunkMask) = Just $! (tl !! (n - 1 - i))
   | otherwise = case IM.lookup (i `shiftR` chunkBits) cs of
-      Just c  -> Just (c ! (i .&. chunkMask))
+      Just c  -> Just $! (c ! (i .&. chunkMask))
       Nothing -> Nothing            -- unreachable: every chunk below n is full
 
 -- | Everything in the pool as the map it would have been.
