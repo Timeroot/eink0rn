@@ -170,7 +170,9 @@ and nothing to resolve, because the checker depends on the GHC boot libraries
 and nothing else. It tries every GHC it can find in turn and installs 9.6.6 with
 ghcup if none of them can build it, which is the case that matters: the arena
 builds each checker on an 8-vCPU, 16 GB `nscloud-ubuntu-22.04` runner inside a
-nix shell that provides elan, cargo, node, ocaml and zig, but no Haskell.
+nix shell that provides elan, cargo, node, ocaml and zig, but no Haskell. Cold
+— clone, ghcup, the compiler, and the sixteen modules — that path takes 2m 55s
+and 2.6 GB of disk; against a GHC already on the machine, 43s.
 
 The RTS options are all about that 16 GB. `-M` is a limit rather than a wish:
 over it the checker prints `DECLINE` and exits 2 instead of taking the runner

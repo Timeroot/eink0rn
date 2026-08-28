@@ -2558,13 +2558,23 @@ rebuilds a term the checker has seen would hand back the one it has. That is a
 change to the core representation with a mutable global table behind it, which
 is a large thing to weigh against an audit, and it has not been made.
 
-Four smaller things were measured and not taken. `-A256m` in place of `-A128m`
+Five smaller things were measured and not taken. `-A256m` in place of `-A128m`
 (§11.6). `-j62` in place of `-j32`, which costs `std` about a second. The
-budgets of §11.3, which are already at the bottom of a flat curve. And the
-chunked pool of `Front.Pool` for the local context, which is the same dense
+budgets of §11.3, which are already at the bottom of a flat curve. The chunked
+pool of `Front.Pool` for the local context, which is the same dense
 counter-keyed table the export pools are — but the context is rebuilt per
 declaration and averages a couple of dozen entries, so it saved 0.6% of `std`'s
-allocation, no time at all, and ran 7% slower on `mathlib`.
+allocation, no time at all, and ran 7% slower on `mathlib`. And GHC's two
+aggressive inlining knobs, `-fspecialise-aggressively` and
+`-fexpose-all-unfoldings`, which move `cslib`'s allocation by 34 kB in 374 GB
+and `std`'s by less than a part in a hundred thousand — three interleaved
+rounds each, and no time difference outside the noise. Both flags are about
+what one module can see of another's code, and the build is a single
+`ghc --make` over every module at once, so there was nothing left for them to
+expose. There is no profile-guided build to try: GHC has no equivalent of
+`-fprofile-generate`/`-fprofile-use`, its own `-fprof-late` instrumentation
+feeds a human rather than the optimiser, and the `-fllvm` backend that would
+inherit LLVM's would need LLVM 11–15.
 
 ---
 

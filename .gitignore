@@ -1,5 +1,6 @@
 # Build output
 arena/
+.ghcup/
 dist-newstyle/
 dist-prof/
 dist-late/
