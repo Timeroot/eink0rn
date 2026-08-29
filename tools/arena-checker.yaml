@@ -6,7 +6,7 @@
 # contains it.  The submitted copy carries the commit `ref` points at, which is
 # what the arena will clone --
 #
-#   sed "s/REPLACE_WITH_COMMIT_SHA/$(git rev-parse v1.1.1^{commit})/" \
+#   sed "s/REPLACE_WITH_COMMIT_SHA/$(git rev-parse v1.1.2^{commit})/" \
 #     tools/arena-checker.yaml > ../lean-kernel-arena/checkers/eink0rn.yaml
 description: |
   **eink0rn** — a Lean 4 kernel in Haskell, written clean-room, that normalises
@@ -23,12 +23,15 @@ description: |
     must match, so no export can smuggle in an unwarranted large elimination or
     an extra reduction rule. Nor are they believed once derived: each rule is
     typechecked against the type its own left-hand side has.
-  - **Mutual blocks whose types span universes are accepted.** Every other
-    kernel requires them to end in the same sort. Here the block is derived —
-    an all-`Prop` shadow, the data members declared separately in topological
-    order, the recursors rebuilt over the two, and every constructor type and
-    iota rule checked definitionally against the derivation. `--enforce-mutual-univ`
-    restores the usual rule.
+  - **Mutual blocks whose types span universes can be derived.** Every other
+    kernel requires them to end in the same sort. This one can instead build the
+    block out of declarations that are already admissible — an all-`Prop`
+    shadow, the data members declared separately in topological order, the
+    recursors rebuilt over the two — and check every constructor type and iota
+    rule definitionally against that derivation. It is off here:
+    `--enforce-mutual-univ` is in the run line below, so what this entry
+    measures is the rule every other kernel follows. `lean4export` emits no such
+    block, so the setting changes no verdict on any of the arena's exports.
   - **The arithmetic shortcuts want evidence.** `Nat.add` and friends are
     computed on bignums only when the definition in the file is definitionally
     the standard one, not because of what it is called. Kernels that trust the
@@ -54,16 +57,34 @@ description: |
   collection finds too much alive, so the other seven do not land on top of that
   declaration. Over the ceiling the answer is a decline and not the runner's OOM
   killer.
-version: "1.1.1"
+version: "1.1.2"
 url: https://github.com/Timeroot/eink0rn
-ref: v1.1.1
+ref: v1.1.2
 rev: REPLACE_WITH_COMMIT_SHA
 threads: 8
 build: bash tools/arena-build.sh
 # Exit codes are the arena's: 0 accept, 1 reject, 2 declined, 3 a fault in the
 # checker.  A crash is never reported as a rejection.
 #
-# The flags are all mathlib, measured on a box with room to spare and then
+# One flag is not about resources.  --enforce-mutual-univ turns off the only
+# place where this kernel accepts a file that official Lean refuses (a mutual
+# inductive block whose types do not all end in the same sort), so that what
+# the arena scores is the same language everyone else is being scored on.  It
+# is a setting and not a repair: with it off the block is derived from
+# admissible declarations and checked, rather than waved through.  No export
+# lean4export produces contains such a block, so it changes no verdict here.
+#
+# The remaining divergences have no such switch, or none worth throwing.  The
+# arithmetic licence of SPEC 6.5 is deliberate in both directions and its
+# --nat-accel=always mode is unsound on purpose -- it exists so that a file the
+# two settings disagree on isolates the rule, not to be run in anger.
+# --pin-std is an extra audit rather than a compatibility knob: it can only
+# reject more than official Lean, never less.  --keep-proofs would close a
+# theoretical false-reject (sealing a proof can only make a reduction stick),
+# but no corpus has ever exhibited one, and keeping every mathlib proof body is
+# exactly what does not fit in this runner.
+#
+# The rest are all mathlib, measured on a box with room to spare and then
 # squeezed back into sixteen gigabytes:
 #
 #   --mem=4000  the live-set budget the thread controller aims at.  Given
@@ -94,7 +115,8 @@ build: bash tools/arena-build.sh
 # than the grace the handler needs to print DECLINE itself; either way -M did
 # its job, and neither is a judgement about the file.
 run: |
-  timeout 5400 ./arena/eink0rn --mem=4000 -j8 "$IN" +RTS -A32m -M13g -RTS
+  timeout 5400 ./arena/eink0rn --enforce-mutual-univ --mem=4000 -j8 "$IN" \
+    +RTS -A32m -M13g -RTS
   rc=$?
   case $rc in
     124) exit 2 ;;

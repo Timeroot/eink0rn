@@ -121,10 +121,11 @@ schema (§12.8), and `Acc.rec` on a proof variable (§12.13).
 
 ### The Lean Kernel Arena exports
 
-All four, through the run line the arena entry uses — `--mem=4000 -j8 +RTS
--A32m -M13g` — one run each on a GCP `n2` instance with 64 cores and other work
-on it. Wall clock under load is worth about ±20%; the memory columns do not care
-what else the box is doing.
+All four, through the resource half of the run line the arena entry uses —
+`--mem=4000 -j8 +RTS -A32m -M13g`; the entry also passes
+`--enforce-mutual-univ`, which no export gives anything to do — one run each on
+a GCP `n2` instance with 64 cores and other work on it. Wall clock under load is
+worth about ±20%; the memory columns do not care what else the box is doing.
 
 | corpus | declarations | verdict | `-j8` | anonymous | mapped file | `-j1` |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -182,7 +183,8 @@ commands in it are:
 
 ```
 bash tools/arena-build.sh                                          # build:
-./arena/eink0rn --mem=4000 -j8 "$IN" +RTS -A32m -M13g -RTS         # run:
+./arena/eink0rn --enforce-mutual-univ --mem=4000 -j8 "$IN" \       # run:
+  +RTS -A32m -M13g -RTS
 ```
 
 `tools/arena-build.sh` is one `ghc --make` — there is no package index to fetch
@@ -193,6 +195,21 @@ builds each checker on an 8-vCPU, 16 GB `nscloud-ubuntu-22.04` runner inside a
 nix shell that provides elan, cargo, node, ocaml and zig, but no Haskell. Cold
 — clone, ghcup, the compiler, and the sixteen modules — that path takes 2m 55s
 and 2.6 GB of disk; against a GHC already on the machine, 43s.
+
+`--enforce-mutual-univ` is the one flag in the line that is not about resources.
+It turns off the only place where this kernel accepts a file official Lean
+refuses — a mutual inductive block whose types do not all end in the same sort,
+§9.6 — so that what the arena scores is the language every other checker is
+being scored on. It is a setting rather than a repair: with it off the block is
+derived from admissible declarations and checked definitionally, not waved
+through. `lean4export` emits no such block, so it changes no verdict on any of
+the four exports. The other divergences of §12 get no such switch here:
+`--nat-accel=always` would match official Lean's name-keyed arithmetic but is
+unsound on purpose and exists for differential testing, `--pin-std` is an extra
+audit that can only reject more than official Lean rather than less, and
+`--keep-proofs` would close a false-reject no corpus has ever exhibited at the
+cost of keeping every `mathlib` proof body, which is exactly what does not fit
+in the runner.
 
 The rest of the run line is all about that 16 GB, and all about `mathlib`. `-M`
 is a limit rather than a wish: over it the checker prints `DECLINE` and exits 2
