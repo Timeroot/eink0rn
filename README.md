@@ -152,8 +152,9 @@ page and the parser touches every one of them. The other quarter is
 `Front.Scan`'s extra pass and the per-line bookkeeping `Front.Pool` does to know
 when an index is finished with.
 
-What it buys is the row underneath: `mathlib` used to want 25 GB and now wants
-12.8, which on a 16 GB runner is the difference between a verdict and none.
+What it buys is the last row of the table: `mathlib` used to want 25 GB and now
+wants 12.8, which on a 16 GB runner is the difference between a verdict and
+none.
 
 One mathlib theorem —
 `AlgebraicGeometry.Scheme.exists_π_app_comp_eq_of_locallyOfFinitePresentation_of_isAffine`
