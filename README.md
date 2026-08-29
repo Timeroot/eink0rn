@@ -122,24 +122,32 @@ schema (§12.8), and `Acc.rec` on a proof variable (§12.13).
 ### The Lean Kernel Arena exports
 
 All four, through the run line the arena entry uses — `--mem=4000 -j8 +RTS
--A32m -M13g -F1.3` — one run each on a GCP `n2` instance with 64 cores and other
-work on it. Wall clock under load is worth about ±20% and the smaller three are
-roughly twice what they take on a quiet machine; the memory columns do not care
+-A32m -M13g` — one run each on a GCP `n2` instance with 64 cores and other work
+on it. Wall clock under load is worth about ±20%; the memory columns do not care
 what else the box is doing.
 
 | corpus | declarations | verdict | `-j8` | anonymous | mapped file | `-j1` |
 | --- | --- | --- | --- | --- | --- | --- |
-| `init.ndjson` (325 MB) | 53,093 | ACCEPT | 34s | 0.82 GB | 0.33 GB | 1m 26s |
-| `std.ndjson` (552 MB) | 90,778 | ACCEPT | 1m 03s | 2.01 GB | 0.56 GB | 2m 42s |
-| `cslib.ndjson` (2.1 GB) | 370,939 | ACCEPT | 3m 48s | 3.53 GB | 2.15 GB | 11m 02s |
-| `mathlib.ndjson` (5.6 GB) | 654,504 | ACCEPT | 21m 47s | 12.84 GB | 5.64 GB | 57m 19s |
+| `init.ndjson` (325 MB) | 53,093 | ACCEPT | 19s | 0.95 GB | 0.33 GB | 1m 26s |
+| `std.ndjson` (552 MB) | 90,778 | ACCEPT | 35s | 1.99 GB | 0.56 GB | 2m 42s |
+| `cslib.ndjson` (2.1 GB) | 370,939 | ACCEPT | 2m 17s | 4.79 GB | 2.15 GB | 11m 02s |
+| `mathlib.ndjson` (5.6 GB) | 654,504 | ACCEPT | 14m 53s | 12.85 GB | 5.64 GB | 57m 19s |
 
 Two memory columns because only one of them is a requirement. The export is
 mapped rather than read, so its pages are clean and file-backed: resident on a
 machine with room, and handed straight back on one without. What has to fit is
 the anonymous column. The last column is the same check on one thread with the
 compiled-in defaults instead of the flags above, for scale — and only for scale,
-since without `-F1.3` the same `mathlib` run wants 20.8 GB.
+since with no ceiling on it the same `mathlib` run wants 20.8 GB.
+
+Only `mathlib` is anywhere near the ceiling, and that is the point of writing
+the limit down as a ceiling rather than as a collection ratio. An earlier
+version of this run line added `-F1.3`, which holds the heap to 1.3 times the
+live set everywhere; repeated interleaved runs put that at 26% of `mathlib`'s
+wall clock for a peak indistinguishable from the default's, because near `-M`
+the collector reins the ratio in by itself and below `-M` there was never
+anything to rein in. The three smaller exports pay for the ceiling in memory
+they have to spare rather than in time.
 
 That memory came at a price in time, and the price is worth stating. Measured
 alternately against the commit before it, arms interleaved so that whatever the
@@ -174,7 +182,7 @@ commands in it are:
 
 ```
 bash tools/arena-build.sh                                          # build:
-./arena/eink0rn --mem=4000 -j8 "$IN" +RTS -A32m -M13g -F1.3 -RTS   # run:
+./arena/eink0rn --mem=4000 -j8 "$IN" +RTS -A32m -M13g -RTS         # run:
 ```
 
 `tools/arena-build.sh` is one `ghc --make` — there is no package index to fetch
@@ -189,15 +197,19 @@ and 2.6 GB of disk; against a GHC already on the machine, 43s.
 The rest of the run line is all about that 16 GB, and all about `mathlib`. `-M`
 is a limit rather than a wish: over it the checker prints `DECLINE` and exits 2
 instead of taking the runner down with it, which is a resource limit reported as
-one rather than as a wrong verdict or a crash. Above 30% of `-M` the RTS
-collects the oldest generation in place instead of copying it, which is what
-makes `-F1.3` affordable: the heap may be 1.3 times the live set before that
-generation is collected, against a default of 2.0. That last flag is the one
-that decides whether `mathlib` fits. `--mem=4000` is the checker's own budget,
-below. `-Mgrace=256m` is built into the binary, so it applies whenever `-M`
-does: it is the room the overflow handler needs in order to speak, the default
-1M being gone before the exception is even delivered when eight threads are
-allocating.
+one rather than as a wrong verdict or a crash. But it is also the flag that
+keeps the run under the limit in the first place, and that is why the run line
+names a ceiling and not a ratio. Above 30% of `-M` the RTS collects the oldest
+generation in place instead of copying it, and as the heap approaches `-M` it
+reins in how far ahead of the live set the heap is allowed to run before that
+generation is collected. So the squeeze applies itself where it is needed and
+nowhere else: `mathlib` peaks at 12.8 GB under `-M13g` and at 21.1 GB with the
+limit raised out of reach, while `init`, `std` and `cslib` never come near it
+and are collected at the fast default throughout. `--mem=4000` is the checker's
+own budget, below. `-Mgrace=256m` is built into the binary, so it applies
+whenever `-M` does: it is the room the overflow handler needs in order to speak,
+the default 1M being gone before the exception is even delivered when eight
+threads are allocating.
 
 Its own two limits are the reason the entry rewrites two exit statuses to 2.
 One is the `timeout`. The other is 251, which is the RTS exiting on the heap

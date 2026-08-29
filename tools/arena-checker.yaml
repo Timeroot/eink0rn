@@ -6,7 +6,7 @@
 # contains it.  The submitted copy carries the commit `ref` points at, which is
 # what the arena will clone --
 #
-#   sed "s/REPLACE_WITH_COMMIT_SHA/$(git rev-parse v1.1.0^{commit})/" \
+#   sed "s/REPLACE_WITH_COMMIT_SHA/$(git rev-parse v1.1.1^{commit})/" \
 #     tools/arena-checker.yaml > ../lean-kernel-arena/checkers/eink0rn.yaml
 description: |
   **eink0rn** — a Lean 4 kernel in Haskell, written clean-room, that normalises
@@ -47,14 +47,16 @@ description: |
 
   Nothing is declined. `mathlib` is the tight one — one declaration in it holds
   a 12.5 GB live set, all memo table, single-threaded or not — and it is checked
-  by keeping the heap close to that with a compacting collector rather than at
-  twice it with a copying one. `--mem` throttles how many threads work at once
-  when a major collection finds too much alive, so the other seven do not land
-  on top of that declaration. `-M` is a real limit underneath both: over it the
-  answer is a decline and not the runner's OOM killer.
-version: "1.1.0"
+  by naming a ceiling and letting the collector work out for itself when it has
+  to compact to stay under one: 12.8 GB against 21.1 GB with the ceiling raised
+  out of reach, and nothing at all charged to the three exports that never come
+  near it. `--mem` throttles how many threads work at once when a major
+  collection finds too much alive, so the other seven do not land on top of that
+  declaration. Over the ceiling the answer is a decline and not the runner's OOM
+  killer.
+version: "1.1.1"
 url: https://github.com/Timeroot/eink0rn
-ref: v1.1.0
+ref: v1.1.1
 rev: REPLACE_WITH_COMMIT_SHA
 threads: 8
 build: bash tools/arena-build.sh
@@ -68,14 +70,17 @@ build: bash tools/arena-build.sh
 #               explicitly rather than left to the adaptive default, so that
 #               the verdict does not depend on what /proc/meminfo says inside
 #               the runner.
-#   -M13g       a real limit, not a wish: over it the checker declines instead
-#               of taking the runner's 16 GB down with it.  Above 30% of it the
-#               oldest generation is collected in place, which is what makes
-#               the next flag affordable.
-#   -F1.3       the heap may be 1.3x the live set before the oldest generation
-#               is collected, against a default of 2.0.  This is the flag that
-#               decides whether mathlib fits: 12.8 GB of anonymous memory
-#               instead of 13.5, on a 10.7 GB live set.
+#   -M13g       the ceiling, and the one flag that decides whether mathlib
+#               fits.  It is a real limit -- over it the checker declines
+#               rather than taking the runner's 16 GB down with it -- but it
+#               also shapes the run well below the limit, because the RTS
+#               collects the oldest generation in place above 30% of -M and
+#               reins in how far the heap may run ahead of the live set as it
+#               approaches -M.  That is the whole point of stating a ceiling
+#               rather than a ratio: mathlib peaks at 12.8 GB under it and at
+#               21.1 GB with it raised out of reach, while the three smaller
+#               exports never come near it and are collected at the fast
+#               default, paying nothing for a flag they do not need.
 #   -A32m       small nursery: eight of them, and the survivors of a big one
 #               are what the old generation has to absorb.
 #
@@ -89,7 +94,7 @@ build: bash tools/arena-build.sh
 # than the grace the handler needs to print DECLINE itself; either way -M did
 # its job, and neither is a judgement about the file.
 run: |
-  timeout 5400 ./arena/eink0rn --mem=4000 -j8 "$IN" +RTS -A32m -M13g -F1.3 -RTS
+  timeout 5400 ./arena/eink0rn --mem=4000 -j8 "$IN" +RTS -A32m -M13g -RTS
   rc=$?
   case $rc in
     124) exit 2 ;;

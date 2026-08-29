@@ -2642,47 +2642,75 @@ whole difference between fitting in sixteen gigabytes and not. `mathlib` at
 
 | oldest generation | peak live | peak anon | elapsed | verdict |
 | --- | --- | --- | --- | --- |
-| copying, `-F2` (`-M14g`, budget 5300) | 7.40 GB | 14.84 GB | — | DECLINE |
+| copying, `-F2` (`-M14g`, `-c90`, budget 5300) | 7.40 GB | 14.84 GB | — | DECLINE |
 | copying, `-F2` (`-c60`) | 6.85 GB | 13.77 GB | — | DECLINE |
 | non-moving | 11.92 GB | 16.20 GB | — | DECLINE |
 | compacting above 40% | 6.69 GB | 13.75 GB | 1410s | ACCEPT |
-| compacting, `-F2` | 6.55 GB | 13.51 GB | 953s | ACCEPT |
 | compacting, `-F1.5` | 8.27 GB | 12.89 GB | 1247s | ACCEPT |
-| compacting, `-F1.3` | 10.71 GB | 12.83 GB | 1022s | ACCEPT |
+| compacting, `-F1.3` | 10.71 GB | 12.83–13.42 GB | 1086s | ACCEPT |
+| compacting, `-F2` (the default) | 10.03 GB | 12.84–13.50 GB | 864s | ACCEPT |
+| `-M30g`, the ceiling out of reach | 10.25 GB | 21.07 GB | 799s | ACCEPT |
 | one thread, unbounded, copying | 12.51 GB | 24.72 GB | 4822s | ACCEPT |
 
 Read the middle column with care and the right-hand one without. *Peak live* is
 sampled at major collections, so a configuration that has fewer of them sees
-less of the truth — the `-F1.3` row took 86 samples and the `-F2` row 31, which
-is most of why the better-sampled row reports the larger figure. On the DECLINE
-rows both figures are where the run died rather than where it was going. *Peak
-anon* is read from `/proc` and is not sampled that way; it is also the number
-that has to fit, the mapped file being reclaimable (above). The elapsed times
-are one run each on a shared box and are worth about ±20%, but the ordering
-survived repetition: compaction is slower than copying because GHC's compacting
-collection is single-threaded.
+less of the truth. On the DECLINE rows both figures are where the run died
+rather than where it was going. *Peak anon* is read from `/proc`, is not sampled
+that way, and is the number that has to fit, the mapped file being reclaimable
+(above). Elapsed times are one run each except the two `-F` rows, which are
+means of three and eight.
 
-Two of these were wrong guesses worth recording. The **non-moving** collector
-should have been the answer — mark-and-sweep wants no copy reserve — and it is
-the worst row in the table: its snapshot-at-the-beginning marking keeps
-everything that was alive when a mark began, which on a live set that quadruples
-in four minutes is most of the growth, and it lost a further 3.4 GB to
-fragmentation on top. It also took an hour. And **compaction is not what holds
-the heap down**; `-F` is. `-c<n>` chooses how the oldest generation is
-collected, `-F` chooses when, and the default of 2.0 is why a 6.5 GB live set
-was costing 13.5 GB. Compaction only makes a low `-F` affordable, by not wanting
-a copy of the generation it is collecting; `-c` alone left the peak where it
-was, and moving it from 30% to 40% only cost time.
+Three of these were wrong guesses worth recording, and the third is the one that
+decides the run line. The **non-moving** collector should have been the answer —
+mark-and-sweep wants no copy reserve — and it is the worst row in the table: its
+snapshot-at-the-beginning marking keeps everything that was alive when a mark
+began, which on a live set that quadruples in four minutes is most of the
+growth, and it lost a further 3.4 GB to fragmentation on top. It also took an
+hour. **Compaction is not what holds the heap down** either: `-c<n>` chooses how
+the oldest generation is collected, not when, and moving it from 30% to 40% only
+cost time. What it does is make a heap near the limit survivable at all, by not
+wanting a copy of the generation it is collecting — which is why the two rows
+that turn it down are the two that die.
 
-What all of it comes to, at `--mem=4000 -j8 +RTS -A32m -M13g -F1.3`, which is
-what the arena entry runs:
+And **`-F` is not what holds the heap down**, which is the guess that lasted
+longest, because a single run of `-F1.3` peaked at 12.83 GB and a single run of
+`-F2` at 13.51 and that looked decisive. It is not: repeating both arms
+interleaved puts three `-F1.3` runs at 12.83, 12.86 and 13.42 GB and eight `-F2`
+runs between 12.84 and 13.50 with a median of 12.85, so the spread within either
+arm is larger than the distance between them, and every one of the eleven
+accepts. `mathlib`'s peak is one declaration's memo tables and the collection
+ratio has no purchase on it. What the ratio does have purchase on is time, where
+it costs 26%.
+
+**`-M` is what holds the heap down** — it is a ceiling and not only a limit. The
+RTS compacts the oldest generation above 30% of it and reins in how far the heap
+may run ahead of the live set as the heap approaches it, so a stated ceiling
+applies exactly as much squeeze as the ceiling needs and none below: the same
+run with `-M30g` takes 21.07 GB and 799s, and with `-M13g` takes 12.85 GB and
+864s. Eight per cent of `mathlib`, nothing at all of the other three, and no
+number in the run line that has to be re-tuned per corpus.
+
+The same policy can be written from below instead, and it was tried: `-O` sets a
+minimum size for the oldest generation, which is collected at whichever of `-O`
+and `-F` times the live set is larger, so `-F1.3 -O6g` says in one flag pair that
+the heap may be 1.3 times the live set or six gigabytes, whichever is more. It
+buys nothing here. On `mathlib` the floor is under the peak by the time the peak
+matters and the run is unchanged: 1025s at `-O6g` and 1028s at `-O8g` against
+1014s without either, all three at 12.8–13.0 GB. On the smaller exports it does
+buy back what the ratio costs — `std` 38.3s to 35.0s, `cslib` 142.0s to 133.8s —
+but for 2.4 times the memory, which is a poor trade for three seconds, and the
+ceiling gives the same seconds back for free by not charging them in the first
+place.
+
+What all of it comes to, at `--mem=4000 -j8 +RTS -A32m -M13g`, which is what the
+arena entry runs:
 
 | corpus | verdict | peak live | peak anon | mapped file | elapsed |
 | --- | --- | --- | --- | --- | --- |
-| `init` | ACCEPT | 0.28 GB | 0.82 GB | 0.33 GB | 34s |
-| `std` | ACCEPT | 0.86 GB | 2.01 GB | 0.56 GB | 63s |
-| `cslib` | ACCEPT | 1.71 GB | 3.53 GB | 2.15 GB | 228s |
-| `mathlib` | ACCEPT | 10.20 GB | 12.84 GB | 5.64 GB | 1307s |
+| `init` | ACCEPT | 0.25 GB | 0.95 GB | 0.33 GB | 19s |
+| `std` | ACCEPT | 0.66 GB | 1.99 GB | 0.56 GB | 35s |
+| `cslib` | ACCEPT | 1.69 GB | 4.79 GB | 2.15 GB | 137s |
+| `mathlib` | ACCEPT | 10.03 GB | 12.85 GB | 5.64 GB | 893s |
 
 The mapped-file column is resident too, and on a machine with room it stays
 resident, which is why `mathlib`'s RSS reads 18.5 GB on a box that has plenty.
