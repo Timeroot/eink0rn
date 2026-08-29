@@ -2569,6 +2569,14 @@ memory drops them and reads them again — so they are resident but not
 *required*, which is the distinction that matters on a machine smaller than the
 export. Live set 11.63 → 8.76 GB.
 
+It is not free. Interleaved against the commit before it, with only the mapping
+changed, one thread over `init` goes 72.8s to 83.0s: a mapped file costs a page
+fault per page and the parser touches every page there is. Keeping *windows*
+into the mapping rather than copying strings out of it makes that worse and not
+better — 98.1s — because a name that is a window is read by touching the page it
+came from, and the pages a run's names live on are scattered across the whole
+export where copies are a few megabytes of heap side by side.
+
 **The pools were most of the rest.** An export numbers its names, levels and
 expressions, and a line may mention any index defined above it, so the reader
 held all of them to the end of the file — and holding an expression holds its
@@ -2589,7 +2597,8 @@ peak went 1,159 → 954 MB without eviction and → 650 MB with it.
 obligation builds its own memo tables — what reduces to what, what is convertible
 with what — and on a hard declaration they are most of what is alive. `+RTS -hT`
 on `mathlib` gives the shape, and the shape is not the one that was assumed. On
-one thread, sampling once a minute:
+one thread, sampling once a minute (`t` is mutator time, which on one thread is
+very nearly the clock):
 
 ```
     t=  1211s   2.23 GB      t=  3448s   3.31 GB
@@ -2609,9 +2618,10 @@ alive up there was built by the checker rather than read from the file, which is
 what a memo table full of reduced forms looks like.
 
 The `-j8` census is the same graph — flat at 3.3 GB, then 3.44 → 4.82 → 6.29 →
-7.88 → 9.28 → 11.47 GB in the last four minutes, 72.7% of it `XApp`. The two
-runs peak within seven per cent of each other, so the spike is **one
-declaration**, not eight at once, and no amount of throttling gets under it.
+7.88 → 9.28 → 11.47 GB over the last 180 seconds of mutator time, 72.7% of it
+`XApp`. The two runs peak within seven per cent of each other, so the spike is
+**one declaration**, not eight at once, and no amount of throttling gets under
+it.
 That also disposes of the first version of `--mem`, which was a gate on
 *starting*: a thread that waits while the live set is over the budget stops the
 ninth obligation and not the eight already running, and the memory belongs to

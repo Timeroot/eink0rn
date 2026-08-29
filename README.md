@@ -121,36 +121,47 @@ schema (§12.8), and `Acc.rec` on a proof variable (§12.13).
 
 ### The Lean Kernel Arena exports
 
-Whole-run wall clock and peak RSS, one run each, alone on one core of a GCP `n2`
-instance. The file is parsed strictly before checking starts, which is most of
-the memory. Read the times to about ±10%, and do not compare two of them: over a
-morning, repeated runs of *one* binary over `init` spread by eight per cent.
+All four, through the run line the arena entry uses — `--mem=4000 -j8 +RTS
+-A32m -M13g -F1.3` — one run each on a GCP `n2` instance with 64 cores and other
+work on it. Wall clock under load is worth about ±20% and the smaller three are
+roughly twice what they take on a quiet machine; the memory columns do not care
+what else the box is doing.
 
-| corpus | declarations | verdict | time | peak RSS | `-j32` |
-| --- | --- | --- | --- | --- | --- |
-| `init.ndjson` (325 MB) | 53,093 | ACCEPT | 1m 07s | 1.8 GB | 4.8s |
-| `std.ndjson` (552 MB) | 90,778 | ACCEPT | 2m 13s | 2.7 GB | 9.5s |
-| `cslib.ndjson` (2.1 GB) | 370,939 | ACCEPT | 8m 04s | 6.5 GB | 32.0s |
-| `mathlib.ndjson` (5.6 GB) | 654,504 | ACCEPT | 44m 00s | 24.2 GB | 5m 04s |
+| corpus | declarations | verdict | `-j8` | anonymous | mapped file | `-j1` |
+| --- | --- | --- | --- | --- | --- | --- |
+| `init.ndjson` (325 MB) | 53,093 | ACCEPT | 34s | 0.82 GB | 0.33 GB | 1m 26s |
+| `std.ndjson` (552 MB) | 90,778 | ACCEPT | 1m 03s | 2.01 GB | 0.56 GB | 2m 42s |
+| `cslib.ndjson` (2.1 GB) | 370,939 | ACCEPT | 3m 48s | 3.53 GB | 2.15 GB | 11m 02s |
+| `mathlib.ndjson` (5.6 GB) | 654,504 | ACCEPT | 21m 47s | 12.84 GB | 5.64 GB | 57m 19s |
 
-The last column is the same run at `-j32 +RTS -A128m`, on all 64 cores rather
-than one. On the three smaller corpora most of it is reading the file (SPEC
-§11.6), so it is the reader that moves it: against the commit before this one,
-measured back to back on an idle box, `init` went 5.6s to 4.8s, `std` 10.5s to
-9.5s, `cslib` 36.7s to 32.0s, and `mathlib` — which is not read-bound and never
-was — 5m 15s to 5m 04s. The reader itself got rather more than that: forcing the
-declaration list of `std` and doing nothing else fell 27%, from 9.2s to 6.7s.
-What eats the difference is that the first pass is also what covers the checks it
-sparks, so finishing it three seconds sooner leaves three seconds more of them to
-finish afterwards. Which is also why the one-core column is unchanged: reading
-`std` is seven seconds of the two minutes and thirteen it takes there, well
-inside the spread of the figure.
+Two memory columns because only one of them is a requirement. The export is
+mapped rather than read, so its pages are clean and file-backed: resident on a
+machine with room, and handed straight back on one without. What has to fit is
+the anonymous column. The last column is the same check on one thread with the
+compiled-in defaults instead of the flags above, for scale — and only for scale,
+since without `-F1.3` the same `mathlib` run wants 20.8 GB.
+
+That memory came at a price in time, and the price is worth stating. Measured
+alternately against the commit before it, arms interleaved so that whatever the
+box was doing it did to both, one thread went 72.8s to 85.6s on `init`, 143.6s
+to 162.4s on `std` and 524.3s to 656.8s on `cslib` — 18%, 13%, 25%. Three
+quarters of that is mapping the file rather than reading it, which the same
+comparison isolates: with the eviction machinery disabled and only the mapping
+left, `init` is already at 83.0s. Reading a mapped file costs a page fault per
+page and the parser touches every one of them. The other quarter is
+`Front.Scan`'s extra pass and the per-line bookkeeping `Front.Pool` does to know
+when an index is finished with.
+
+What it buys is the row underneath: `mathlib` used to want 25 GB and now wants
+12.8, which on a 16 GB runner is the difference between a verdict and none.
 
 One mathlib theorem —
 `AlgebraicGeometry.Scheme.exists_π_app_comp_eq_of_locallyOfFinitePresentation_of_isAffine`
-— accounts for 4m 27s of the one-pass figure on its own, and for two thirds of
-the `-j32` one. The next slowest takes 1m 01s, and only five declarations in the
-whole export take longer than 20 seconds.
+— accounts for 4m 27s of the single-threaded figure on its own. The next slowest
+takes 1m 01s, and only five declarations in the whole export take longer than 20
+seconds. It is almost certainly also the memory spike described below: that
+lasts four minutes and comes at the very end, which is where a declaration this
+much slower than the rest would still be running when everything else is done.
 
 ### Submitting to the arena
 
@@ -195,23 +206,10 @@ between one collection and the next can commit to an allocation it has no room
 to finish. Both are `-M` and the clock doing their job, and neither is a
 judgement about the file.
 
-Through that run line, on eight threads, with nothing declined:
+Nothing is declined, and the table above is that run line.
 
-| corpus | verdict | time | anonymous | mapped file |
-| --- | --- | --- | --- | --- |
-| `init.ndjson` | ACCEPT | 34s | 0.82 GB | 0.33 GB |
-| `std.ndjson` | ACCEPT | 1m 03s | 2.01 GB | 0.56 GB |
-| `cslib.ndjson` | ACCEPT | 3m 48s | 3.53 GB | 2.15 GB |
-| `mathlib.ndjson` | ACCEPT | 21m 47s | 12.84 GB | 5.64 GB |
-
-Two memory columns because only one of them is a requirement. The export is
-mapped rather than read, so its pages are clean and file-backed: resident on a
-machine with room, and handed straight back on one without. What has to fit in
-the runner's 16 GB is the anonymous column. These times are one run each on a
-loaded box and the smaller three are about twice what they take on a quiet one.
-
-`mathlib` is the whole reason the flags above are the flags above, and its
-difficulty is one declaration. A heap census (SPEC §11.8) shows the live set
+`mathlib` is the whole reason the flags are the flags, and its difficulty is one
+declaration. A heap census (SPEC §11.8) shows the live set
 flat at 3.3 GB for the first hour and then quadrupling to 12.25 GB in 240
 seconds before collapsing back — and doing exactly the same thing, to the same
 height, on one thread. So it is not eight obligations landing at once and no

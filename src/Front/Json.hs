@@ -92,6 +92,12 @@ lit bs = go
 -- So the bytes are copied, which is a few hundred megabytes of short-lived
 -- allocation across a large export and the difference between the file being
 -- resident and the file being a file.
+--
+-- It is also, measured, the faster of the two, which was not the expectation.
+-- Windows instead of copies made @init@ on one thread go 85.7s to 98.1s: a name
+-- that is a window is read by touching the page of the mapping it came from,
+-- and the pages a run's names live on are scattered across the whole export,
+-- where copies are a few megabytes of heap next to each other.
 slice :: B.ByteString -> Int -> Int -> B.ByteString
 slice bs a b = B.copy (B.take (b - a) (B.drop a bs))
 
