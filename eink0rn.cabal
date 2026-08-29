@@ -26,7 +26,9 @@ library
                       Kernel.Check
                       Kernel.Inductive
                       Front.Json
+                      Front.Mmap
                       Front.Pool
+                      Front.Scan
                       Front.Export
                       Front.Block
                       Front.Hetero
@@ -62,5 +64,9 @@ executable eink0rn
     -- through before the exception is delivered, and then the RTS kills the
     -- process itself -- exit 251, which reads as a fault in the checker rather
     -- than as the limit doing its job.
-    ghc-options:      -threaded -rtsopts "-with-rtsopts=-K512m -A1g -Mgrace=256m"
+    -- -T: keep the RTS's own counters, which is how the pipeline reads how much
+    -- memory it is using and decides whether to let the walk go on.  It is the
+    -- statistics without the report; the cost is a few words per collection.
+    ghc-options:      -threaded -rtsopts
+                      "-with-rtsopts=-K512m -A1g -Mgrace=256m -T"
     default-language: Haskell2010

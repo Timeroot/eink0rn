@@ -81,9 +81,19 @@ lit bs = go
     go !i (c : cs) = i < n && B.index bs i == c && go (i + 1) cs
     go _  []       = True
 
--- | The substring between two indices.
+-- | The substring between two indices, as bytes of its own.
+--
+-- Every caller is reading a string, and a string is the one thing here that
+-- gets kept: it becomes a component of a 'Kernel.Name.Name' or the payload of a
+-- literal, and those outlive the line by the whole run.  Taking a window
+-- instead would keep the buffer under it too, and "Front.Mmap" explains why
+-- that is the wrong thing to keep -- a single window pins the entire export,
+-- and it is a mapping of the file rather than heap that ought to be free to go.
+-- So the bytes are copied, which is a few hundred megabytes of short-lived
+-- allocation across a large export and the difference between the file being
+-- resident and the file being a file.
 slice :: B.ByteString -> Int -> Int -> B.ByteString
-slice bs a b = B.take (b - a) (B.drop a bs)
+slice bs a b = B.copy (B.take (b - a) (B.drop a bs))
 
 pValue :: B.ByteString -> Int -> P Json
 pValue bs i

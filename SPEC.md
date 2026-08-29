@@ -2464,11 +2464,34 @@ so they parallelise. Two passes on *one* thread cost nothing measurable and 4%
 more allocation, which is a second `TCState` per declaration.
 
 An obligation is not held back to the end of the file. It is a pure value that
-nothing else reads, so it can be started the moment pass one has filed it, and
-`sparkObs` sparks each one as it goes by. The other threads therefore begin on
-declaration 0's judgements while pass one is still walking declaration 1, and by
-the time pass one finishes most of the file has already been checked — on `std`,
-all but about four seconds of it.
+nothing else reads, so it can be started the moment pass one has filed it: pass
+one writes each one to a queue and N threads take them off it. The threads
+therefore begin on declaration 0's judgements while pass one is still walking
+declaration 1, and by the time pass one finishes most of the file has already
+been checked — on `std`, all but about four seconds of it.
+
+The queue is bounded, and that is not a detail. An obligation holds the term it
+is about, so an obligation filed and not yet discharged is a declaration's worth
+of heap that nothing can collect, and pass one files them far faster than N
+threads can take them: left to run it is the whole file, which on `mathlib` was
+several gigabytes and the largest single thing alive. So pass one waits when
+2N are already waiting. There is no throughput in going faster than that —
+what the walk would produce, nobody could take — and §11.8 has what it is worth.
+
+The room is given back when a thread *takes* an obligation and not when it
+finishes with it. What is held is bounded either way — 2N waiting and one per
+thread in hand — but charging the room to the work as well as to the queue lets
+one slow obligation stop the queue being refilled, and obligations are wildly
+uneven: `mathlib` has a single theorem that is most of its pass two, and with
+the room charged to it, seven threads ran the queue dry and waited on the
+eighth. Measured, that was 2.0 of 8 cores idle for the whole run and `mathlib`
+forty per cent slower, for no memory at all.
+
+None of this decides anything. These are the same obligations `discharge` reads,
+forcing one is idempotent, and the verdict is still the first failure in *file*
+order — which is what `discharge` computes, on the main thread, after pass one
+has ended. A thread that dies on an obligation may simply be let die: the
+obligation reverts to a thunk and the reader forces it again.
 
 What is left is sequential. Reading the file is not part of either pass and
 depends on neither, so under `-jN` it is given a thread of its own and runs while
@@ -2522,6 +2545,166 @@ and the memory is not: `-A256m` won all five interleaved pairs on `std` and both
 on `cslib`, by 1.5% and 7% respectively, for half again as much resident memory —
 7.5 GB against 11.3 on `std`, 10.5 against 15.2 on `cslib`. `-A128m` is the
 recommendation because that is the wrong side of the trade at `mathlib`'s size.
+The table above and the two `-A` comparisons predate the bounded queue, which
+holds pass one back and therefore moves the split between the two passes; what
+they still say is where the work is.
+
+---
+
+### 11.8 Where the memory goes
+
+Not normative, and for the same reason §11.7 is not: a record of what was
+measured, so that the next attempt starts from one. The question this section
+answers is why a checker that reads a file and forgets it needs gigabytes, and
+what each of the three answers was worth. Figures are `mathlib` at `-j8`, which
+is the only corpus where any of it decides anything.
+
+**The file was a third of it.** A `ByteString` is a window on a buffer and every
+window keeps the whole buffer, so the parser's unread remainder keeps the file:
+5.64 GB of an 11.63 GB live set, alive until the last line is read, which is the
+moment the run holds the most of everything else as well. Mapping the file
+instead (`Front.Mmap`) makes the bytes file-backed pages rather than heap. The
+collector never copies them, `-M` never counts them, and a kernel short of
+memory drops them and reads them again — so they are resident but not
+*required*, which is the distinction that matters on a machine smaller than the
+export. Live set 11.63 → 8.76 GB.
+
+**The pools were most of the rest.** An export numbers its names, levels and
+expressions, and a line may mention any index defined above it, so the reader
+held all of them to the end of the file — and holding an expression holds its
+whole subterm graph. Nothing in the format says when an index is finished with,
+so `Front.Scan` reads the file once and works out for each one the last line it
+appears on, and `Front.Pool` drops it there. The working set is small: of
+`std`'s 9,396,483 expressions the most ever wanted at one time is 247,920, and
+6.2% under the deliberately over-cautious scan that module actually uses.
+
+Eviction alone made things *worse* — `std` 1,159 → 1,265 MB — and the profile
+said why: the pools were not the only thing holding those terms, because pass
+one was running ahead of the threads and the undischarged backlog held them too.
+Eviction pays once the backlog is bounded, and then it pays twice over. With the
+queue held to 2N and the reader to 2048 declarations ahead of the walk, `std`'s
+peak went 1,159 → 954 MB without eviction and → 650 MB with it.
+
+**What is left is the checking, and a heap census says what it is.** Every
+obligation builds its own memo tables — what reduces to what, what is convertible
+with what — and on a hard declaration they are most of what is alive. `+RTS -hT`
+on `mathlib` gives the shape, and the shape is not the one that was assumed. On
+one thread, sampling once a minute:
+
+```
+    t=  1211s   2.23 GB      t=  3448s   3.31 GB
+    t=  2119s   2.79 GB      t=  3630s   3.25 GB
+    t=  3025s   3.21 GB      t=  3690s   3.55 GB
+    t=  3327s   3.31 GB      t=  3750s   6.36 GB
+    t=  3388s   3.31 GB      t=  3811s   9.48 GB
+                             t=  3870s  12.25 GB   <- peak
+                             t=  3931s   3.16 GB
+```
+
+Three and a bit gigabytes, flat, for an hour; then 240 seconds in which it
+nearly quadruples; then it is over and the file ends. 68.9% of the peak is
+`Kernel.Expr.XApp`, which is five words, so the peak holds about 211 million
+application nodes against the 81,237,230 the export defines: most of what is
+alive up there was built by the checker rather than read from the file, which is
+what a memo table full of reduced forms looks like.
+
+The `-j8` census is the same graph — flat at 3.3 GB, then 3.44 → 4.82 → 6.29 →
+7.88 → 9.28 → 11.47 GB in the last four minutes, 72.7% of it `XApp`. The two
+runs peak within seven per cent of each other, so the spike is **one
+declaration**, not eight at once, and no amount of throttling gets under it.
+That also disposes of the first version of `--mem`, which was a gate on
+*starting*: a thread that waits while the live set is over the budget stops the
+ninth obligation and not the eight already running, and the memory belongs to
+the ones already running. Measured, it moved `mathlib`'s peak by three per cent
+between a 3 GB budget and a 5.3 GB one.
+
+What replaced it governs how many run at once (`withPipeline`): a major
+collection that finds more than the budget alive halves the number of threads
+allowed to work, one that finds comfortably less gives a thread back. That is
+worth having — it is what keeps seven other threads from piling on top of the
+declaration above, and it costs time and never a verdict — but it is a bound on
+coincidence, not on any single obligation. `std` and `cslib` never come near
+their budget and are never throttled at all.
+
+**So the collector decides the rest**, and on a 12 GB live set the choice is the
+whole difference between fitting in sixteen gigabytes and not. `mathlib` at
+`-j8`, `--mem=4000` and `-M13g` except where noted:
+
+| oldest generation | peak live | peak anon | elapsed | verdict |
+| --- | --- | --- | --- | --- |
+| copying, `-F2` (`-M14g`, budget 5300) | 7.40 GB | 14.84 GB | — | DECLINE |
+| copying, `-F2` (`-c60`) | 6.85 GB | 13.77 GB | — | DECLINE |
+| non-moving | 11.92 GB | 16.20 GB | — | DECLINE |
+| compacting above 40% | 6.69 GB | 13.75 GB | 1410s | ACCEPT |
+| compacting, `-F2` | 6.55 GB | 13.51 GB | 953s | ACCEPT |
+| compacting, `-F1.5` | 8.27 GB | 12.89 GB | 1247s | ACCEPT |
+| compacting, `-F1.3` | 10.71 GB | 12.83 GB | 1022s | ACCEPT |
+| one thread, unbounded, copying | 12.51 GB | 24.72 GB | 4822s | ACCEPT |
+
+Read the middle column with care and the right-hand one without. *Peak live* is
+sampled at major collections, so a configuration that has fewer of them sees
+less of the truth — the `-F1.3` row took 86 samples and the `-F2` row 31, which
+is most of why the better-sampled row reports the larger figure. On the DECLINE
+rows both figures are where the run died rather than where it was going. *Peak
+anon* is read from `/proc` and is not sampled that way; it is also the number
+that has to fit, the mapped file being reclaimable (above). The elapsed times
+are one run each on a shared box and are worth about ±20%, but the ordering
+survived repetition: compaction is slower than copying because GHC's compacting
+collection is single-threaded.
+
+Two of these were wrong guesses worth recording. The **non-moving** collector
+should have been the answer — mark-and-sweep wants no copy reserve — and it is
+the worst row in the table: its snapshot-at-the-beginning marking keeps
+everything that was alive when a mark began, which on a live set that quadruples
+in four minutes is most of the growth, and it lost a further 3.4 GB to
+fragmentation on top. It also took an hour. And **compaction is not what holds
+the heap down**; `-F` is. `-c<n>` chooses how the oldest generation is
+collected, `-F` chooses when, and the default of 2.0 is why a 6.5 GB live set
+was costing 13.5 GB. Compaction only makes a low `-F` affordable, by not wanting
+a copy of the generation it is collecting; `-c` alone left the peak where it
+was, and moving it from 30% to 40% only cost time.
+
+What all of it comes to, at `--mem=4000 -j8 +RTS -A32m -M13g -F1.3`, which is
+what the arena entry runs:
+
+| corpus | verdict | peak live | peak anon | mapped file | elapsed |
+| --- | --- | --- | --- | --- | --- |
+| `init` | ACCEPT | 0.28 GB | 0.82 GB | 0.33 GB | 34s |
+| `std` | ACCEPT | 0.86 GB | 2.01 GB | 0.56 GB | 63s |
+| `cslib` | ACCEPT | 1.71 GB | 3.53 GB | 2.15 GB | 228s |
+| `mathlib` | ACCEPT | 10.20 GB | 12.84 GB | 5.64 GB | 1307s |
+
+The mapped-file column is resident too, and on a machine with room it stays
+resident, which is why `mathlib`'s RSS reads 18.5 GB on a box that has plenty.
+None of it is required: those are clean file-backed pages and the kernel takes
+them back when something wants the memory. What has to fit is the anon column,
+and the run above fits in sixteen gigabytes with about three to spare.
+
+What is left after that is a cache with no bound. The memo tables are pure — a
+missing entry costs a recomputation and nothing else — so a table that dropped
+its oldest entries at some size would bound the spike above by construction. It
+is not done here, and the reason to be careful about doing it is that the
+declaration whose tables would be dropped is the one declaration in `mathlib`
+that is already most of a pass.
+
+On `std`, where the budget is never reached and none of this applies, the older
+measurement of the gate still shows what waiting costs when it does happen, with
+total CPU flat at 177s throughout — the threads wait, they do not repeat work:
+
+| `--mem` | peak live | elapsed |
+| --- | --- | --- |
+| off | 939 MB | 37.3s |
+| 500 | 627 MB | 51.7s |
+| 300 | 539 MB | 82.0s |
+| 200 | 578 MB | 159.4s |
+
+540 MB is `std`'s floor — one obligation and the environment — and asking for
+less than the floor buys nothing and still waits, which is the shape to expect.
+The default is a third of what the machine reports, taking the cgroup's limit
+over `/proc/meminfo` where there is one, since inside a container that file is
+the host's memory and not the container's. A third, because what has to fit is
+not the live set but the heap around it: at the default `-F` the heap is twice
+the live set, and there is the nursery and the mapped file besides.
 
 ---
 

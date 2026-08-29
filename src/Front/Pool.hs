@@ -4,77 +4,82 @@
 --
 -- A pool is written once, left to right, and read only backwards: a line
 -- defines the entry at some index and may mention any index already defined.
--- An 'Data.IntMap.IntMap' says that and is the obvious thing to reach for, but
--- it pays for the writing in a way this shape does not have to.  Every
--- insertion copies the path it came down -- some two dozen nodes, six words
--- each, for a pool with nine million entries in it -- and an export of @std@
--- performs nine million of them.  Reading the pools was costing more than
--- reducing the terms they held.
 --
--- So the dense case is stored densely: entries are collected into a small
--- chunk, and a chunk is frozen into an array once it is full.  Writing an entry
--- is then a cons cell, plus one array and one trie insertion per 'chunkSize'
--- entries.  Reading one is a walk of at most that many links if it is among the
--- most recent -- 40% of the references in @std@ are to the entry immediately
--- before, and 55% are within the last sixty-four -- and otherwise a walk of the
--- trie described below.
+-- The thing that decides the shape of this module is that a pool is also a
+-- /root/.  Whatever it holds, the garbage collector holds: an expression filed
+-- at index 40,000,000 keeps its whole subterm graph, and the pool that never
+-- lets go of anything therefore keeps every proof body in the file until the
+-- last line has been read.  On @mathlib@ that was most of an eleven gigabyte
+-- live set, and it is why reading the file and checking it at the same time
+-- /helped/ -- finishing the read early was the only way the pool ever died.
+--
+-- So an entry is dropped once "Front.Scan" says nothing below can ask for it
+-- again.  The working set is small: of @std@'s 9,396,483 expressions the most
+-- ever wanted at one time is 247,920, and with the conservative scan that
+-- module actually uses, 579,917 -- six per cent.  What is held is then the
+-- terms being worked on rather than the terms that have ever been read.
+--
+-- The layout follows from that. Two chunks of the most recent entries are kept
+-- as plain lists, because that is where the references are -- 40% of them in
+-- @std@ are to the entry immediately before, and 55% within the last
+-- sixty-four -- and a list of sixty-four costs nothing to build and is walked
+-- in a handful of loads.  An entry falling out the back of the second chunk is
+-- looked up in the table: if it is dead it is dropped there and then and never
+-- costs a map insertion at all, and only the survivors go into the 'IntMap'
+-- behind.  Since most entries are dead by then, most are never filed twice.
 --
 -- The general case is not given up on.  Indices in the format are sparse and
--- need not be monotonic; a pool that is handed one out of turn turns into the
--- plain map, which is exactly the old behaviour, including which of two entries
--- filed at the same index wins.  No export a real exporter writes does this.
+-- need not be monotonic; a pool handed one out of turn turns into the plain
+-- map, which is the old behaviour.  No export a real exporter writes does this.
 --
--- Measured on @std@, over five interleaved pairs of two binaries differing in
--- this module and nothing else: a single-threaded pass one falls from 14.6 to
--- 13.3 seconds of CPU, and every pair agreed.  It costs four per cent more
--- allocation, which is the path copying described under 'Node'.
+-- An earlier version of this module stored the whole pool densely, in chunks
+-- hung in a sixty-four-way trie, and was measurably quicker at reading than the
+-- 'IntMap' it replaced.  That is given up here, and knowingly: the map now
+-- holds the live minority rather than the file, so it is a fraction of the size
+-- it was measured at, and what it costs in reading it returns several times
+-- over in what the collector no longer has to trace.
 module Front.Pool
   ( Pool
+  , PoolEvicted (..)
   , emptyPool
   , poolPush
   , poolAt
+  , poolReap
   ) where
 
-import           Data.Array         (Array, elems, listArray, (!), (//))
-import           Data.Bits          (shiftL, shiftR, (.&.))
+import           Control.Exception  (Exception, throw)
+import           Data.Bits          (shiftL, (.&.))
 import           Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IM
+import           Data.List          (foldl')
+import           Front.Scan         (Deaths, deathOf)
+
+-- | Asking for an entry that was dropped.
+--
+-- This is a bug in "Front.Scan" and nothing else -- a reference it did not see
+-- -- and it is raised rather than reported so that no verdict can rest on it.
+-- @Main@ answers it by reading the export again with eviction off, which is the
+-- behaviour this module had before eviction existed.  The cost of being wrong
+-- here is therefore a second pass, not a wrong answer.
+newtype PoolEvicted = PoolEvicted Int
+  deriving (Show)
+
+instance Exception PoolEvicted
 
 -- | Entries numbered from zero.
 --
--- @Dense n sh root tl@ holds the entries @0 .. n-1@: the full chunks in the
--- trie @root@ reads at shift @sh@, and the rest in @tl@, newest first.  @tl@
--- therefore holds @n `mod` chunkSize@ entries, which is what lets the split
--- point be recovered from @n@ alone.
+-- @Dense n lost old dm cur prv@ holds the entries @0 .. n-1@ that are still
+-- wanted.  @cur@ is the chunk being filled and @prv@ the one before it, both
+-- newest first; @old@ is everything below them that survived; @dm@ says which
+-- line each of those dies on, so that reaping is a walk of the front of a map
+-- rather than a search.  @lost@ records whether anything has been dropped,
+-- which is the one thing the sparse fallback needs to know.
 data Pool a
-  = Dense {-# UNPACK #-} !Int {-# UNPACK #-} !Int !(Array Int (Node a)) [a]
+  = Dense {-# UNPACK #-} !Int !Bool !(IntMap a) !(IntMap [Int]) ![a] ![a]
   | Sparse !(IntMap a)
 
--- | A node of the trie the full chunks hang in: a chunk itself at the bottom,
--- and 'branchSize' children above it.
---
--- The trie is keyed by chunk number and it is /complete/ -- chunk numbers are
--- handed out in order from zero -- so the depth is fixed by how many chunks
--- there are and the path to one is its chunk number read 'branchBits' at a
--- time.  Which is the whole reason it is here rather than an 'IntMap': a map
--- keyed by chunk number branches on one bit at a time, so reaching the hundred
--- and forty-five thousandth chunk of @std@ costs seventeen dependent loads
--- through seventeen separate five-word nodes, and a third of an export's
--- references are far enough back to pay that in full.  Sixty-four-way branching
--- makes it three loads, the first two of them off nodes small and hot enough to
--- stay in cache.
---
--- What it costs is the writing: a chunk is filed by copying the path down to
--- it, three arrays of sixty-four pointers, against seventeen nodes of five
--- words for the map.  That is three times the words, once per sixty-four
--- entries, and it buys a fourfold shorter read on every one of them.
-data Node a
-  = Chunk !(Array Int a)
-  | Branch !(Array Int (Node a))
-
--- | How many entries one chunk holds.  Big enough that the per-chunk costs are
--- divided by something, small enough that walking the unfrozen one is not a
--- search.
+-- | How many entries one chunk holds.  Big enough to cover the references that
+-- never reach the map, small enough that walking one is not a search.
 chunkBits :: Int
 chunkBits = 6
 
@@ -84,92 +89,84 @@ chunkSize = 1 `shiftL` chunkBits
 chunkMask :: Int
 chunkMask = chunkSize - 1
 
--- | How many children a trie node has.  Also six, but for its own reason: a
--- node is then one cache line of pointers, and the depth for any pool an export
--- can produce is at most four.
-branchBits :: Int
-branchBits = 6
-
-branchSize :: Int
-branchSize = 1 `shiftL` branchBits
-
-branchMask :: Int
-branchMask = branchSize - 1
-
--- | A node array with nothing in it yet.  The slots are never read before they
--- are written -- 'poolAt' looks below @n@ and every chunk below @n@ is filed --
--- so what they hold is a statement of that invariant rather than a value.
-emptyBranch :: Array Int (Node a)
-emptyBranch = listArray (0, branchMask) (replicate branchSize unwritten)
-
-unwritten :: Node a
-unwritten = error "Front.Pool: chunk read before it was written"
-
 emptyPool :: Pool a
-emptyPool = Dense 0 0 emptyBranch []
+emptyPool = Dense 0 False IM.empty IM.empty [] []
 
--- | The chunk with this number.  It must be one that has been filed.
-chunkAt :: Int -> Array Int (Node a) -> Int -> Array Int a
-chunkAt sh0 root cn = down (sh0 - branchBits) (root ! ((cn `shiftR` sh0) .&. branchMask))
-  where
-    down !sh nd = case nd of
-      Chunk c  -> c
-      Branch a -> down (sh - branchBits) (a ! ((cn `shiftR` sh) .&. branchMask))
-
--- | File a chunk under the next chunk number, growing the trie by a level when
--- the number no longer fits.
+-- | File an entry at an index, on this line.  Strict in the entry.
 --
--- Whether the subtree a chunk goes into already exists is not looked up: chunk
--- numbers arrive in order, so the subtree at depth @sh@ is new exactly when the
--- bits of @cn@ below @sh@ are all zero.
-pushChunk :: Int -> Array Int (Node a) -> Int -> Array Int a
-          -> (Int, Array Int (Node a))
-pushChunk sh root cn c
-  | cn >= branchSize `shiftL` sh =
-      let sh'   = sh + branchBits
-          root' = emptyBranch // [(0, Branch root)]
-      in (sh', ins sh' root')
-  | otherwise = (sh, ins sh root)
-  where
-    ins !s a
-      | s == 0    = a // [(i, Chunk c)]
-      | otherwise = a // [(i, Branch (ins (s - branchBits) sub))]
-      where
-        i = (cn `shiftR` s) .&. branchMask
-        sub | cn .&. ((1 `shiftL` s) - 1) == 0 = emptyBranch
-            | otherwise = case a ! i of
-                Branch b -> b
-                Chunk _  -> emptyBranch   -- unreachable: a chunk hangs at s == 0
-
--- | File an entry at an index.  Strict in the entry, as the map it replaces
--- was.
-poolPush :: Int -> a -> Pool a -> Pool a
-poolPush k !x (Dense n sh root tl)
+-- The table and the line are wanted not for the entry going in but for the one
+-- coming out of the back of @prv@, which is the moment its fate is decided.
+poolPush :: Deaths -> Int -> Int -> a -> Pool a -> Pool a
+poolPush ds line k !x (Dense n lost old dm cur prv)
   | k == n =
-      let n'  = n + 1
-          tl' = x : tl
+      let n'   = n + 1
+          cur' = x : cur
       in if n' .&. chunkMask == 0
-           then case pushChunk sh root (n' `shiftR` chunkBits - 1) (freeze tl') of
-                  (sh', root') -> Dense n' sh' root' []
-           else Dense n' sh root tl'
-  where freeze vs = listArray (0, chunkMask) (reverse vs)
-poolPush k x p = Sparse (IM.insert k x (toMap p))
+           then case retire ds line (n' - 2 * chunkSize) prv old dm of
+                  (l, old', dm') -> Dense n' (lost || l) old' dm' [] cur'
+           else Dense n' lost old dm cur' prv
+poolPush _ _ k x p = Sparse (IM.insert k x (toMap p))
 
--- Every entry is in whnf already -- 'poolPush' saw to that -- so the @$!@ costs
--- nothing and saves the thunk the reader would otherwise wrap around each of
--- the twenty-two million lookups an export of @std@ makes.
+-- | Decide the chunk that has just fallen out of the back.  @base@ is the index
+-- of its oldest entry; the list is newest first.
+retire :: Deaths -> Int -> Int -> [a] -> IntMap a -> IntMap [Int]
+       -> (Bool, IntMap a, IntMap [Int])
+retire ds line base prv old dm = go (base + length prv - 1) prv False old dm
+  where
+    go _ []         !l !o !d = (l, o, d)
+    go !i (v : vs)  !l !o !d
+      | dth <= line     = go (i - 1) vs True o d
+      -- Never spoken of again by anything the scan could see, so there is no
+      -- line to reap it on and no reason to take up room in the death index.
+      | dth == maxBound = go (i - 1) vs l (IM.insert i v o) d
+      | otherwise       = go (i - 1) vs l (IM.insert i v o)
+                                          (IM.insertWith (++) dth [i] d)
+      where dth = deathOf ds i
+
+-- | The entry at an index, if the format ever gave it one.
+--
+-- 'Nothing' is "no line has defined this", which is a malformed export and is
+-- reported as one.  An index below @n@ that is not here is a different thing
+-- entirely -- it existed and was dropped -- and that is not something a file
+-- can be blamed for.
 poolAt :: Pool a -> Int -> Maybe a
 poolAt (Sparse m) i = IM.lookup i m
-poolAt (Dense n sh root tl) i
-  | i < 0 || i >= n            = Nothing
-  | i >= n - (n .&. chunkMask) = Just $! (tl !! (n - 1 - i))
-  | otherwise = Just $! (chunkAt sh root (i `shiftR` chunkBits)
-                           ! (i .&. chunkMask))
+poolAt (Dense n _ old _ cur prv) i
+  | i < 0 || i >= n       = Nothing
+  | i >= base             = Just $! (cur !! (n - 1 - i))
+  | i >= base - chunkSize = Just $! (prv !! (base - 1 - i))
+  | otherwise = case IM.lookup i old of
+      Just v  -> Just $! v
+      Nothing -> throw (PoolEvicted i)
+  where base = n - (n .&. chunkMask)
+
+-- | Drop everything whose last line is at or behind this one.
+--
+-- Called once a line has been read, so an entry this line was the last to
+-- mention has already been read out of the pool by the time it goes.  The
+-- common case is that nothing is due, and that case returns the pool it was
+-- given rather than a copy of it.
+poolReap :: Int -> Pool a -> Pool a
+poolReap line p@(Dense n _ old0 dm0 cur prv) = case IM.minViewWithKey dm0 of
+  Just ((k, _), _) | k <= line -> go old0 dm0
+  _                            -> p
+  where
+    go !o !d = case IM.minViewWithKey d of
+      Just ((k, is), d')
+        | k <= line -> go (foldl' (flip IM.delete) o is) d'
+      _             -> Dense n True o d cur prv
+poolReap _ p = p
 
 -- | Everything in the pool as the map it would have been.
+--
+-- Only the sparse fallback wants this, and it wants a pool that is still whole.
+-- Once anything has been dropped there is no honest answer, so it asks for the
+-- pass that never drops anything instead.
 toMap :: Pool a -> IntMap a
 toMap (Sparse m) = m
-toMap (Dense n sh root tl) =
-  IM.fromDistinctAscList (zip [0 ..] (frozen ++ reverse tl))
+toMap (Dense n lost old _ cur prv)
+  | lost      = throw (PoolEvicted (-1))
+  | otherwise = IM.union old (IM.fromList (down (n - 1) cur ++ down (base - 1) prv))
   where
-    frozen = concat [ elems (chunkAt sh root cn) | cn <- [0 .. n `shiftR` chunkBits - 1] ]
+    base = n - (n .&. chunkMask)
+    down i vs = zip [i, i - 1 ..] vs

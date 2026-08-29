@@ -45,33 +45,43 @@ description: |
   judgements about it. Depends on the GHC boot libraries and nothing else, so
   the build is one `ghc --make` with no package index to fetch.
 
-  `mathlib` is declined for space, not for anything in it: its live set is
-  11.6 GB, which does not fit the runner's 16 GB. Given the room it takes,
-  eink0rn accepts it in 10 minutes at `-j8`. Every other export is checked
-  normally; `cslib`, the next largest, peaks at 8.4 GB.
+  Nothing is declined. `mathlib` is the tight one — one declaration in it holds
+  a 12.5 GB live set, all memo table, single-threaded or not — and it is checked
+  by keeping the heap close to that with a compacting collector rather than at
+  twice it with a copying one. `--mem` throttles how many threads work at once
+  when a major collection finds too much alive, so the other seven do not land
+  on top of that declaration. `-M` is a real limit underneath both: over it the
+  answer is a decline and not the runner's OOM killer.
 version: "1.0.0"
 url: https://github.com/Timeroot/eink0rn
 ref: v1.0.0
 rev: REPLACE_WITH_COMMIT_SHA
 threads: 8
 build: bash tools/arena-build.sh
-# mathlib's live set is 11.6 GB -- measured, by checking it on a box with room
-# to spare: 10m01s at -j8, 25.6 GB peak with a copying collector, and 12.5 GB
-# and rising after 53 minutes of compacting one.  It does not fit in 16 GB, and
-# the only question was whether to spend an hour of the matrix's 360 minutes
-# discovering that on every round.  Nothing else here is close: cslib, the next
-# largest, has a 4 GB live set and peaks at 8.4 GB.
-declines:
-  - mathlib
 # Exit codes are the arena's: 0 accept, 1 reject, 2 declined, 3 a fault in the
 # checker.  A crash is never reported as a rejection.
 #
-# -M is a limit rather than a wish: over it the checker declines instead of
-# taking the runner's 16 GB down with it.  -c30 asks for a compacting
-# collection once the live set passes 30% of that, which keeps the peak near
-# the live set rather than at twice it.  The timeout is the same idea for the
-# clock: a decline, not a wrong answer, and not a job that runs the matrix out
-# of its 360 minutes.
+# The flags are all mathlib, measured on a box with room to spare and then
+# squeezed back into sixteen gigabytes:
+#
+#   --mem=4000  the live-set budget the thread controller aims at.  Given
+#               explicitly rather than left to the adaptive default, so that
+#               the verdict does not depend on what /proc/meminfo says inside
+#               the runner.
+#   -M13g       a real limit, not a wish: over it the checker declines instead
+#               of taking the runner's 16 GB down with it.  Above 30% of it the
+#               oldest generation is collected in place, which is what makes
+#               the next flag affordable.
+#   -F1.3       the heap may be 1.3x the live set before the oldest generation
+#               is collected, against a default of 2.0.  This is the flag that
+#               decides whether mathlib fits: 12.5 GB peak instead of 13.2, on
+#               a 10.7 GB live set.
+#   -A32m       small nursery: eight of them, and the survivors of a big one
+#               are what the old generation has to absorb.
+#
+# The timeout is the same idea for the clock: a decline, not a wrong answer,
+# and not a job that runs the matrix out of its 360 minutes.  mathlib takes
+# about 17 minutes of it; every other export is minutes.
 #
 # The two rewritten statuses are both resource limits reported as such.  124 is
 # the timeout above.  251 is the RTS's own heap-limit exit, taken when the live
@@ -79,7 +89,7 @@ declines:
 # than the grace the handler needs to print DECLINE itself; either way -M did
 # its job, and neither is a judgement about the file.
 run: |
-  timeout 5400 ./arena/eink0rn -j8 "$IN" +RTS -A32m -M12g -c30 -RTS
+  timeout 5400 ./arena/eink0rn --mem=4000 -j8 "$IN" +RTS -A32m -M13g -F1.3 -RTS
   rc=$?
   case $rc in
     124) exit 2 ;;

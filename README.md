@@ -161,8 +161,8 @@ it to that repository's `checkers/eink0rn.yaml` and bumping `rev`. The two
 commands in it are:
 
 ```
-bash tools/arena-build.sh                              # build:
-./arena/eink0rn -j8 "$IN" +RTS -A32m -M12g -c30 -RTS   # run:
+bash tools/arena-build.sh                                          # build:
+./arena/eink0rn --mem=4000 -j8 "$IN" +RTS -A32m -M13g -F1.3 -RTS   # run:
 ```
 
 `tools/arena-build.sh` is one `ghc --make` — there is no package index to fetch
@@ -174,12 +174,15 @@ nix shell that provides elan, cargo, node, ocaml and zig, but no Haskell. Cold
 — clone, ghcup, the compiler, and the sixteen modules — that path takes 2m 55s
 and 2.6 GB of disk; against a GHC already on the machine, 43s.
 
-The RTS options are all about that 16 GB. `-M` is a limit rather than a wish:
-over it the checker prints `DECLINE` and exits 2 instead of taking the runner
-down with it, which is a resource limit reported as one rather than as a wrong
-verdict or a crash. `-c30` asks for a compacting collection once the live set
-passes 30% of the limit, which keeps the peak near the live set rather than at
-twice it. `-Mgrace=256m` is built into the binary, so it applies whenever `-M`
+The rest of the run line is all about that 16 GB, and all about `mathlib`. `-M`
+is a limit rather than a wish: over it the checker prints `DECLINE` and exits 2
+instead of taking the runner down with it, which is a resource limit reported as
+one rather than as a wrong verdict or a crash. Above 30% of `-M` the RTS
+collects the oldest generation in place instead of copying it, which is what
+makes `-F1.3` affordable: the heap may be 1.3 times the live set before that
+generation is collected, against a default of 2.0. That last flag is the one
+that decides whether `mathlib` fits. `--mem=4000` is the checker's own budget,
+below. `-Mgrace=256m` is built into the binary, so it applies whenever `-M`
 does: it is the room the overflow handler needs in order to speak, the default
 1M being gone before the exception is even delivered when eight threads are
 allocating.
@@ -187,25 +190,36 @@ allocating.
 Its own two limits are the reason the entry rewrites two exit statuses to 2.
 One is the `timeout`. The other is 251, which is the RTS exiting on the heap
 limit by itself, and it happens when the live set grows past `-M` by more than
-the grace in the gap between two collections — `-c⟨n⟩` decides one collection
-too late, so a live set that doubles each time can commit to a copy it has no
-room to finish. Both are `-M` and the clock doing their job, and neither is a
+the grace in the gap between two collections — a heap that outgrows the limit
+between one collection and the next can commit to an allocation it has no room
+to finish. Both are `-M` and the clock doing their job, and neither is a
 judgement about the file.
 
-Through that run line, on eight threads:
+Through that run line, on eight threads, with nothing declined:
 
-| corpus | verdict | time | peak RSS |
-| --- | --- | --- | --- |
-| `init.ndjson` | ACCEPT | 12.3s | 1.74 GB |
-| `std.ndjson` | ACCEPT | 23.3s | 3.65 GB |
-| `cslib.ndjson` | ACCEPT | 1m 24s | 8.30 GB |
+| corpus | verdict | time | anonymous | mapped file |
+| --- | --- | --- | --- | --- |
+| `init.ndjson` | ACCEPT | 34s | 0.82 GB | 0.33 GB |
+| `std.ndjson` | ACCEPT | 1m 03s | 2.01 GB | 0.56 GB |
+| `cslib.ndjson` | ACCEPT | 3m 48s | 3.53 GB | 2.15 GB |
+| `mathlib.ndjson` | ACCEPT | 21m 47s | 12.84 GB | 5.64 GB |
 
-**`mathlib` is declined up front**, which is the one real limitation. Its live
-set is 11.6 GB: at `-j8` with room to spare it is accepted in 10m 01s, but the
-peak is 25.6 GB, and a compacting collector holding it to 13.4 GB was still
-short of finishing after 53 minutes. Nothing else is close — `cslib`, the next
-largest, has a 4 GB live set and peaks at 8.4 GB — so this is about that one
-file rather than about the runner being small.
+Two memory columns because only one of them is a requirement. The export is
+mapped rather than read, so its pages are clean and file-backed: resident on a
+machine with room, and handed straight back on one without. What has to fit in
+the runner's 16 GB is the anonymous column. These times are one run each on a
+loaded box and the smaller three are about twice what they take on a quiet one.
+
+`mathlib` is the whole reason the flags above are the flags above, and its
+difficulty is one declaration. A heap census (SPEC §11.8) shows the live set
+flat at 3.3 GB for the first hour and then quadrupling to 12.25 GB in 240
+seconds before collapsing back — and doing exactly the same thing, to the same
+height, on one thread. So it is not eight obligations landing at once and no
+amount of throttling gets under it; it is one theorem's memo tables. `--mem` is
+a budget on the live set that halves how many threads may work when a major
+collection finds more than that alive and gives a thread back when one finds
+comfortably less, which is what keeps the other seven from piling on top of that
+declaration. It is never reached on the other three corpora.
 
 ## Layout
 
@@ -220,7 +234,10 @@ src/Kernel/Canon     stored canonical forms, for the arithmetic licence and --pi
 src/Kernel/Check     inference, reduction, and definitional equality
 src/Kernel/Inductive admitting one inductive family, and deriving its recursor
 src/Front/Json       a JSON reader, streaming, for files larger than memory
-src/Front/Export     the NDJSON pools and the declaration schema
+src/Front/Mmap       the export as file-backed pages rather than as heap
+src/Front/Scan       one cheap pass to find where each pool index dies
+src/Front/Pool       the pools themselves, dropping entries at that point
+src/Front/Export     the NDJSON line schema and the declarations it builds
 src/Front/Lower      surface to core: the nesting compilation, and the flattening
 src/Front/Hetero     deriving a mutual block whose types span universes
 app/Main.hs          the command line

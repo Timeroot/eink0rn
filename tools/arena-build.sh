@@ -16,10 +16,12 @@ mkdir -p "$out/obj"
 # Kept the same as the ghc-options in eink0rn.cabal, so that the binary the
 # arena runs is the binary the tests were run against.  -A1g is the default
 # nursery for a one-core run and is overridden on the command line for the
-# arena, which has eight of them and sixteen gigabytes to fit them in.
+# arena, which has eight of them and sixteen gigabytes to fit them in.  -T is
+# not a tuning knob but a requirement: --mem reads the RTS's own live-bytes
+# counter, and without -T there is no counter and no bound.
 build_with() {
   echo "== building with $1 ($("$1" --numeric-version))"
-  "$1" -O2 -threaded -rtsopts "-with-rtsopts=-K512m -A1g -Mgrace=256m" \
+  "$1" -O2 -threaded -rtsopts "-with-rtsopts=-K512m -A1g -Mgrace=256m -T" \
        -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)" \
        -isrc -iapp -outputdir "$out/obj" -o "$out/eink0rn" app/Main.hs
 }

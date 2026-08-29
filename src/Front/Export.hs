@@ -52,6 +52,7 @@ import           Data.Char              (isDigit)
 import           Data.Word              (Word8)
 import           Front.Json
 import           Front.Pool
+import           Front.Scan             (Deaths)
 import           Kernel.Env             (Hint (..), QuotKind (..))
 import           Kernel.Expr
 import           Kernel.Level
@@ -118,14 +119,37 @@ data ExRule = ExRule
 
 -- The pools --------------------------------------------------------------------
 
+-- | The three pools, plus the two things they need in order to let go of
+-- anything: the table saying when each entry is last wanted, and the line the
+-- reader is on.  See "Front.Pool" for why they must let go.
 data Pools = Pools
   { pNames  :: !(Pool Name)
   , pLevels :: !(Pool Level)
   , pExprs  :: !(Pool Expr)
+  , pDeaths :: !Deaths
+  , pLine   :: {-# UNPACK #-} !Int
   }
 
-emptyPools :: Pools
-emptyPools = Pools (poolPush 0 Anon emptyPool) (poolPush 0 LZero emptyPool) emptyPool
+emptyPools :: Deaths -> Pools
+emptyPools ds = Pools
+  { pNames  = poolPush ds 0 0 Anon emptyPool
+  , pLevels = poolPush ds 0 0 LZero emptyPool
+  , pExprs  = emptyPool
+  , pDeaths = ds
+  , pLine   = 1
+  }
+
+-- | Let the pools go of everything this line was the last to want.
+--
+-- Reading a line reads out of the pools before it files into them, so by the
+-- time this runs the line is done with whatever it was going to ask for.
+advance :: Int -> Pools -> Pools
+advance ln ps = ps
+  { pNames  = poolReap ln (pNames ps)
+  , pLevels = poolReap ln (pLevels ps)
+  , pExprs  = poolReap ln (pExprs ps)
+  , pLine   = ln + 1
+  }
 
 -- | Read a whole export.  Declarations come back in stream order.
 --
@@ -140,8 +164,8 @@ emptyPools = Pools (poolPush 0 Anon emptyPool) (poolPush 0 LZero emptyPool) empt
 -- The order in which problems are reported is therefore file order throughout: a
 -- declaration that does not typecheck is reported ahead of a malformed line
 -- below it, where reading the file first would have reported the malformed line.
-parseExport :: B.ByteString -> [Either String ExDecl]
-parseExport input = go (1 :: Int) emptyPools 0
+parseExport :: Deaths -> B.ByteString -> [Either String ExDecl]
+parseExport ds input = go (1 :: Int) (emptyPools ds) 0
   where
     len = B.length input
 
@@ -156,7 +180,7 @@ parseExport input = go (1 :: Int) emptyPools 0
     go !ln ps !off
       | off >= len = []
       | otherwise  = case fastLine ps input off of
-          FastOk ps' nxt -> go (ln + 1) ps' nxt
+          FastOk ps' nxt -> go (ln + 1) (advance ln ps') nxt
           FastErr err    -> [Left (at ln err)]
           NotFast        -> slow ln ps (B.takeWhile (/= '\n') (B.drop off input))
       where
@@ -165,11 +189,11 @@ parseExport input = go (1 :: Int) emptyPools 0
         -- in a newline leaves @off == len@, and that is the empty last line
         -- 'B.lines' also declines to produce.
         slow ln' ps' l
-          | B.null (B.dropWhile (`elem` " \t\r") l) = go (ln' + 1) ps' nxt
+          | B.null (B.dropWhile (`elem` " \t\r") l) = go (ln' + 1) (advance ln' ps') nxt
           | otherwise = case step ps' l of
               Left err              -> [Left (at ln' err)]
-              Right (ps'', Nothing) -> go (ln' + 1) ps'' nxt
-              Right (ps'', Just d)  -> Right d : go (ln' + 1) ps'' nxt
+              Right (ps'', Nothing) -> go (ln' + 1) (advance ln' ps'') nxt
+              Right (ps'', Just d)  -> Right d : go (ln' + 1) (advance ln' ps'') nxt
           where nxt = off + B.length l + 1
 
     at ln err = "line " ++ show ln ++ ": " ++ err
@@ -327,7 +351,8 @@ nameLine ps s i0 = case nat s (lit inOpen s i0) of
 fileName :: Pools -> Int -> Int -> Int -> (Name -> Name) -> Fast
 fileName ps k nxt p mk = case poolAt (pNames ps) p of
   Nothing  -> FastErr ("undefined name index " ++ show p)
-  Just pre -> FastOk (ps { pNames = poolPush k (mk pre) (pNames ps) }) nxt
+  Just pre -> FastOk (ps { pNames = poolPush (pDeaths ps) (pLine ps) k (mk pre)
+                                             (pNames ps) }) nxt
 {-# INLINE fileName #-}
 
 -- | @{"const":{"name":N,"us":[U,...]},"ie":K}@.
@@ -361,7 +386,7 @@ exprIx ps i = maybe (Left ("undefined expression index " ++ show i)) Right
                     (poolAt (pExprs ps) i)
 
 fileExpr :: Int -> Expr -> Pools -> Pools
-fileExpr k e ps = ps { pExprs = poolPush k e (pExprs ps) }
+fileExpr k e ps = ps { pExprs = poolPush (pDeaths ps) (pLine ps) k e (pExprs ps) }
 
 -- | The byte at a position inside the file.
 --
@@ -422,7 +447,9 @@ plainStr s i
     n = B.length s
     go !j
       | j >= n                           = Slice (-1) B.empty
-      | w == wQuote                      = Slice (j + 1) (B.take (j - i) (B.drop i s))
+      -- Copied, not windowed, for the reason 'Front.Json.slice' gives: these
+      -- bytes are kept and the buffer they came out of should not be.
+      | w == wQuote                      = Slice (j + 1) (B.copy (B.take (j - i) (B.drop i s)))
       | w == wBackslash || w == wNewline = Slice (-1) B.empty
       | otherwise                        = go (j + 1)
       where w = byteAt s j
@@ -566,7 +593,7 @@ entry ps t v
       f <- record [t, key] v
       k <- natOf =<< field f key
       x <- rd =<< field f t
-      pure (put (poolPush k x (get ps)), Nothing)
+      pure (put (poolPush (pDeaths ps) (pLine ps) k x (get ps)), Nothing)
 
 exprTags :: [String]
 exprTags =
