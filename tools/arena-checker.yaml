@@ -85,7 +85,7 @@ build: bash tools/arena-build.sh
 #               are what the old generation has to absorb.
 #
 # The timeout is the same idea for the clock: a decline, not a wrong answer,
-# and not a job that runs the matrix out of its 360 minutes.  mathlib took 22
+# and not a job that runs the matrix out of its 360 minutes.  mathlib took 15
 # minutes of it on a box under other load; every other export is minutes.
 #
 # The two rewritten statuses are both resource limits reported as such.  124 is
