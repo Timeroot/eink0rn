@@ -6,7 +6,7 @@
 # contains it.  The submitted copy carries the commit `ref` points at, which is
 # what the arena will clone --
 #
-#   sed "s/REPLACE_WITH_COMMIT_SHA/$(git rev-parse v1.0.0^{commit})/" \
+#   sed "s/REPLACE_WITH_COMMIT_SHA/$(git rev-parse v1.1.0^{commit})/" \
 #     tools/arena-checker.yaml > ../lean-kernel-arena/checkers/eink0rn.yaml
 description: |
   **eink0rn** — a Lean 4 kernel in Haskell, written clean-room, that normalises
@@ -52,9 +52,9 @@ description: |
   when a major collection finds too much alive, so the other seven do not land
   on top of that declaration. `-M` is a real limit underneath both: over it the
   answer is a decline and not the runner's OOM killer.
-version: "1.0.0"
+version: "1.1.0"
 url: https://github.com/Timeroot/eink0rn
-ref: v1.0.0
+ref: v1.1.0
 rev: REPLACE_WITH_COMMIT_SHA
 threads: 8
 build: bash tools/arena-build.sh
@@ -74,14 +74,14 @@ build: bash tools/arena-build.sh
 #               the next flag affordable.
 #   -F1.3       the heap may be 1.3x the live set before the oldest generation
 #               is collected, against a default of 2.0.  This is the flag that
-#               decides whether mathlib fits: 12.5 GB peak instead of 13.2, on
-#               a 10.7 GB live set.
+#               decides whether mathlib fits: 12.8 GB of anonymous memory
+#               instead of 13.5, on a 10.7 GB live set.
 #   -A32m       small nursery: eight of them, and the survivors of a big one
 #               are what the old generation has to absorb.
 #
 # The timeout is the same idea for the clock: a decline, not a wrong answer,
-# and not a job that runs the matrix out of its 360 minutes.  mathlib takes
-# about 17 minutes of it; every other export is minutes.
+# and not a job that runs the matrix out of its 360 minutes.  mathlib took 22
+# minutes of it on a box under other load; every other export is minutes.
 #
 # The two rewritten statuses are both resource limits reported as such.  124 is
 # the timeout above.  251 is the RTS's own heap-limit exit, taken when the live
