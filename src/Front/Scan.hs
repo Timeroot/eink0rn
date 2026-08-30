@@ -79,7 +79,7 @@ deathOf (Deaths a) i
 scanDeaths :: B.ByteString -> Deaths
 scanDeaths input
   | n <= 0    = NoDeaths
-  | otherwise = runST (start 1024 >>= \a0 -> go 0 1 1024 a0)
+  | otherwise = runST (start 1024 >>= \a0 -> go 0 1 1024 0 a0)
   where
     n = B.length input
 
@@ -103,18 +103,41 @@ scanDeaths input
       cp 0
       pure (c', a')
 
-    go :: Int -> Int -> Int -> STUArray s Int Int32 -> ST s Deaths
-    go !i !ln !c !a
-      | i >= n = Deaths <$> unsafeFreeze a
+    -- Cut the table down to the indices that exist, once, at the end.
+    --
+    -- Doubling is the right way to grow it -- the scan is a linear pass over
+    -- half a gigabyte and cannot afford to copy the table often -- but it ends
+    -- holding up to twice the words it needs, and unlike everything else here
+    -- the table then stays live for the whole run.  On @std@ that is 67 MB
+    -- held to the last line where 38 MB would do.  One more copy buys it back.
+    fit :: forall s. Int -> Int -> STUArray s Int Int32
+        -> ST s (STUArray s Int Int32)
+    fit want c a
+      | want >= c = pure a
+      | otherwise = do
+          a' <- start want
+          let cp :: Int -> ST s ()
+              cp !i | i >= want = pure ()
+                    | otherwise = unsafeRead a i >>= unsafeWrite a' i >> cp (i + 1)
+          cp 0
+          pure a'
+
+    -- @c@ is how many slots the table has and @hi@ the largest index any line
+    -- has claimed to define, which is what the finished table has to reach;
+    -- @c@ overshoots it by up to a factor of two, that being what doubling
+    -- costs, and 'fit' is where that is given back.
+    go :: Int -> Int -> Int -> Int -> STUArray s Int Int32 -> ST s Deaths
+    go !i !ln !c !hi !a
+      | i >= n = Deaths <$> (unsafeFreeze =<< fit (hi + 1) c a)
       | otherwise =
           let w = BU.unsafeIndex input i in
           if isDigit w
             then case digits i 0 of
               (v, j)
-                | v >= 0 && v < c -> unsafeWrite a v (fromIntegral ln) >> go j ln c a
-                | otherwise       -> go j ln c a
+                | v >= 0 && v < c -> unsafeWrite a v (fromIntegral ln) >> go j ln c hi a
+                | otherwise       -> go j ln c hi a
             else if w == wNL
-              then go (i + 1) (ln + 1) c a
+              then go (i + 1) (ln + 1) c hi a
               -- @"in":@, @"il":@, @"ie":@ -- the three ways a line says which
               -- entry it is defining, and the only thing here that has to know
               -- anything about the format.  Getting this wrong makes the table
@@ -126,10 +149,11 @@ scanDeaths input
                       && BU.unsafeIndex input (i + 4) == wColon
                 then case digits (i + 5) 0 of
                   (v, _)
-                    | v >= c && v <= limit -> grow v c a >>= \(c', a') -> go (i + 1) ln c' a'
+                    | v >= c && v <= limit ->
+                        grow v c a >>= \(c', a') -> go (i + 1) ln c' (max hi v) a'
                     | v > limit            -> pure NoDeaths
-                    | otherwise            -> go (i + 1) ln c a
-                else go (i + 1) ln c a
+                    | otherwise            -> go (i + 1) ln c (max hi v) a
+                else go (i + 1) ln c hi a
 
     -- The value of the run of digits at @i@, and where it ends.  A run too long
     -- to be an index saturates: it is a literal, and all the caller does with it

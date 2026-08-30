@@ -16,7 +16,8 @@
 -- about the tables changes: the same keys, the same buckets, the same cap on how
 -- long a bucket may get.
 module Kernel.Cache
-  ( Cache
+  ( Chain (..)
+  , Cache
   , newCache
   , clearCache
   , bucket
@@ -41,6 +42,39 @@ import           Data.Array.IO   (IOArray, IOUArray, newArray)
 import           Data.Bits       (shiftL, (.&.))
 import           Data.IORef      (IORef, newIORef, readIORef, writeIORef)
 
+-- | What a cache needs to know about the buckets it hangs entries in.
+--
+-- It does not know what an entry is.  It knows that a bucket is a chain of
+-- them, newest first; everything else -- what an entry holds, what a lookup
+-- matches it against -- belongs to the table's owner and is written beside it
+-- in "Kernel.Check".
+--
+-- The point of the class is that an entry /is/ a link, rather than a value hung
+-- off one.  A bucket of @[(k, ek, v)]@ is two heap objects an entry and nine
+-- words with the @Int@ boxed; a chain whose links carry those fields is one
+-- object of five.  The memo tables are about a fifth of the live heap at the
+-- peak of a run of @std@, and the entries in them were 104 MB of conses and
+-- boxed triples where they are now 55 MB of chain links, so the four words are
+-- worth a class to get.
+--
+-- The other thing an entry now carries is its own key, which is why 'push' no
+-- longer takes a function to recover one: the only caller that ever wanted a
+-- key back was 'grow', and 'chainHang' is where it asks.
+--
+-- Nothing here says an entry's fields must be strict, and 'Kernel.Check.MemoB'
+-- says at length why the largest table's are not.
+class Chain b where
+  -- | The empty bucket.
+  chainNil  :: b
+  -- | At most @n@ entries.  Must hand back the bucket it was given when that is
+  -- already so: at a load factor of one nearly every bucket is short, and
+  -- copying them all would cost more than the cap saves.
+  chainCap  :: Int -> b -> b
+  -- | Rehang a bucket's entries into the table replacing it, adding how many
+  -- there were to a running count.  Oldest first, so the cap goes on forgetting
+  -- the oldest.  Only 'grow' calls this.
+  chainHang :: IOArray Int b -> Int -> b -> Int -> IO Int
+
 -- | The mask and the number of live entries, then the slots.  The slot count is
 -- a power of two, so the mask is one less than it and indexing is a bitwise and.
 --
@@ -49,7 +83,7 @@ import           Data.IORef      (IORef, newIORef, readIORef, writeIORef)
 -- a boxed cell meant building a fresh one for every entry, which for a table
 -- written tens of millions of times a run came to more litter than the entries.
 -- The array still needs a cell of its own, since growing the table replaces it.
-data Cache v = Cache !(IOUArray Int Int) !(IORef (IOArray Int [v]))
+data Cache b = Cache !(IOUArray Int Int) !(IORef (IOArray Int b))
 
 -- | Small: most tables are asked a handful of questions and thrown away, and
 -- the ones that are not double their way up in a few steps.
@@ -64,61 +98,55 @@ initialSlots = 64
 slotCap :: Int
 slotCap = 8
 
-newCache :: IO (Cache v)
+newCache :: Chain b => IO (Cache b)
 newCache = do
   hdr <- newArray (0, 1) 0
   unsafeWrite hdr 0 (initialSlots - 1)
-  arr <- newArray (0, initialSlots - 1) []
+  arr <- newArray (0, initialSlots - 1) chainNil
   Cache hdr <$> newIORef arr
 
 -- | Forget everything.  Called when the environment or the universe parameters
 -- change, which is when every answer in the table stops being about the right
 -- question.
-clearCache :: Cache v -> IO ()
+clearCache :: Chain b => Cache b -> IO ()
 clearCache (Cache hdr ref) = do
   unsafeWrite hdr 0 (initialSlots - 1)
   unsafeWrite hdr 1 0
-  writeIORef ref =<< newArray (0, initialSlots - 1) []
+  writeIORef ref =<< newArray (0, initialSlots - 1) chainNil
 
 -- | The entries that could match this key, most recently added first.  The
 -- caller compares them properly; a bucket is only a shortlist.
-bucket :: Cache v -> Int -> IO [v]
+bucket :: Cache b -> Int -> IO b
 bucket (Cache hdr ref) k = do
   mask <- unsafeRead hdr 0
   arr  <- readIORef ref
   unsafeRead arr (k .&. mask)
 
--- | Add an entry.  @keyOf@ recovers an entry's key, which is needed only when
--- the table doubles and everything has to be reindexed.
-push :: (v -> Int) -> Cache v -> Int -> v -> IO ()
-push keyOf c@(Cache hdr ref) k v = do
+-- | Add an entry, given as the function that puts it at the front of a bucket:
+-- an entry is a link of the chain, so only its owner can build one, and the
+-- bucket it is to be linked onto is not known until the slot has been read.
+--
+-- Inlined so that the link is built where the fields are, rather than a closure
+-- over them being built here.
+push :: Chain b => Cache b -> Int -> (b -> b) -> IO ()
+push c@(Cache hdr ref) k link = do
   mask <- unsafeRead hdr 0
   n    <- unsafeRead hdr 1
   arr  <- readIORef ref
   let i = k .&. mask
   old <- unsafeRead arr i
-  unsafeWrite arr i (v : capped old)
+  unsafeWrite arr i (link (chainCap (slotCap - 1) old))
   let n' = n + 1
-  if n' > mask then grow keyOf c mask arr
+  if n' > mask then grow c mask arr
                else unsafeWrite hdr 1 n'
-
--- | The bucket, shortened to leave room for one more entry.
---
--- @take@ would say this, and would also copy a bucket that is already short
--- enough -- which, at a load factor of one, is almost every bucket there is.
-capped :: [v] -> [v]
-capped vs = if fits (slotCap - 1) vs then vs else take (slotCap - 1) vs
-  where
-    fits _ []       = True
-    fits 0 _        = False
-    fits j (_ : xs) = fits (j - 1 :: Int) xs
+{-# INLINE push #-}
 
 -- | Grow the table and reindex.  Amortised constant, and the entries are
 -- rehung in the order they were in, so the cap keeps evicting the oldest.
 --
 -- By a factor of eight and not the usual two.  Doubling is what you want when
 -- growing is a copy and the slots are the cost; here the slots are a word each
--- and growing is a /rehang/ -- a cons cell for every entry the table holds --
+-- and growing is a /rehang/ -- a fresh link for every entry the table holds --
 -- so the thing to minimise is how many times the entries are touched.  Ending
 -- at @S@ slots, doubling rehangs about @S@ entries in total and eightfold about
 -- @S/7@, and it allocates two thirds as many slots on the way.  What it costs
@@ -133,23 +161,16 @@ capped vs = if fits (slotCap - 1) vs then vs else take (slotCap - 1) vs
 -- cache-friendly thing the checker does.  Raising the load factor instead was
 -- measured and rejected: at two entries a slot @std@ allocates 0.5% less and
 -- runs 3% slower, the buckets having got long enough to notice.
-grow :: forall v. (v -> Int) -> Cache v -> Int -> IOArray Int [v] -> IO ()
-grow keyOf (Cache hdr ref) mask arr = do
+grow :: forall b. Chain b => Cache b -> Int -> IOArray Int b -> IO ()
+grow (Cache hdr ref) mask arr = do
   let mask' = mask `shiftL` 3 + 7
-  arr' <- newArray (0, mask') []
-  let hang :: Int -> [v] -> IO Int
-      hang !c []       = pure c
-      hang !c (v : vs) = do
-        let j = keyOf v .&. mask'
-        b <- unsafeRead arr' j
-        unsafeWrite arr' j (v : b)
-        hang (c + 1) vs
-      slot :: Int -> Int -> IO Int
+  arr' <- newArray (0, mask') chainNil
+  let slot :: Int -> Int -> IO Int
       slot !c i
         | i > mask  = pure c
         | otherwise = do
-            vs <- unsafeRead arr i
-            c' <- hang c (reverse vs)
+            b  <- unsafeRead arr i
+            c' <- chainHang arr' mask' b c
             slot c' (i + 1)
   n <- slot 0 0
   unsafeWrite hdr 0 mask'

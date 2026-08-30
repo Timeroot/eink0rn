@@ -41,6 +41,8 @@ module Kernel.Check
   ) where
 
 import           Control.Monad          (unless, when)
+import           Data.Array.Base        (unsafeRead, unsafeWrite)
+import           Data.Bits              ((.&.))
 import qualified Data.ByteString.Char8  as B
 import           Data.IntMap.Strict     (IntMap)
 import qualified Data.IntMap.Strict     as IM
@@ -49,9 +51,9 @@ import           Data.IORef             (IORef, modifyIORef', newIORef,
 import           Data.List              (find, foldl')
 import           Data.Map.Strict        (Map)
 import qualified Data.Map.Strict        as M
-import           Kernel.Cache           (Budget, Cache, Counter, bucket,
-                                         bumpCounter, clearCache, getFuel,
-                                         getWaste, newBudget, newCache,
+import           Kernel.Cache           (Budget, Cache, Chain (..), Counter,
+                                         bucket, bumpCounter, clearCache,
+                                         getFuel, getWaste, newBudget, newCache,
                                          newCounter, nextCount, push,
                                          readCounter, setFuel, setWaste, tick,
                                          writeCounter)
@@ -198,38 +200,108 @@ warmLicences = unmeteredly $ do
 --
 -- Missing a hit only wastes time.  Buckets are capped so that a hash collision
 -- cannot turn the table into a leak.
-type Memo = Cache (Expr, Int, Expr)
+--
+-- The bucket is a chain of entries and not a list of triples, for the reason
+-- 'Kernel.Cache.Chain' gives: five words an entry rather than nine, on the
+-- tables that are the largest single thing in the heap while a hard declaration
+-- is being checked.
+type Memo = Cache MemoB
 
-memoEntryKey :: (Expr, Int, Expr) -> Int
-memoEntryKey (k, ek, _) = hashMix (exprHash k) ek
+-- | An entry: the term, its environment key, and what the table remembers about
+-- it, in one link.
+--
+-- **The fields are lazy on purpose**, and the two bangs that look free here are
+-- the most expensive characters measured in this file.  Every caller of
+-- 'memoInsert' has already run the action that produced the value, so the
+-- fields are in weak head normal form before the link is built and strictness
+-- can force nothing that is not forced: it is, semantically, a no-op.  It is not
+-- one for the compiler.  Making them strict makes 'memoInsert' strict, which
+-- propagates through 'insertWhnf' and 'insertInfer' into 'whnf' and 'inferM'
+-- themselves, and the code GHC then generates for those two allocates
+-- **16% more** over a run of @init@ -- 63.93 GB against 55.15 -- and peaks a
+-- fifth higher, for the same verdict on every test.
+--
+-- Bisected one bucket type at a time, and this declaration is the whole of it:
+-- with the other four strict and this one lazy the run is 55.15 GB, and with
+-- this one strict it is 63.9 to 64.5 whichever way the other four are set.  So
+-- they are lazy for uniformity and not for a measurement, having been tried
+-- both ways to no effect on either figure.
+data MemoB = MNil | MCons Expr {-# UNPACK #-} !Int Expr MemoB
+
+memoEntryKey :: Expr -> Int -> Int
+memoEntryKey k ek = hashMix (exprHash k) ek
+{-# INLINE memoEntryKey #-}
+
+instance Chain MemoB where
+  chainNil = MNil
+  chainCap n b0 = if fits n b0 then b0 else trunc n b0
+    where
+      fits !j b = case b of
+        MNil           -> True
+        MCons _ _ _ tl -> j > 0 && fits (j - 1 :: Int) tl
+      trunc !j b = case b of
+        MCons k ek v tl | j > (0 :: Int) -> MCons k ek v (trunc (j - 1) tl)
+        _                                -> MNil
+  chainHang arr mask = go
+    where
+      go MNil              !n = pure n
+      go (MCons k ek v tl) !n = do
+        n' <- go tl n
+        let j = memoEntryKey k ek .&. mask
+        b <- unsafeRead arr j
+        unsafeWrite arr j (MCons k ek v b)
+        pure (n' + 1)
 
 memoLookup :: Memo -> Int -> Expr -> IO (Maybe Expr)
-memoLookup m ek e = go <$> bucket m (hashMix (exprHash e) ek)
+memoLookup m ek e = go <$> bucket m (memoEntryKey e ek)
   where
-    go ((k, ek', v) : rest) | ek == ek', k == e = Just v
+    go (MCons k ek' v rest) | ek == ek', k == e = Just v
                             | otherwise         = go rest
-    go []                                       = Nothing
+    go MNil                                     = Nothing
 
 memoInsert :: Memo -> Int -> Expr -> Expr -> IO ()
-memoInsert m ek k v = push memoEntryKey m (hashMix (exprHash k) ek) (k, ek, v)
+memoInsert m ek k v = push m (memoEntryKey k ek) (MCons k ek v)
 
 -- | Which local constant stands for a binder: the binder's type node and the
 -- environment it is read in, to the identifier inference gave it.  See
 -- 'sharedLocal'.
-type LocalMemo = Cache (Expr, Int, Int)
+type LocalMemo = Cache LocalB
 
-localEntryKey :: (Expr, Int, Int) -> Int
-localEntryKey (t, pk, _) = hashMix (exprHash t) pk
+data LocalB = LNil | LCons Expr {-# UNPACK #-} !Int {-# UNPACK #-} !Int LocalB
+
+localEntryKey :: Expr -> Int -> Int
+localEntryKey t pk = hashMix (exprHash t) pk
+{-# INLINE localEntryKey #-}
+
+instance Chain LocalB where
+  chainNil = LNil
+  chainCap n b0 = if fits n b0 then b0 else trunc n b0
+    where
+      fits !j b = case b of
+        LNil           -> True
+        LCons _ _ _ tl -> j > 0 && fits (j - 1 :: Int) tl
+      trunc !j b = case b of
+        LCons t pk x tl | j > (0 :: Int) -> LCons t pk x (trunc (j - 1) tl)
+        _                                -> LNil
+  chainHang arr mask = go
+    where
+      go LNil               !n = pure n
+      go (LCons t pk x tl)  !n = do
+        n' <- go tl n
+        let j = localEntryKey t pk .&. mask
+        b <- unsafeRead arr j
+        unsafeWrite arr j (LCons t pk x b)
+        pure (n' + 1)
 
 localIdLookup :: LocalMemo -> Int -> Expr -> IO (Maybe Int)
-localIdLookup m pk t = go <$> bucket m (hashMix (exprHash t) pk)
+localIdLookup m pk t = go <$> bucket m (localEntryKey t pk)
   where
-    go ((k, pk', x) : rest) | pk == pk', ptrEq k t = Just x
+    go (LCons k pk' x rest) | pk == pk', ptrEq k t = Just x
                             | otherwise            = go rest
-    go []                                          = Nothing
+    go LNil                                        = Nothing
 
 localIdInsert :: LocalMemo -> Int -> Expr -> Int -> IO ()
-localIdInsert m pk t x = push localEntryKey m (hashMix (exprHash t) pk) (t, pk, x)
+localIdInsert m pk t x = push m (localEntryKey t pk) (LCons t pk x)
 
 -- | A memo on /pairs/ of terms: what 'isDefEq' last answered about them.
 --
@@ -247,27 +319,46 @@ localIdInsert m pk t x = push localEntryKey m (hashMix (exprHash t) pk) (t, pk, 
 -- completeness cost at nothing that matters, entries are written only from a
 -- call that ran unmetered, never from inside a 'speculate' where @False@ means
 -- no more than "not this way".
-type EqMemo = Cache (Expr, Expr, Bool)
+type EqMemo = Cache EqB
+
+data EqB = ENil | ECons Expr Expr Bool EqB
 
 -- | Symmetric in its arguments, as conversion is.
 eqKey :: Expr -> Expr -> Int
 eqKey a b = let x = exprHash a; y = exprHash b
             in hashMix (min x y) (max x y)
 
-eqEntryKey :: (Expr, Expr, Bool) -> Int
-eqEntryKey (a, b, _) = eqKey a b
+instance Chain EqB where
+  chainNil = ENil
+  chainCap n b0 = if fits n b0 then b0 else trunc n b0
+    where
+      fits !j b = case b of
+        ENil           -> True
+        ECons _ _ _ tl -> j > 0 && fits (j - 1 :: Int) tl
+      trunc !j b = case b of
+        ECons x y v tl | j > (0 :: Int) -> ECons x y v (trunc (j - 1) tl)
+        _                               -> ENil
+  chainHang arr mask = go
+    where
+      go ENil              !n = pure n
+      go (ECons x y v tl)  !n = do
+        n' <- go tl n
+        let j = eqKey x y .&. mask
+        b <- unsafeRead arr j
+        unsafeWrite arr j (ECons x y v b)
+        pure (n' + 1)
 
 eqLookup :: EqMemo -> Expr -> Expr -> IO (Maybe Bool)
 eqLookup m a b = go <$> bucket m (eqKey a b)
   where
-    go ((x, y, v) : rest)
+    go (ECons x y v rest)
       | x == a && y == b = Just v
       | x == b && y == a = Just v
       | otherwise        = go rest
-    go []                = Nothing
+    go ENil              = Nothing
 
 eqInsert :: EqMemo -> Expr -> Expr -> Bool -> IO ()
-eqInsert m a b v = push eqEntryKey m (eqKey a b) (a, b, v)
+eqInsert m a b v = push m (eqKey a b) (ECons a b v)
 
 -- | Is a comparison of these two worth a table lookup?
 --
@@ -280,7 +371,29 @@ eqWorthMemo a b = big a && big b
 
 -- | A memo on (stored body, its parameters, universe arguments) triples; see
 -- 'instLevels'.
-type LevelMemo = Cache (Expr, [Name], [Level], Expr)
+type LevelMemo = Cache LevelB
+
+data LevelB = VNil | VCons Expr [Name] [Level] Expr LevelB
+
+instance Chain LevelB where
+  chainNil = VNil
+  chainCap n b0 = if fits n b0 then b0 else trunc n b0
+    where
+      fits !j b = case b of
+        VNil             -> True
+        VCons _ _ _ _ tl -> j > 0 && fits (j - 1 :: Int) tl
+      trunc !j b = case b of
+        VCons e ps ls r tl | j > (0 :: Int) -> VCons e ps ls r (trunc (j - 1) tl)
+        _                                   -> VNil
+  chainHang arr mask = go
+    where
+      go VNil                 !n = pure n
+      go (VCons e ps ls r tl) !n = do
+        n' <- go tl n
+        let j = levelsKey e ps ls .&. mask
+        b <- unsafeRead arr j
+        unsafeWrite arr j (VCons e ps ls r b)
+        pure (n' + 1)
 
 -- | 'instLevelsE', remembered for the length of one declaration.
 --
@@ -318,16 +431,16 @@ instLevels ps ls e
   | otherwise = TC $ \s -> do
       let tbl = tcLevelInst s
           key = levelsKey e ps ls
-          hit ((b, ps', ls', r) : rest)
+          hit (VCons b ps' ls' r rest)
             | ptrEq b e, ps' == ps, ls' == ls = Just r
             | otherwise                       = hit rest
-          hit []                              = Nothing
+          hit VNil                            = Nothing
       b <- bucket tbl key
       case hit b of
         Just r  -> pure (Right r)
         Nothing -> do
           let r = instLevelsE ps ls e
-          push (\(x, p, l, _) -> levelsKey x p l) tbl key (e, ps, ls, r)
+          push tbl key (VCons e ps ls r)
           pure (Right r)
   where
     -- @zipWith@ would otherwise read a short argument list as "every parameter
@@ -344,7 +457,29 @@ levelsKey e ps ls = foldl' (\h l -> hashMix h (levelHash l))
                            ls
 
 -- | A memo on what the environment says about a name; see 'lookupConstC'.
-type ConstMemo = Cache (Name, Maybe ConstInfo)
+type ConstMemo = Cache ConstB
+
+data ConstB = KNil | KCons Name (Maybe ConstInfo) ConstB
+
+instance Chain ConstB where
+  chainNil = KNil
+  chainCap n b0 = if fits n b0 then b0 else trunc n b0
+    where
+      fits !j b = case b of
+        KNil         -> True
+        KCons _ _ tl -> j > 0 && fits (j - 1 :: Int) tl
+      trunc !j b = case b of
+        KCons m r tl | j > (0 :: Int) -> KCons m r (trunc (j - 1) tl)
+        _                             -> KNil
+  chainHang arr mask = go
+    where
+      go KNil            !n = pure n
+      go (KCons m r tl)  !n = do
+        n' <- go tl n
+        let j = nameHash m .&. mask
+        b <- unsafeRead arr j
+        unsafeWrite arr j (KCons m r b)
+        pure (n' + 1)
 
 -- | 'lookupConst' against the current environment, remembered for as long as
 -- that environment is the current one.
@@ -366,16 +501,16 @@ lookupConstC :: Name -> TC (Maybe ConstInfo)
 lookupConstC n = TC $ \s -> do
   let tbl = tcConsts s
       key = nameHash n
-      hit ((m, r) : rest) | m == n    = Just r
-                          | otherwise = hit rest
-      hit []                          = Nothing
+      hit (KCons m r rest) | m == n    = Just r
+                           | otherwise = hit rest
+      hit KNil                         = Nothing
   b <- bucket tbl key
   case hit b of
     Just r  -> pure (Right r)
     Nothing -> do
       env <- readIORef (tcEnv s)
       let r = lookupConst env n
-      push (nameHash . fst) tbl key (n, r)
+      push tbl key (KCons n r)
       pure (Right r)
 
 -- | The checking monad: failure, and -- because everything the checker

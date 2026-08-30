@@ -62,7 +62,8 @@ module Kernel.Expr
 import           Control.Monad.ST      (ST, runST)
 import           Data.Array.Base       (unsafeRead, unsafeWrite)
 import           Data.Array.ST         (STArray, STUArray, newArray)
-import           Data.Bits             ((.&.))
+import           Data.Bits             (complement, shiftL, shiftR, (.&.),
+                                        (.|.))
 import qualified Data.ByteString.Char8 as B
 import           Data.IntMap.Strict    (IntMap)
 import qualified Data.IntMap.Strict    as IM
@@ -89,33 +90,113 @@ newtype Binder = Binder Name
 
 instance Show Binder where show (Binder n) = showName n
 
--- | The real representation.  @X@-prefixed constructors are private.  Where
--- two @Int@s appear they are, in order, the cached hash and the cached
--- 'looseBVarRange'; a node with only one carries the hash.
+-- | The real representation.  @X@-prefixed constructors are private.
+--
+-- The leading @Int@ is the node's cached hash, except on the five constructors
+-- that can contain a bound variable, where it is a hash and a
+-- 'looseBVarRange' packed into the one word: the range in the low
+-- 'rangeBits', the hash above it.  Both caches are wanted on every one of those
+-- nodes and neither needs a full word, and an @Expr@ is what a run of this
+-- kernel is almost entirely made of -- @XApp@ alone is 38% of the live heap at
+-- @std@'s peak and 70% of it at @mathlib@'s -- so the word saved is worth the
+-- shift.  See 'mkHR'.
 data Expr
   = XBVar !Int                                  -- ^ de Bruijn index
   | XFVar !Int                                  -- ^ local constant (checker-internal)
   | XSort !Int !Level
   | XConst !Int !Name ![Level]
-  | XApp !Int !Int !Expr !Expr
-  | XLam !Int !Int !Binder !Expr !Expr          -- ^ @fun (x : t) => b@
-  | XPi  !Int !Int !Binder !Expr !Expr          -- ^ @(x : t) -> b@
-  | XLet !Int !Int !Binder !Expr !Expr !Expr    -- ^ @let x : t := v; b@
-  | XProj !Int !Int !Name !Int !Expr            -- ^ @s.i@ at structure type @T@ (0-based)
+  | XApp !Int !Expr !Expr
+  | XLam !Int !Binder !Expr !Expr               -- ^ @fun (x : t) => b@
+  | XPi  !Int !Binder !Expr !Expr               -- ^ @(x : t) -> b@
+  | XLet !Int !Binder !Expr !Expr !Expr         -- ^ @let x : t := v; b@
+  | XProj !Int !Name !Int !Expr                 -- ^ @s.i@ at structure type @T@ (0-based)
   | XNatLit !Int !Integer                       -- ^ abbreviation for a @Nat.succ@ tower
   | XStrLit !Int !B.ByteString                  -- ^ abbreviation for @String.mk [...]@
 
+-- | How many low bits of a packed word hold the range.
+--
+-- Sixteen million binders deep is not a term any exporter emits, and the
+-- remaining forty bits are more hash than the caches can use: they are only
+-- ever a filter in front of a structural test and an index into a table, so a
+-- collision costs a comparison and never an answer.  The width is nonetheless
+-- not load-bearing -- 'looseBVarRange' is exact at every width, because a range
+-- too large to store is stored as 'satRange' and recomputed on demand.
+rangeBits :: Int
+rangeBits = 24
+
+rangeMask :: Int
+rangeMask = (1 `shiftL` rangeBits) - 1
+
+-- | The stored range meaning \"at least this, and the exact figure was not
+-- representable\".  Reaching it costs a traversal and nothing else.
+satRange :: Int
+satRange = rangeMask
+
+-- | Pack a hash and a range into one word.
+--
+-- The /top/ bits of the hash are the ones kept.  'hashMix' ends in a multiply,
+-- which mixes upwards -- bit @i@ of a product depends only on bits @<= i@ of
+-- its arguments -- so the low bits of a hash are the least mixed, and they are
+-- exactly the bits every table here indexes on.  Shifting them out and handing
+-- back bits 24 and up is therefore not merely lossless where it matters, it is
+-- an improvement on what the tables saw before.
+mkHR :: Int -> Int -> Int
+mkHR h r = (h .&. complement rangeMask) .|. (if r < satRange then r else satRange)
+{-# INLINE mkHR #-}
+
+-- | The range a packed node stores, saturation and all.  Used where the answer
+-- is about to be packed again, so that a saturated child keeps its parent
+-- saturated instead of being expanded and re-clamped.
+rawRange :: Expr -> Int
+rawRange e = case e of
+  XBVar i        -> i + 1
+  XApp hr _ _    -> hr .&. rangeMask
+  XLam hr _ _ _  -> hr .&. rangeMask
+  XPi  hr _ _ _  -> hr .&. rangeMask
+  XLet hr _ _ _ _ -> hr .&. rangeMask
+  XProj hr _ _ _ -> hr .&. rangeMask
+  _              -> 0
+
+-- | 'rawRange' of a binder's body, seen from outside the binder, and still
+-- saturated if it was.  Decrementing 'satRange' would turn \"at least sixteen
+-- million\" into an exact figure that is wrong.
+rawUnder :: Expr -> Int
+rawUnder b = let r = rawRange b
+             in if r == satRange then satRange else max 0 (r - 1)
+
 -- | Smallest @k@ such that no @BVar i@ with @i >= k@ occurs free.  Constant
 -- time: it is either immediate or cached.
+--
+-- Exact, including on the node whose cached range saturated: that one is
+-- recomputed from its children, which is a traversal no export has ever
+-- provoked and which is here so that the width of the field cannot be an
+-- assumption about the file.
 looseBVarRange :: Expr -> Int
-looseBVarRange e = case e of
-  XBVar i          -> i + 1
-  XApp _ r _ _     -> r
-  XLam _ r _ _ _   -> r
-  XPi  _ r _ _ _   -> r
-  XLet _ r _ _ _ _ -> r
-  XProj _ r _ _ _  -> r
-  _                -> 0
+looseBVarRange e = let r = rawRange e
+                   in if r == satRange then exactRange e else r
+
+-- | The range of a node whose cached one saturated.  Memoised, so it is linear
+-- in the graph rather than in its unfolding; a child whose own range fits is
+-- read straight off it.
+exactRange :: Expr -> Int
+exactRange e0 = runST (newMemo >>= \ref -> go ref e0)
+  where
+    go ref ex
+      | r /= satRange = pure r
+      | otherwise = memoAt ref 0 ex $ case ex of
+          XApp _ f a      -> max <$> go ref f <*> go ref a
+          XLam _ _ t b    -> binder ref t b
+          XPi  _ _ t b    -> binder ref t b
+          XLet _ _ t v b  -> do t' <- go ref t; v' <- go ref v; b' <- go ref b
+                                pure (max t' (max v' (max 0 (b' - 1))))
+          XProj _ _ _ b   -> go ref b
+          -- An @XBVar@ whose index happens to land on 'satRange' exactly: the
+          -- stored figure is the true one, and there is nothing under it.
+          _               -> pure r
+      where r = rawRange ex
+    binder ref t b = do t' <- go ref t; b' <- go ref b
+                        pure (max t' (max 0 (b' - 1)))
+{-# NOINLINE exactRange #-}
 
 -- | A hash of the node's structure.  Constant time.
 --
@@ -128,11 +209,11 @@ exprHash e = case e of
   XFVar i          -> hashMix 4 i
   XSort h _        -> h
   XConst h _ _     -> h
-  XApp h _ _ _     -> h
-  XLam h _ _ _ _   -> h
-  XPi  h _ _ _ _   -> h
-  XLet h _ _ _ _ _ -> h
-  XProj h _ _ _ _  -> h
+  XApp hr _ _      -> hr `shiftR` rangeBits
+  XLam hr _ _ _    -> hr `shiftR` rangeBits
+  XPi  hr _ _ _    -> hr `shiftR` rangeBits
+  XLet hr _ _ _ _  -> hr `shiftR` rangeBits
+  XProj hr _ _ _   -> hr `shiftR` rangeBits
   XNatLit h _      -> h
   XStrLit h _      -> h
 
@@ -179,16 +260,16 @@ eqE a0 b0 = case plain eqBudget a0 b0 of
       | ptrEq x y                = Step True k
       | exprHash x /= exprHash y = Step False k
       | otherwise = case (x, y) of
-          (XApp _ _ f a, XApp _ _ g b) -> two (k - 1) f g a b
-          (XLam _ _ n t b, XLam _ _ n' t' b')
+          (XApp _ f a, XApp _ g b) -> two (k - 1) f g a b
+          (XLam _ n t b, XLam _ n' t' b')
             | n == n'   -> two (k - 1) t t' b b'
-          (XPi _ _ n t b, XPi _ _ n' t' b')
+          (XPi _ n t b, XPi _ n' t' b')
             | n == n'   -> two (k - 1) t t' b b'
-          (XLet _ _ n t v b, XLet _ _ n' t' v' b')
+          (XLet _ n t v b, XLet _ n' t' v' b')
             | n == n'   -> case two (k - 1) t t' v v' of
                 Step True k1 -> plain k1 b b'
                 r            -> r
-          (XProj _ _ s i b, XProj _ _ s' i' b')
+          (XProj _ s i b, XProj _ s' i' b')
             | i == i', s == s' -> plain (k - 1) b b'
           _ -> Step (eqLeaf x y) (k - 1)
 
@@ -212,14 +293,14 @@ eqE a0 b0 = case plain eqBudget a0 b0 of
         seen []              = False
 
     kids ref x y = case (x, y) of
-      (XApp _ _ f a, XApp _ _ g b) -> andM (go ref f g) (go ref a b)
-      (XLam _ _ n t b, XLam _ _ n' t' b')
+      (XApp _ f a, XApp _ g b) -> andM (go ref f g) (go ref a b)
+      (XLam _ n t b, XLam _ n' t' b')
         | n == n' -> andM (go ref t t') (go ref b b')
-      (XPi _ _ n t b, XPi _ _ n' t' b')
+      (XPi _ n t b, XPi _ n' t' b')
         | n == n' -> andM (go ref t t') (go ref b b')
-      (XLet _ _ n t v b, XLet _ _ n' t' v' b')
+      (XLet _ n t v b, XLet _ n' t' v' b')
         | n == n' -> andM (go ref t t') (andM (go ref v v') (go ref b b'))
-      (XProj _ _ s i b, XProj _ _ s' i' b')
+      (XProj _ s i b, XProj _ s' i' b')
         | i == i', s == s' -> go ref b b'
       _ -> pure (eqLeaf x y)
 
@@ -283,14 +364,14 @@ cmpE a b = case compare (tagE a) (tagE b) of
     fields (XFVar i)          (XFVar j)          = compare i j
     fields (XSort _ l)        (XSort _ m)        = compare l m
     fields (XConst _ n ls)    (XConst _ m ms)    = compare (n, ls) (m, ms)
-    fields (XApp _ _ f x)     (XApp _ _ g y)     = compare f g <> compare x y
-    fields (XLam _ _ n t x)   (XLam _ _ m u y)   =
+    fields (XApp _ f x)     (XApp _ g y)     = compare f g <> compare x y
+    fields (XLam _ n t x)   (XLam _ m u y)   =
       compare n m <> compare t u <> compare x y
-    fields (XPi _ _ n t x)    (XPi _ _ m u y)    =
+    fields (XPi _ n t x)    (XPi _ m u y)    =
       compare n m <> compare t u <> compare x y
-    fields (XLet _ _ n t v x) (XLet _ _ m u w y) =
+    fields (XLet _ n t v x) (XLet _ m u w y) =
       compare n m <> compare t u <> compare v w <> compare x y
-    fields (XProj _ _ s i x)  (XProj _ _ r j y)  =
+    fields (XProj _ s i x)  (XProj _ r j y)  =
       compare s r <> compare i j <> compare x y
     fields (XNatLit _ x)      (XNatLit _ y)      = compare x y
     fields (XStrLit _ x)      (XStrLit _ y)      = compare x y
@@ -303,11 +384,7 @@ tagE e = case e of
   XStrLit{} -> 10
 
 hasLooseBVars :: Expr -> Bool
-hasLooseBVars e = looseBVarRange e > 0
-
--- | Range of a binder's body seen from outside the binder.
-under :: Expr -> Int
-under b = max 0 (looseBVarRange b - 1)
+hasLooseBVars e = rawRange e > 0
 
 -- | Combine child hashes under a per-constructor seed.
 h1 :: Int -> Int -> Int
@@ -343,30 +420,30 @@ pattern StrLit s <- XStrLit _ s
   where StrLit s = XStrLit (h1 29 (B.foldl' (\h c -> h * 33 + fromEnum c) 5381 s)) s
 
 pattern App :: Expr -> Expr -> Expr
-pattern App f a <- XApp _ _ f a
-  where App f a = XApp (h2 31 (exprHash f) (exprHash a))
-                       (max (looseBVarRange f) (looseBVarRange a)) f a
+pattern App f a <- XApp _ f a
+  where App f a = XApp (mkHR (h2 31 (exprHash f) (exprHash a))
+                             (max (rawRange f) (rawRange a))) f a
 
 pattern Lam :: Binder -> Expr -> Expr -> Expr
-pattern Lam n t b <- XLam _ _ n t b
-  where Lam n t b = XLam (h2 37 (exprHash t) (exprHash b))
-                         (max (looseBVarRange t) (under b)) n t b
+pattern Lam n t b <- XLam _ n t b
+  where Lam n t b = XLam (mkHR (h2 37 (exprHash t) (exprHash b))
+                               (max (rawRange t) (rawUnder b))) n t b
 
 pattern Pi :: Binder -> Expr -> Expr -> Expr
-pattern Pi n t b <- XPi _ _ n t b
-  where Pi n t b = XPi (h2 41 (exprHash t) (exprHash b))
-                       (max (looseBVarRange t) (under b)) n t b
+pattern Pi n t b <- XPi _ n t b
+  where Pi n t b = XPi (mkHR (h2 41 (exprHash t) (exprHash b))
+                             (max (rawRange t) (rawUnder b))) n t b
 
 pattern Let :: Binder -> Expr -> Expr -> Expr -> Expr
-pattern Let n t v b <- XLet _ _ n t v b
+pattern Let n t v b <- XLet _ n t v b
   where Let n t v b =
-          XLet (h3 43 (exprHash t) (exprHash v) (exprHash b))
-               (max (looseBVarRange t) (max (looseBVarRange v) (under b))) n t v b
+          XLet (mkHR (h3 43 (exprHash t) (exprHash v) (exprHash b))
+                     (max (rawRange t) (max (rawRange v) (rawUnder b)))) n t v b
 
 pattern Proj :: Name -> Int -> Expr -> Expr
-pattern Proj s i b <- XProj _ _ s i b
-  where Proj s i b = XProj (h3 47 (nameHash s) i (exprHash b))
-                           (looseBVarRange b) s i b
+pattern Proj s i b <- XProj _ s i b
+  where Proj s i b = XProj (mkHR (h3 47 (nameHash s) i (exprHash b))
+                                 (rawRange b)) s i b
 
 {-# COMPLETE BVar, FVar, Sort, Const, App, Lam, Pi, Let, Proj, NatLit, StrLit #-}
 

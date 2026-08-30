@@ -2182,6 +2182,19 @@ than on its tree unfolding:
 Both are maintained by pattern synonyms, so nothing outside `Kernel.Expr` can set
 a cache to a lie.
 
+They share a word. On the five constructors that can contain a bound variable —
+the only ones where both caches are wanted — the range lives in the low 24 bits
+and the hash above it, which makes an application node four machine words rather
+than five and a `let` six rather than seven. That is not a bookkeeping detail on
+a corpus where application nodes are 38% of the live heap at `std`'s peak and
+70% of it at `mathlib`'s; §11.8 has what it was worth. Neither cache
+loses anything it was using: the bits the hash gives up are its low ones, which
+`hashMix` mixes least and every table here indexes on, so shifting them out
+improves the buckets rather than weakening them; and a range too large for 24
+bits is stored saturated and recomputed exactly, by a memoised traversal, on the
+first term that ever needs it. So the width of the field is a space decision and
+not an assumption about what an export may contain.
+
 Names are shared the same way and cache a hash the same way, and their equality
 is the same three-step test: pointer, then hash, then walk. The pointer step
 earns its keep because the export interns names in a pool, so the constant a
@@ -2601,27 +2614,26 @@ one thread, sampling once a minute (`t` is mutator time, which on one thread is
 very nearly the clock):
 
 ```
-    t=  1211s   2.23 GB      t=  3448s   3.31 GB
-    t=  2119s   2.79 GB      t=  3630s   3.25 GB
-    t=  3025s   3.21 GB      t=  3690s   3.55 GB
-    t=  3327s   3.31 GB      t=  3750s   6.36 GB
-    t=  3388s   3.31 GB      t=  3811s   9.48 GB
-                             t=  3870s  12.25 GB   <- peak
-                             t=  3931s   3.16 GB
+    t=   544s   1.97 GB      t=  2404s   2.84 GB
+    t=  1028s   2.34 GB      t=  2525s   2.73 GB
+    t=  1511s   2.56 GB      t=  2586s   2.69 GB
+    t=  1995s   2.78 GB      t=  2647s   4.07 GB
+    t=  2237s   2.79 GB      t=  2707s   6.56 GB
+                             t=  2767s   9.11 GB   <- peak
+                             t=  2828s   2.63 GB
 ```
 
-Three and a bit gigabytes, flat, for an hour; then 240 seconds in which it
-nearly quadruples; then it is over and the file ends. 68.9% of the peak is
-`Kernel.Expr.XApp`, which is five words, so the peak holds about 211 million
+Under three gigabytes, flat, for three quarters of an hour; then 180 seconds in
+which it more than triples; then it is over and the file ends. 65.9% of the peak
+is `Kernel.Expr.XApp`, which is four words, so the peak holds about 188 million
 application nodes against the 81,237,230 the export defines: most of what is
 alive up there was built by the checker rather than read from the file, which is
 what a memo table full of reduced forms looks like.
 
-The `-j8` census is the same graph — flat at 3.3 GB, then 3.44 → 4.82 → 6.29 →
-7.88 → 9.28 → 11.47 GB over the last 180 seconds of mutator time, 72.7% of it
-`XApp`. The two runs peak within seven per cent of each other, so the spike is
-**one declaration**, not eight at once, and no amount of throttling gets under
-it.
+The `-j8` census is the same graph — flat under 3 GB, then 3.07 → 4.08 → 5.17 →
+6.30 → 7.43 → 8.50 → 9.61 GB, 70.2% of it `XApp`. The two runs peak within six
+per cent of each other, so the spike is **one declaration**, not eight at once,
+and no amount of throttling gets under it.
 That also disposes of the first version of `--mem`, which was a gate on
 *starting*: a thread that waits while the live set is over the budget stops the
 ninth obligation and not the eight already running, and the memory belongs to
@@ -2636,9 +2648,70 @@ declaration above, and it costs time and never a verdict — but it is a bound o
 coincidence, not on any single obligation. `std` and `cslib` never come near
 their budget and are never throttled at all.
 
-**So the collector decides the rest**, and on a 12 GB live set the choice is the
-whole difference between fitting in sixteen gigabytes and not. `mathlib` at
-`-j8`, `--mem=4000` and `-M13g` except where noted:
+**Then the nodes themselves.** Mapping, eviction and throttling all bound how
+much is alive; past them the heap is made of nothing but the checker's own
+structures, and the only thing left to change is how many words each one costs.
+Three changes, all of them representation, none of them able to reach a verdict:
+
+- an `Expr`'s two cached fields share a word (§11.3), so an application node is
+  four words rather than five, a `lam`, `pi` or `proj` five rather than six, and
+  a `let` six rather than seven;
+- a memo table's bucket is a chain whose links *are* its entries, rather than a
+  list of tuples — one heap object of five words rather than two of nine
+  (`Kernel.Cache.Chain`);
+- `Front.Scan`'s table is grown by doubling, which is what a linear pass over
+  half a gigabyte needs, and then cut to fit once at the end, because it is the
+  one array that outlives the pass that builds it and it was holding up to twice
+  the words it needed for the whole run after.
+
+`+RTS -hT` on `std`, at the sample where the heap is largest:
+
+| | before | after |
+| --- | --- | --- |
+| `XApp`, `XLam`, `XPi`, `XLet`, `XProj` | 450.9 MB | 348.7 MB |
+| bucket entries — `:`, `(,,)`, `I#` | 135.4 MB | 31.2 MB |
+| bucket entries — `MCons`, `LCons`, `ECons` | — | 55.2 MB |
+| `Front.Scan`'s table (`ARR_WORDS`) | 67.3 MB | 37.7 MB |
+| **the whole heap at that sample** | **865.4 MB** | **680.3 MB** |
+
+(The `:` and `I#` rows do not go to zero because other things are lists and
+boxed integers too; the *change* in them is the buckets.)
+
+It is not a trade against time, which is the usual shape of a memory change and
+is not this one: the same `std` check goes from 109.9 GB allocated to 100.7 and
+from 139.6s of mutator time on one thread to 121.8. Words not allocated are
+words not copied.
+
+There is a trap in it worth recording, because it cost more than the change
+saved before it was found. Making a bucket entry's fields strict is at every
+call site a no-op — the values are in weak head normal form before the link is
+built, and forcing them forces nothing — and it made `init` allocate **16% more**,
+63.9 GB against 55.1, and peak a fifth higher. The demand propagates out of
+`memoInsert` through `insertWhnf` and `insertInfer` into `whnf` and `inferM`,
+and what changes is the code GHC generates for those two. Bisected to exactly
+one of the five bucket types; `Kernel.Check.MemoB` carries the note.
+
+On `mathlib`, censused the same way at the same interval under the same flags,
+the peak live set is **11.67 GB before and 9.61 GB after** — 17.6% — and
+interleaved runs of 723s and 847s become 697s and 700s. `Expr` nodes are 9.08 GB
+of the first figure and 7.69 GB of the second, which is the packed word and
+nothing else: the spike is some two hundred million application nodes either
+way, at five words each and then at four.
+`Front.Scan`'s table is 389 MB there where the census of the old code caught it
+at 542.
+
+What moves furthest is the heap the collector then asks the operating system
+for, because it asks for a multiple of the live set. With the ceiling out of
+reach at `-M30g`, two runs of the old code peak at 21.2 and 21.8 GB of anonymous
+memory and three of the new at 12.5, 13.0 and 15.1. Under `-M13g` both sit at
+the ceiling — 12.4 to 13.5 GB — which is what a ceiling is for; what has changed
+is that `mathlib` is now just over the limit rather than eight gigabytes over
+it.
+
+**So the collector decides the rest**, and on a live set this size the choice is
+the whole difference between fitting in sixteen gigabytes and not. `mathlib` at
+`-j8`, `--mem=4000` and `-M13g` except where noted, every row measured on the
+code as it stood *before* the section above:
 
 | oldest generation | peak live | peak anon | elapsed | verdict |
 | --- | --- | --- | --- | --- |
@@ -2659,6 +2732,16 @@ rather than where it was going. *Peak anon* is read from `/proc`, is not sampled
 that way, and is the number that has to fit, the mapped file being reclaimable
 (above). Elapsed times are one run each except the two `-F` rows, which are
 means of three and eight.
+
+The comparison is between rows and it survives the representation changes, but
+the absolute figures in it do not, and the two rows that matter were measured
+again afterwards. `-F2` under `-M13g` is 12.4 to 12.9 GB of anon in 697s and
+700s, and `-M30g` — the same run with nothing to hold it down — is 12.5, 13.0
+and 15.1 GB in 671s, 672s and 700s. So the ceiling now costs nothing at all in
+time and is no longer the difference between eight gigabytes; what it still buys
+is the *spread*, turning a run that lands anywhere from 12.5 to 15.1 GB into one
+that lands at 12.9 or under every time. On a sixteen-gigabyte runner that is
+still the whole of the argument for stating it.
 
 Three of these were wrong guesses worth recording, and the third is the one that
 decides the run line. The **non-moving** collector should have been the answer —
@@ -2685,10 +2768,13 @@ it costs 26%.
 **`-M` is what holds the heap down** — it is a ceiling and not only a limit. The
 RTS compacts the oldest generation above 30% of it and reins in how far the heap
 may run ahead of the live set as the heap approaches it, so a stated ceiling
-applies exactly as much squeeze as the ceiling needs and none below: the same
-run with `-M30g` takes 21.07 GB and 799s, and with `-M13g` takes 12.85 GB and
-864s. Eight per cent of `mathlib`, nothing at all of the other three, and no
-number in the run line that has to be re-tuned per corpus.
+applies exactly as much squeeze as the ceiling needs and none below: on the code
+of the table above, the same run with `-M30g` takes 21.07 GB and 799s and with
+`-M13g` takes 12.85 GB and 864s. Eight per cent of `mathlib`, nothing at all of
+the other three, and no number in the run line that has to be re-tuned per
+corpus. On the code as it now stands the squeeze is smaller and free, for the
+reason just given, and the flag stays because what it bounds is the worst run
+and not the average one.
 
 The same policy can be written from below instead, and it was tried: `-O` sets a
 minimum size for the oldest generation, which is collected at whichever of `-O`
@@ -2707,10 +2793,14 @@ arena entry runs:
 
 | corpus | verdict | peak live | peak anon | mapped file | elapsed |
 | --- | --- | --- | --- | --- | --- |
-| `init` | ACCEPT | 0.25 GB | 0.95 GB | 0.33 GB | 19s |
-| `std` | ACCEPT | 0.66 GB | 1.99 GB | 0.56 GB | 35s |
-| `cslib` | ACCEPT | 1.69 GB | 4.79 GB | 2.15 GB | 137s |
-| `mathlib` | ACCEPT | 10.03 GB | 12.85 GB | 5.64 GB | 893s |
+| `init` | ACCEPT | 0.21 GB | 0.84 GB | 0.33 GB | 18s |
+| `std` | ACCEPT | 0.60 GB | 1.88 GB | 0.56 GB | 34s |
+| `cslib` | ACCEPT | 1.64 GB | 4.47 GB | 2.15 GB | 2m 10s |
+| `mathlib` | ACCEPT | 9.61 GB | 12.87 GB | 5.64 GB | 11m 37s |
+
+Peak anon is the largest of three runs; `mathlib`'s peak live is the `-hT`
+census, the other three being read off `-s`, which on `mathlib` samples too
+coarsely to see the top of the spike and reports 5.4 to 5.9 GB.
 
 The mapped-file column is resident too, and on a machine with room it stays
 resident, which is why `mathlib`'s RSS reads 18.5 GB on a box that has plenty.

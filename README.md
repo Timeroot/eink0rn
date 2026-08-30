@@ -123,23 +123,24 @@ schema (§12.8), and `Acc.rec` on a proof variable (§12.13).
 
 All four, through the resource half of the run line the arena entry uses —
 `--mem=4000 -j8 +RTS -A32m -M13g`; the entry also passes
-`--enforce-mutual-univ`, which no export gives anything to do — one run each on
-a GCP `n2` instance with 64 cores and other work on it. Wall clock under load is
-worth about ±20%; the memory columns do not care what else the box is doing.
+`--enforce-mutual-univ`, which no export gives anything to do — on a GCP `n2`
+instance with 64 cores and other work on it. The memory column is the largest of
+three runs and does not care what else the box is doing; wall clock under load
+is worth about ±20%.
 
 | corpus | declarations | verdict | `-j8` | anonymous | mapped file | `-j1` |
 | --- | --- | --- | --- | --- | --- | --- |
-| `init.ndjson` (325 MB) | 53,093 | ACCEPT | 19s | 0.95 GB | 0.33 GB | 1m 26s |
-| `std.ndjson` (552 MB) | 90,778 | ACCEPT | 35s | 1.99 GB | 0.56 GB | 2m 42s |
-| `cslib.ndjson` (2.1 GB) | 370,939 | ACCEPT | 2m 17s | 4.79 GB | 2.15 GB | 11m 02s |
-| `mathlib.ndjson` (5.6 GB) | 654,504 | ACCEPT | 14m 53s | 12.85 GB | 5.64 GB | 57m 19s |
+| `init.ndjson` (325 MB) | 53,093 | ACCEPT | 18s | 0.84 GB | 0.33 GB | 1m 19s |
+| `std.ndjson` (552 MB) | 90,778 | ACCEPT | 34s | 1.88 GB | 0.56 GB | 2m 37s |
+| `cslib.ndjson` (2.1 GB) | 370,939 | ACCEPT | 2m 10s | 4.47 GB | 2.15 GB | 10m 03s |
+| `mathlib.ndjson` (5.6 GB) | 654,504 | ACCEPT | 11m 37s | 12.87 GB | 5.64 GB | 50m 22s |
 
 Two memory columns because only one of them is a requirement. The export is
 mapped rather than read, so its pages are clean and file-backed: resident on a
 machine with room, and handed straight back on one without. What has to fit is
 the anonymous column. The last column is the same check on one thread with the
 compiled-in defaults instead of the flags above, for scale — and only for scale,
-since with no ceiling on it the same `mathlib` run wants 20.8 GB.
+since with no ceiling on it the same `mathlib` run wants 19.0 GB.
 
 Only `mathlib` is anywhere near the ceiling, and that is the point of writing
 the limit down as a ceiling rather than as a collection ratio. An earlier
@@ -162,8 +163,11 @@ page and the parser touches every one of them. The other quarter is
 when an index is finished with.
 
 What it buys is the last row of the table: `mathlib` used to want 25 GB and now
-wants 12.8, which on a 16 GB runner is the difference between a verdict and
-none.
+wants 12.9, which on a 16 GB runner is the difference between a verdict and
+none. A later pass over the checker's own representations (SPEC §11.8) took a
+further 17.6% off the live set behind that figure, which is what the `-j1`
+column shows and the `-j8` one does not: under `-M13g` the anonymous column is
+the ceiling talking, not the heap.
 
 One mathlib theorem —
 `AlgebraicGeometry.Scheme.exists_π_app_comp_eq_of_locallyOfFinitePresentation_of_isAffine`
@@ -220,8 +224,11 @@ names a ceiling and not a ratio. Above 30% of `-M` the RTS collects the oldest
 generation in place instead of copying it, and as the heap approaches `-M` it
 reins in how far ahead of the live set the heap is allowed to run before that
 generation is collected. So the squeeze applies itself where it is needed and
-nowhere else: `mathlib` peaks at 12.8 GB under `-M13g` and at 21.1 GB with the
-limit raised out of reach, while `init`, `std` and `cslib` never come near it
+nowhere else. It used to be worth eight gigabytes on `mathlib` — 12.8 GB under
+`-M13g` against 21.1 with the limit raised out of reach — and since SPEC §11.8
+it is worth the spread instead: three runs with the limit out of reach peak at
+12.5, 13.0 and 15.1 GB, and under `-M13g` every run lands at 12.9 or below, in
+the same time to within a per cent. `init`, `std` and `cslib` never come near it
 and are collected at the fast default throughout. `--mem=4000` is the checker's
 own budget, below. `-Mgrace=256m` is built into the binary, so it applies
 whenever `-M` does: it is the room the overflow handler needs in order to speak,
@@ -240,9 +247,9 @@ Nothing is declined, and the table above is that run line.
 
 `mathlib` is the whole reason the flags are the flags, and its difficulty is one
 declaration. A heap census (SPEC §11.8) shows the live set
-flat at 3.3 GB for the first hour and then quadrupling to 12.25 GB in 240
-seconds before collapsing back — and doing exactly the same thing, to the same
-height, on one thread. So it is not eight obligations landing at once and no
+flat under 3 GB for three quarters of an hour and then more than tripling to
+9.6 GB in the last few minutes before collapsing back — and doing exactly the
+same thing, to within six per cent of the same height, on one thread. So it is not eight obligations landing at once and no
 amount of throttling gets under it; it is one theorem's memo tables. `--mem` is
 a budget on the live set that halves how many threads may work when a major
 collection finds more than that alive and gives a thread back when one finds
