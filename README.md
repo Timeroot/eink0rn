@@ -82,7 +82,7 @@ export.
 | --- | --- | --- |
 | `--nat-accel=off\|canonical\|verified\|always` | `canonical` | how much evidence the arithmetic shortcuts of SPEC §6.5 demand before a `Nat` operation is computed on a bignum instead of unfolded. `always` trusts the *name* and is unsound; it exists to reproduce the behaviour of kernels that do that. |
 | `--pin-std=off\|warn\|error` | `off` | audit `False`, `Eq`, `Iff`, `Nonempty`, the quotient package and the three standard axioms against their standard forms (SPEC §12.5). |
-| `--keep-proofs` | off | retain every proof term instead of sealing it (SPEC §12.10). A pure performance switch. |
+| `--keep-proofs` | off | retain every proof term instead of sealing it (SPEC §12.10). By default a checked `theorem` becomes an axiom of its own statement, which is where two thirds of `mathlib`'s peak went; the one case in any corpus that needs the proof back is named there. |
 | `--enforce-mutual-univ` | off | reject a mutual inductive block whose types do not all end in the same sort, as every other Lean kernel does. By default such a block is derived from simpler declarations and accepted if the derivation checks out (SPEC §9.6, §12.14). |
 | `--progress[=SECS]` | off | report on stderr as the file is checked, naming each declaration that took at least `SECS` seconds. |
 | `-jN` | off | check in two passes, the second on `N` threads (bare `-j`: one per core). Pass one only reads each declaration into the environment, taking its statement on trust; pass two makes both judgements about it, which is where all but a few per cent of the time goes and which nothing else depends on. Each obligation is started as pass one files it, and the file is read on a thread of its own alongside. Same verdict either way — SPEC §11.6 says why. On the three smaller corpora pass one costs no more than reading the file: `std` in 9.5s rather than 133s. |
@@ -90,7 +90,9 @@ export.
 ## Tests
 
 The arena corpus lives in `refs/tests/` (extracted from `refs/tests.tar.gz`),
-laid out as `good/*.ndjson` and `bad/*.ndjson`:
+laid out as `good/*.ndjson`, `bad/*.ndjson` and `either/*.ndjson` — the last for
+the cases the arena itself scores `outcome: either`, where a verdict is demanded
+but not a particular one:
 
 ```
 bash tools/run-tests.sh                 # 193/193
@@ -125,25 +127,32 @@ All four, through the resource half of the run line the arena entry uses —
 `--mem=4000 -j8 +RTS -A32m -M13g`; the entry also passes
 `--enforce-mutual-univ`, which no export gives anything to do — on a GCP `n2`
 instance with 64 cores and other work on it. The memory column is the largest of
-three runs and does not care what else the box is doing; wall clock under load
-is worth about ±20%.
+three or four runs and does not care what else the box is doing; the `-j8` clock
+is the *best* of the same runs, because the box was carrying load averages
+between 20 and 110 throughout and a loaded run only ever reads slow.
 
 | corpus | declarations | verdict | `-j8` | anonymous | mapped file | `-j1` |
 | --- | --- | --- | --- | --- | --- | --- |
-| `init.ndjson` (325 MB) | 53,093 | ACCEPT | 18s | 0.84 GB | 0.33 GB | 1m 19s |
-| `std.ndjson` (552 MB) | 90,778 | ACCEPT | 34s | 1.88 GB | 0.56 GB | 2m 37s |
-| `cslib.ndjson` (2.1 GB) | 370,939 | ACCEPT | 2m 10s | 4.47 GB | 2.15 GB | 10m 03s |
-| `mathlib.ndjson` (5.6 GB) | 654,504 | ACCEPT | 11m 37s | 12.87 GB | 5.64 GB | 50m 22s |
+| `init.ndjson` (325 MB) | 53,093 | ACCEPT | 19s | 0.76 GB | 0.33 GB | 1m 12s |
+| `std.ndjson` (552 MB) | 90,778 | ACCEPT | 35s | 1.83 GB | 0.56 GB | 2m 15s |
+| `cslib.ndjson` (2.1 GB) | 370,939 | ACCEPT | 2m 25s | 3.80 GB | 2.15 GB | 16m 03s |
+| `mathlib.ndjson` (5.6 GB) | 654,504 | ACCEPT | 8m 07s | 8.61 GB | 5.64 GB | 55m 22s |
 
 Two memory columns because only one of them is a requirement. The export is
 mapped rather than read, so its pages are clean and file-backed: resident on a
 machine with room, and handed straight back on one without. What has to fit is
 the anonymous column. The last column is the same check on one thread with the
-compiled-in defaults instead of the flags above, for scale — and only for scale,
-since with no ceiling on it the same `mathlib` run wants 19.0 GB.
+compiled-in defaults instead of the flags above, for scale — and only for scale:
+it is one run each, taken while the box was busiest, and with no ceiling on it
+the same `mathlib` run wants 7.01 GB.
 
-Only `mathlib` is anywhere near the ceiling, and that is the point of writing
-the limit down as a ceiling rather than as a collection ratio. An earlier
+Three of those four are read-bound at `-j8` and their clocks have not moved in a
+long time. `mathlib` is the one that is not, and it is where sealing proof bodies
+(SPEC §12.10) landed: that row read 11m 37s and 12.87 GB before it, and 19.0 GB
+in the `-j1` column.
+
+Nothing is near the ceiling any more, but the run line still names one rather
+than a collection ratio, and that is deliberate. An earlier
 version of this run line added `-F1.3`, which holds the heap to 1.3 times the
 live set everywhere; repeated interleaved runs put that at 26% of `mathlib`'s
 wall clock for a peak indistinguishable from the default's, because near `-M`
@@ -163,19 +172,23 @@ page and the parser touches every one of them. The other quarter is
 when an index is finished with.
 
 What it buys is the last row of the table: `mathlib` used to want 25 GB and now
-wants 12.9, which on a 16 GB runner is the difference between a verdict and
-none. A later pass over the checker's own representations (SPEC §11.8) took a
-further 17.6% off the live set behind that figure, which is what the `-j1`
-column shows and the `-j8` one does not: under `-M13g` the anonymous column is
-the ceiling talking, not the heap.
+wants 8.6, which on a 16 GB runner is the difference between a verdict and
+none. Two later passes did the rest — the checker's own representations (SPEC
+§11.8) took 17.6% off the live set, and sealing proof bodies (§12.10) took
+two thirds of what was left — and both show in the `-j1` column more plainly
+than in the `-j8` one, since under `-M13g` the anonymous column is partly the
+ceiling talking rather than the heap.
 
 One mathlib theorem —
 `AlgebraicGeometry.Scheme.exists_π_app_comp_eq_of_locallyOfFinitePresentation_of_isAffine`
-— accounts for 4m 27s of the single-threaded figure on its own. The next slowest
-takes 1m 01s, and only five declarations in the whole export take longer than 20
-seconds. It is almost certainly also the memory spike described below: that
-lasts four minutes and comes at the very end, which is where a declaration this
-much slower than the rest would still be running when everything else is done.
+— used to account for 4m 27s of the single-threaded figure on its own, against
+1m 01s for the next slowest and 20 seconds for all but five declarations in the
+export. It was also the memory spike described below, which lasted four minutes
+and came at the very end, exactly where a declaration that much slower than the
+rest would still be running once everything else was done. Both were the same
+thing: what it spent that time on was unfolding the proofs its statement
+mentions. Since §12.10 sealed those, a `--progress=20` run over the whole export
+on one thread names **no declaration at all**.
 
 ### Submitting to the arena
 
@@ -211,9 +224,9 @@ the four exports. The other divergences of §12 get no such switch here:
 `--nat-accel=always` would match official Lean's name-keyed arithmetic but is
 unsound on purpose and exists for differential testing, `--pin-std` is an extra
 audit that can only reject more than official Lean rather than less, and
-`--keep-proofs` would close a false-reject no corpus has ever exhibited at the
-cost of keeping every `mathlib` proof body, which is exactly what does not fit
-in the runner.
+`--keep-proofs` would close one false-reject — `subject-reduction-redex`, which
+the arena scores `either` anyway — at the cost of keeping every `mathlib` proof
+body, which is most of what this run line exists to fit.
 
 The rest of the run line is all about that 16 GB, and all about `mathlib`. `-M`
 is a limit rather than a wish: over it the checker prints `DECLINE` and exits 2
@@ -225,11 +238,15 @@ generation in place instead of copying it, and as the heap approaches `-M` it
 reins in how far ahead of the live set the heap is allowed to run before that
 generation is collected. So the squeeze applies itself where it is needed and
 nowhere else. It used to be worth eight gigabytes on `mathlib` — 12.8 GB under
-`-M13g` against 21.1 with the limit raised out of reach — and since SPEC §11.8
-it is worth the spread instead: three runs with the limit out of reach peak at
-12.5, 13.0 and 15.1 GB, and under `-M13g` every run lands at 12.9 or below, in
-the same time to within a per cent. `init`, `std` and `cslib` never come near it
-and are collected at the fast default throughout. `--mem=4000` is the checker's
+`-M13g` against 21.1 with the limit raised out of reach — and since SPEC §11.8 it
+was worth the spread instead: three runs with the limit out of reach peaked at
+12.5, 13.0 and 15.1 GB against 12.9 or below under `-M13g`, in the same time to
+within a per cent. Since §12.10 it is worth nothing at all: interleaved,
+`-M13g` peaks at 8.53 and 8.06 GB and `-M30g` at 8.44 and 8.61, in the same time
+again. It stays because what it bounds is the run that goes wrong — over the
+limit the checker says `DECLINE` and exits, which is a resource limit reported as
+one. `init`, `std` and `cslib` never came near it and are collected at the fast
+default throughout, and `mathlib` no longer does either. `--mem=4000` is the checker's
 own budget, below. `-Mgrace=256m` is built into the binary, so it applies
 whenever `-M` does: it is the room the overflow handler needs in order to speak,
 the default 1M being gone before the exception is even delivered when eight
@@ -246,15 +263,17 @@ judgement about the file.
 Nothing is declined, and the table above is that run line.
 
 `mathlib` is the whole reason the flags are the flags, and its difficulty is one
-declaration. A heap census (SPEC §11.8) shows the live set
-flat under 3 GB for three quarters of an hour and then more than tripling to
-9.6 GB in the last few minutes before collapsing back — and doing exactly the
-same thing, to within six per cent of the same height, on one thread. So it is not eight obligations landing at once and no
-amount of throttling gets under it; it is one theorem's memo tables. `--mem` is
-a budget on the live set that halves how many threads may work when a major
-collection finds more than that alive and gives a thread back when one finds
-comfortably less, which is what keeps the other seven from piling on top of that
-declaration. It is never reached on the other three corpora.
+declaration. A heap census (SPEC §11.8) showed the live set flat under 3 GB for
+three quarters of an hour and then more than tripling to 9.6 GB in the last few
+minutes before collapsing back — and doing exactly the same thing, to within six
+per cent of the same height, on one thread. So it was not eight obligations
+landing at once and no amount of throttling was going to get under it; it was
+one theorem's memo tables, and those tables were full of the reduced forms of
+proofs. Sealing them (§12.10) takes that peak to 3.1–3.4 GB. `--mem` is a budget
+on the live set that halves how many threads may work when a major collection
+finds more than that alive and gives a thread back when one finds comfortably
+less, which is what kept the other seven from piling on top of that declaration.
+It is now barely reached on `mathlib` either.
 
 ## Layout
 

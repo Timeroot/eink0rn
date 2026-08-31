@@ -2635,7 +2635,27 @@ The `-j8` census is the same graph — flat under 3 GB, then 3.07 → 4.08 → 5
 6.30 → 7.43 → 8.50 → 9.61 GB, 70.2% of it `XApp`. The two runs peak within six
 per cent of each other, so the spike is **one declaration**, not eight at once,
 and no amount of throttling gets under it.
-That also disposes of the first version of `--mem`, which was a gate on
+
+**And the memo table was full of proofs.** The paragraphs above are what the
+census said before §12.10 sealed theorem values unconditionally; the conclusion
+they draw is right and the lever it implies was the wrong one. What that
+declaration was memoising was the reduced forms of the *proofs* its statement
+mentions, and against an axiom there is nothing to reduce. Sealing therefore does
+what bounding the tables was supposed to do, without a cache policy and without
+the risk that the obligation whose table gets dropped is most of a pass. Two
+interleaved rounds on `mathlib`, `-hT -i10` under the arena's flags:
+
+| | keeping proofs | sealing them |
+| --- | --- | --- |
+| peak live | 9827, 9683 MB | 3445, 3064 MB |
+| of which `XApp` | 70.3% | 50.1% |
+| max residency (`-s`) | 10.10, 9.96 GB | 3.57, 3.33 GB |
+| bytes allocated | 1708.20, 1708.14 GB | 1571.09, 1571.07 GB |
+| total CPU | 4479, 4563 s | 3202, 3196 s |
+
+The spike is still one declaration and still at the end; it is a third the height.
+
+The census also disposes of the first version of `--mem`, which was a gate on
 *starting*: a thread that waits while the live set is over the budget stops the
 ninth obligation and not the eight already running, and the memory belongs to
 the ones already running. Measured, it moved `mathlib`'s peak by three per cent
@@ -2773,9 +2793,10 @@ applies exactly as much squeeze as the ceiling needs and none below: on the code
 of the table above, the same run with `-M30g` takes 21.07 GB and 799s and with
 `-M13g` takes 12.85 GB and 864s. Eight per cent of `mathlib`, nothing at all of
 the other three, and no number in the run line that has to be re-tuned per
-corpus. On the code as it now stands the squeeze is smaller and free, for the
-reason just given, and the flag stays because what it bounds is the worst run
-and not the average one.
+corpus. Since §12.10 the squeeze is not merely smaller but absent — interleaved,
+`-M13g` peaks at 8.53 and 8.06 GB and `-M30g` at 8.44 and 8.61, in the same time
+— and the flag stays for the run that goes wrong rather than the average one:
+over the limit the checker declines and says so, instead of being killed.
 
 The same policy can be written from below instead, and it was tried: `-O` sets a
 minimum size for the oldest generation, which is collected at whichever of `-O`
@@ -2896,7 +2917,7 @@ Recorded so that a disagreement with official Lean can be diagnosed rather than
 patched. §12.1 is the part of the kernel that is *not* name-blind, and how each
 name is earned; §12.2 onwards are places where `eink0rn` knowingly answers
 differently from official Lean, in both directions: §12.2, §12.14 and half of
-§12.6 accept more, §12.3, §12.4 and §12.7–§12.9 accept less.
+§12.6 accept more, §12.3, §12.4, §12.7–§12.9 and §12.10 accept less.
 
 ### 12.1 Names with meaning
 
