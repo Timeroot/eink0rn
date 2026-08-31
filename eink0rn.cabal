@@ -38,7 +38,11 @@ library
                     , containers
                     , array
                     , mtl
-    default-language: Haskell2010
+    -- GHC2021, not Haskell2010: `tools/arena-build.sh` builds with a bare
+    -- `ghc --make`, whose default language is GHC2021, and the two must agree or
+    -- the binary the arena runs is not the binary `cabal build` tests.  Nothing
+    -- here wants an extension GHC2021 does not already have.
+    default-language: GHC2021
 
 executable eink0rn
     import:           warnings
@@ -69,4 +73,4 @@ executable eink0rn
     -- statistics without the report; the cost is a few words per collection.
     ghc-options:      -threaded -rtsopts
                       "-with-rtsopts=-K512m -A1g -Mgrace=256m -T"
-    default-language: Haskell2010
+    default-language: GHC2021

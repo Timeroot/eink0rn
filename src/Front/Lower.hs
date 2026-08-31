@@ -7,7 +7,7 @@
 -- erased (binder annotations, @mdata@) or compiled away:
 --
 -- * @thm@ becomes a definition -- the kernel has no notion of a theorem -- and
---   then, where 'proofErasable' allows, an axiom;
+--   then, its value having been checked, an axiom;
 -- * @opaque@ is checked and then becomes an axiom, since it must not unfold;
 -- * reducibility hints survive as the unfolding order of 'defPriority', which
 --   is advice and cannot be anything else;
@@ -54,10 +54,10 @@ import           Kernel.Name
 data Config = Config
   { cfgAccel :: !AccelMode
   , cfgSealProofs :: !Bool
-    -- ^ Throw a theorem's value away once it has been checked, whenever
-    -- 'proofErasable' says no reduction could ever ask for it again.  On by
+    -- ^ Throw every theorem's value away once it has been checked.  On by
     -- default: it takes the question of whether to unfold a proof off the table
-    -- entirely, for all but a handful of propositions.  See SPEC.md §12.10.
+    -- entirely, and a proof body is the largest thing a Lean file is made of.
+    -- See SPEC.md §12.10.
   , cfgMutUniv :: !Bool
     -- ^ Reject a mutual inductive block whose types do not all land in the same
     -- universe, as every other Lean kernel does.  Off by default: the block is
@@ -299,7 +299,7 @@ defLike :: LS -> Name -> [Name] -> Expr -> Expr -> Hint -> DeclKind
 defLike st n lps ty val hint kind = do
   checkLevelParams lps
   barrier (lsEnv st) [ty, val]
-  (spent, lic) <- runTCLearn (lsEnv st) lps $ do
+  ((), lic) <- runTCLearn (lsEnv st) lps $ do
     when warming warmLicences
     -- Deferred, the statement is not checked here either: 'assumedSortOf' says
     -- which sort it will live in, which is all the environment wants, and
@@ -316,15 +316,11 @@ defLike st n lps ty val hint kind = do
         throwTC ("theorem statement is not a proposition: it lives in Sort "
                  ++ showLevel sort)
     unless (lsDefer st) $ checkType val ty
-    -- Asked in the same run as the check, so it reuses its memo tables; asked
-    -- of the /statement/, so it costs a head normalisation and nothing more.
-    -- Which is also why deferring disturbs neither this nor the test above it,
-    -- and so does not disturb which constants the environment ends up holding:
-    -- both are questions about the statement, and the statement is here.
-    if kind == IsThm && isDefinitelyZero sort
-      then proofErasable ty
-      else pure False
-  let sealed = kind == IsOpaque || (spent && lsSeal st)
+  -- Nothing about the value is consulted: a theorem's statement is a
+  -- proposition, the test above has just said so, and that alone is what
+  -- licenses throwing the proof away (SPEC.md §12.10).  Deferring therefore
+  -- does not disturb which constants the environment ends up holding.
+  let sealed = kind == IsOpaque || (kind == IsThm && lsSeal st)
       info | sealed    = CAxiom n lps ty
            | otherwise = CDef DefInfo { defName   = n
                                       , defLevels = lps

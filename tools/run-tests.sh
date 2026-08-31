@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Run eink0rn over a corpus laid out as <root>/good/**.ndjson and <root>/bad/**.ndjson.
+# Run eink0rn over a corpus laid out as <root>/good/**.ndjson, <root>/bad/**.ndjson
+# and <root>/either/**.ndjson -- the last for cases the arena itself scores
+# `outcome: either`, where any verdict but a hang or a crash is correct.
 #
 #   tools/run-tests.sh [root] [-v] [-t seconds] [filter]
 #
@@ -35,11 +37,17 @@ check() {  # $1 = file, $2 = expected verdict
   err=$(mktemp)
   got=$(timeout "$TIMEOUT" "$BIN" "$f" 2>"$err"); rc=$?
   if [ $rc -eq 124 ]; then got="TIMEOUT"; fi
-  if [ "$got" = "$want" ]; then
+  # An EITHER case wants a verdict, not a particular one: rc 0 or 1, never a
+  # timeout (124) and never the checker declining to answer (2, 3).
+  if [ "$got" = "$want" ] || { [ "$want" = EITHER ] && [ $rc -lt 2 ]; }; then
     pass=$((pass+1))
-    if [ $VERBOSE -eq 1 ]; then printf '  ok   %-60s %s\n' "${f#"$ROOT"/}" "$got"; fi
+    # Which way an EITHER case fell is the whole of what it tells you, so say so
+    # even without -v.
+    if [ $VERBOSE -eq 1 ] || [ "$want" = EITHER ]; then
+      printf '  ok   %-60s %s\n' "${f#"$ROOT"/}" "$got"
+    fi
     # A rejection is only interesting if it is for the right reason; print it.
-    if [ $VERBOSE -eq 1 ] && [ "$want" = REJECT ]; then
+    if [ $VERBOSE -eq 1 ] && [ "$got" = REJECT ]; then
       sed 's/^/         /' "$err" | head -3
     fi
   else
@@ -51,8 +59,8 @@ check() {  # $1 = file, $2 = expected verdict
   rm -f "$err"
 }
 
-for want in ACCEPT REJECT; do
-  case $want in ACCEPT) dir=good ;; REJECT) dir=bad ;; esac
+for want in ACCEPT REJECT EITHER; do
+  case $want in ACCEPT) dir=good ;; REJECT) dir=bad ;; EITHER) dir=either ;; esac
   [ -d "$ROOT/$dir" ] || continue
   echo "== $ROOT/$dir (expect $want)"
   while IFS= read -r f; do

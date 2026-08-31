@@ -710,7 +710,6 @@ flattenCore env0 ctxt disp members paramTele lvls nps hint privRoot = do
                   , indNumIndices  = ni
                   , indCtors       = map fst (cmCtors m)
                   , indIsRecursive = selfRec m
-                  , indLargeElim   = wantLarge
                   , indK           = False
                   }
         | (m, ni) <- zip members nIdxs ]

@@ -54,11 +54,10 @@ data IndInfo = IndInfo
   , indNumIndices  :: !Int
   , indCtors       :: ![Name]     -- ^ in constructor-index order
   , indIsRecursive :: !Bool       -- ^ does some member of the block occur in a field?
-  , indLargeElim   :: !Bool       -- ^ may the recursor eliminate into any @Sort@?
   , indK           :: !Bool
     -- ^ does its recursor get K-like reduction?  The same flag as 'recK', kept
     -- here so that a question about a /type/ can be answered without first
-    -- finding the recursor that eliminates it; see 'Kernel.Check.proofErasable'.
+    -- finding the recursor that eliminates it; see "Front.Hetero".
   } deriving (Eq, Show)
 
 data CtorInfo = CtorInfo

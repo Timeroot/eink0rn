@@ -138,7 +138,6 @@ admit ci = do
         , indNumIndices  = length idxTele
         , indCtors       = map csName shapes
         , indIsRecursive = any (any (isRecField . cfRec) . csFields) shapes
-        , indLargeElim   = largeElim
         , indK           = kLike
         }
       ctorInfos =
