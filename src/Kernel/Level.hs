@@ -25,6 +25,7 @@ module Kernel.Level
   , substLevel
   , instLevelParams
   , levelParamsOf
+  , levelGround
   , levelHash
   , showLevel
   ) where
@@ -41,6 +42,20 @@ data Level
   | LIMax  !Level !Level
   | LParam !Name
   deriving (Eq, Ord)
+
+-- | Does this level mention no parameter at all?
+--
+-- @null . 'levelParamsOf'@ answers the same question and allocates a list and a
+-- 'nub' to do it.  This one is asked at every 'Kernel.Expr.Sort' and
+-- 'Kernel.Expr.Const' that is built, which is tens of millions of times a run,
+-- so it may not allocate.
+levelGround :: Level -> Bool
+levelGround l = case l of
+  LZero     -> True
+  LSucc a   -> levelGround a
+  LMax  a b -> levelGround a && levelGround b
+  LIMax a b -> levelGround a && levelGround b
+  LParam _  -> False
 
 -- | A structural hash.  Levels are small, so this is recomputed rather than
 -- cached; it exists so that 'Kernel.Expr.Expr' can cache a hash of its own.

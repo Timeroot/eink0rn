@@ -282,7 +282,7 @@ checkDecl st d = case d of
                       checkInductive (lsMutUniv st) (lsEnv st) types ctors recs
     pure st { lsEnv = env' }
   where
-    run lps act = either Left (const (Right ())) (runTC (lsEnv st) lps act)
+    run lps act = either Left (const (Right ())) (runTCMain (lsEnv st) lps act)
 
 -- | Which of the three value-carrying declaration kinds this is: what its
 -- statement has to say, and what becomes of its value once that value has been
@@ -346,7 +346,7 @@ defLike st n lps ty val hint kind = do
     -- tables, and the second is not attempted when the first has failed -- a
     -- value checked against a type nobody has read is a comparison against
     -- whatever the export happened to write down.
-    obs | lsDefer st = Obligation n (label (runTC (lsEnv st) lps
+    obs | lsDefer st = Obligation n (label (runTCMain (lsEnv st) lps
                                              (inferSortOf ty >> checkType val ty)))
                          : lsObs st
         | otherwise  = lsObs st
@@ -373,7 +373,7 @@ defLike st n lps ty val hint kind = do
 quarantine :: LS -> Name -> [Name] -> Expr -> Maybe Expr -> Either String LS
 quarantine st n lps ty mval = do
   checkLevelParams lps
-  _ <- runTC (lsEnv st) lps (inferSortOf ty)
+  _ <- runTCMain (lsEnv st) lps (inferSortOf ty)
   env' <- addConst (lsEnv st) (CAxiom n lps ty)
   pure st { lsEnv    = env' { envUnsafe = S.insert n (envUnsafe env') }
           , lsUnsafe = maybe id (\v -> ((n, lps, ty, v) :)) mval (lsUnsafe st) }
@@ -406,7 +406,7 @@ quarantine st n lps ty mval = do
 checkQuarantined :: Env -> (Name, [Name], Expr, Expr) -> Either String ()
 checkQuarantined env (n, lps, ty, val) =
   either (Left . ((showName n ++ ": ") ++)) (const (Right ()))
-         (runTC env lps (checkType val ty))
+         (runTCMain env lps (checkType val ty))
 
 -- | An inductive block marked unsafe: every declared constant becomes an
 -- uninterpreted axiom of its declared type, quarantined.
@@ -429,7 +429,7 @@ quarantineBlock env0 types ctors recs =
     one env (n, lps, ty) = do
       checkLevelParams lps
       _ <- either (Left . ((showName n ++ ": ") ++)) Right
-             (runTC env lps (inferSortOf ty))
+             (runTCMain env lps (inferSortOf ty))
       env' <- addConst env (CAxiom n lps ty)
       pure env' { envUnsafe = S.insert n (envUnsafe env') }
 
@@ -973,7 +973,7 @@ admitQuot st (QuotD kind n lps ty _) = do
           , lsQuotMk = if kind == QCtor then Just n else lsQuotMk st
           , lsQuots  = (kind, n) : lsQuots st }
   where
-    run act = either Left (const (Right ())) (runTC (lsEnv st) lps act)
+    run act = either Left (const (Right ())) (runTCMain (lsEnv st) lps act)
 
 -- | The quotient package is one extension to the theory, not four independent
 -- constants, and it is admitted whole or not at all.

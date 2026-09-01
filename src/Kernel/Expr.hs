@@ -53,6 +53,7 @@ module Kernel.Expr
   -- * Queries
   , hasLooseBVars
   , looseBVarRange
+  , groundE
   , occursConst
   , constsMeeting
   , instLevelsE
@@ -92,14 +93,15 @@ instance Show Binder where show (Binder n) = showName n
 
 -- | The real representation.  @X@-prefixed constructors are private.
 --
--- The leading @Int@ is the node's cached hash, except on the five constructors
--- that can contain a bound variable, where it is a hash and a
--- 'looseBVarRange' packed into the one word: the range in the low
--- 'rangeBits', the hash above it.  Both caches are wanted on every one of those
--- nodes and neither needs a full word, and an @Expr@ is what a run of this
--- kernel is almost entirely made of -- @XApp@ alone is 38% of the live heap at
--- @std@'s peak and 70% of it at @mathlib@'s -- so the word saved is worth the
--- shift.  See 'mkHR'.
+-- The leading @Int@ is the node's caches, packed.  On the five constructors
+-- that can contain a bound variable it is a 'looseBVarRange' in the low
+-- 'rangeBits', a 'groundE' bit above that, and the hash above that; on 'XSort'
+-- and 'XConst' it is a 'groundE' bit and the hash above it, those two having no
+-- range to keep; on the rest it is a bare hash.  Every one of those caches is
+-- wanted on every node that has it and none needs a full word, and an @Expr@ is
+-- what a run of this kernel is almost entirely made of -- @XApp@ alone is 38%
+-- of the live heap at @std@'s peak and 70% of it at @mathlib@'s -- so the words
+-- saved are worth the shift.  See 'mkHR' and 'groundE'.
 data Expr
   = XBVar !Int                                  -- ^ de Bruijn index
   | XFVar !Int                                  -- ^ local constant (checker-internal)
@@ -116,7 +118,8 @@ data Expr
 -- | How many low bits of a packed word hold the range.
 --
 -- Sixteen million binders deep is not a term any exporter emits, and the
--- remaining forty bits are more hash than the caches can use: they are only
+-- thirty-nine bits left over the range and the 'groundBit' are more hash than
+-- the caches can use: they are only
 -- ever a filter in front of a structural test and an index into a table, so a
 -- collision costs a comparison and never an answer.  The width is nonetheless
 -- not load-bearing -- 'looseBVarRange' is exact at every width, because a range
@@ -126,6 +129,16 @@ rangeBits = 24
 
 rangeMask :: Int
 rangeMask = (1 `shiftL` rangeBits) - 1
+
+-- | The bit, just above the range, that says a node is 'groundE'.
+--
+-- On the five packed constructors.  The two other nodes that can fail to be
+-- ground -- 'Sort' and 'Const', which carry levels -- have no range to pack
+-- beside, so they keep the answer in the /low/ bit of their word and their hash
+-- above it; 'exprHash' shifts it back off.  The remaining four are ground by
+-- construction or, in 'FVar'\'s case, never.
+groundBit :: Int
+groundBit = 1 `shiftL` rangeBits
 
 -- | The stored range meaning \"at least this, and the exact figure was not
 -- representable\".  Reaching it costs a traversal and nothing else.
@@ -140,9 +153,39 @@ satRange = rangeMask
 -- exactly the bits every table here indexes on.  Shifting them out and handing
 -- back bits 24 and up is therefore not merely lossless where it matters, it is
 -- an improvement on what the tables saw before.
-mkHR :: Int -> Int -> Int
-mkHR h r = (h .&. complement rangeMask) .|. (if r < satRange then r else satRange)
+mkHR :: Int -> Int -> Bool -> Int
+mkHR h r g = (h .&. complement (rangeMask .|. groundBit))
+             .|. (if g then groundBit else 0)
+             .|. (if r < satRange then r else satRange)
 {-# INLINE mkHR #-}
+
+-- | No 'FVar', and no universe parameter in any level.
+--
+-- Constant time: every node that could fail it caches the answer, and the rest
+-- cannot fail it.  It is the condition under which a reduct may be remembered
+-- past the declaration that computed it, in "Kernel.GMemo": an 'FVar'
+-- identifier means a different local in every checking episode, and a level
+-- parameter means a different parameter in every declaration, so a term
+-- mentioning either is only about the episode it was built in.  A term
+-- mentioning neither means the same thing everywhere.
+--
+-- Bound variables do not disqualify a node.  A 'BVar' is positional and a
+-- binder that encloses it travels with it, so a 'Lam' over a body that mentions
+-- @'BVar' 0@ is as ground as a closed constant.
+groundE :: Expr -> Bool
+groundE e = case e of
+  XBVar _         -> True
+  XFVar _         -> False
+  XSort h _       -> h .&. 1 /= 0
+  XConst h _ _    -> h .&. 1 /= 0
+  XApp hr _ _     -> hr .&. groundBit /= 0
+  XLam hr _ _ _   -> hr .&. groundBit /= 0
+  XPi  hr _ _ _   -> hr .&. groundBit /= 0
+  XLet hr _ _ _ _ -> hr .&. groundBit /= 0
+  XProj hr _ _ _  -> hr .&. groundBit /= 0
+  XNatLit _ _     -> True
+  XStrLit _ _     -> True
+{-# INLINE groundE #-}
 
 -- | The range a packed node stores, saturation and all.  Used where the answer
 -- is about to be packed again, so that a saturated child keeps its parent
@@ -207,13 +250,13 @@ exprHash :: Expr -> Int
 exprHash e = case e of
   XBVar i          -> hashMix 2 i
   XFVar i          -> hashMix 4 i
-  XSort h _        -> h
-  XConst h _ _     -> h
-  XApp hr _ _      -> hr `shiftR` rangeBits
-  XLam hr _ _ _    -> hr `shiftR` rangeBits
-  XPi  hr _ _ _    -> hr `shiftR` rangeBits
-  XLet hr _ _ _ _  -> hr `shiftR` rangeBits
-  XProj hr _ _ _   -> hr `shiftR` rangeBits
+  XSort h _        -> h `shiftR` 1
+  XConst h _ _     -> h `shiftR` 1
+  XApp hr _ _      -> hr `shiftR` (rangeBits + 1)
+  XLam hr _ _ _    -> hr `shiftR` (rangeBits + 1)
+  XPi  hr _ _ _    -> hr `shiftR` (rangeBits + 1)
+  XLet hr _ _ _ _  -> hr `shiftR` (rangeBits + 1)
+  XProj hr _ _ _   -> hr `shiftR` (rangeBits + 1)
   XNatLit h _      -> h
   XStrLit h _      -> h
 
@@ -404,12 +447,14 @@ pattern FVar i = XFVar i
 
 pattern Sort :: Level -> Expr
 pattern Sort l <- XSort _ l
-  where Sort l = XSort (h1 13 (levelHash l)) l
+  where Sort l = XSort (h1 13 (levelHash l) `shiftL` 1
+                        .|. (if levelGround l then 1 else 0)) l
 
 pattern Const :: Name -> [Level] -> Expr
 pattern Const n ls <- XConst _ n ls
   where Const n ls = XConst (foldl (\h l -> hashMix h (levelHash l))
-                                   (h1 19 (nameHash n)) ls) n ls
+                                   (h1 19 (nameHash n)) ls `shiftL` 1
+                             .|. (if all levelGround ls then 1 else 0)) n ls
 
 pattern NatLit :: Integer -> Expr
 pattern NatLit n <- XNatLit _ n
@@ -422,28 +467,32 @@ pattern StrLit s <- XStrLit _ s
 pattern App :: Expr -> Expr -> Expr
 pattern App f a <- XApp _ f a
   where App f a = XApp (mkHR (h2 31 (exprHash f) (exprHash a))
-                             (max (rawRange f) (rawRange a))) f a
+                             (max (rawRange f) (rawRange a))
+                             (groundE f && groundE a)) f a
 
 pattern Lam :: Binder -> Expr -> Expr -> Expr
 pattern Lam n t b <- XLam _ n t b
   where Lam n t b = XLam (mkHR (h2 37 (exprHash t) (exprHash b))
-                               (max (rawRange t) (rawUnder b))) n t b
+                               (max (rawRange t) (rawUnder b))
+                               (groundE t && groundE b)) n t b
 
 pattern Pi :: Binder -> Expr -> Expr -> Expr
 pattern Pi n t b <- XPi _ n t b
   where Pi n t b = XPi (mkHR (h2 41 (exprHash t) (exprHash b))
-                             (max (rawRange t) (rawUnder b))) n t b
+                             (max (rawRange t) (rawUnder b))
+                             (groundE t && groundE b)) n t b
 
 pattern Let :: Binder -> Expr -> Expr -> Expr -> Expr
 pattern Let n t v b <- XLet _ n t v b
   where Let n t v b =
           XLet (mkHR (h3 43 (exprHash t) (exprHash v) (exprHash b))
-                     (max (rawRange t) (max (rawRange v) (rawUnder b)))) n t v b
+                     (max (rawRange t) (max (rawRange v) (rawUnder b)))
+                     (groundE t && groundE v && groundE b)) n t v b
 
 pattern Proj :: Name -> Int -> Expr -> Expr
 pattern Proj s i b <- XProj _ s i b
   where Proj s i b = XProj (mkHR (h3 47 (nameHash s) i (exprHash b))
-                                 (rawRange b)) s i b
+                                 (rawRange b) (groundE b)) s i b
 
 {-# COMPLETE BVar, FVar, Sort, Const, App, Lam, Pi, Let, Proj, NatLit, StrLit #-}
 

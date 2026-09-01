@@ -9,6 +9,7 @@ module Kernel.Check
   , TCState (..)
   , runTC
   , runTCLearn
+  , runTCMain
   , throwTC
   -- * The judgements
   , infer
@@ -59,6 +60,7 @@ import           Kernel.Cache           (Budget, Cache, Chain (..), Counter,
 import           Kernel.Canon
 import           Kernel.Env
 import           Kernel.Expr
+import           Kernel.GMemo           (gmemoInsert, gmemoLookup)
 import           Kernel.Level
 import           Kernel.Name
 import           System.IO.Unsafe       (unsafePerformIO)
@@ -122,6 +124,12 @@ data TCState = TCState
   , tcCanonOk     :: !(IORef (Map Name Bool))  -- ^ cached 'canonIndMatches'
   , tcSortRes     :: !(IORef (Map Name (Maybe ([Name], Level))))
                              -- ^ cached 'resultUniverse'
+  , tcMain        :: !(IORef Bool)
+                             -- ^ is the environment this state is reading one of
+                             --   the main chain, so that a reduct found here
+                             --   keeps past the declaration?  See
+                             --   "Kernel.GMemo" for what turns on it, and
+                             --   'runTCMain' and 'withEnv' for who sets it.
   }
 
 -- | Start the four licence caches off from what the environment already knows,
@@ -541,14 +549,34 @@ instance Monad TC where
     Left e  -> pure (Left e)
     Right a -> unTC (k a) s
 
+-- | Check against an environment that may be anything at all -- in particular,
+-- one of the flattening's scratch environments, where a constant unfolds to
+-- something it does not unfold to anywhere else.
+--
+-- So the cross-declaration reduct table is /off/ here, and 'runTCMain' is the
+-- way to ask for it.  That is the safe polarity: a caller that should have said
+-- @Main@ and did not loses cache hits, and a caller that says it wrongly would
+-- lose soundness, so the wrong one must be the one you have to type.
 runTC :: Env -> [Name] -> TC a -> Either String a
-runTC env lps act = fst <$> runTCLearn env lps act
+runTC env lps act = fst <$> runTCOn False env lps act
+
+-- | 'runTC' against an environment on the main chain: the one that grows by
+-- 'Kernel.Env.addConst' from the start of the file to the end, and never
+-- otherwise.  See "Kernel.GMemo" for what that buys and why it is sound.
+runTCMain :: Env -> [Name] -> TC a -> Either String a
+runTCMain env lps act = fst <$> runTCOn True env lps act
 
 -- | 'runTC', also handing back the licences established along the way so that
 -- the caller can store them in the environment it carries to the next
 -- declaration.  See 'Licences' for why that is sound, and 'seedLicences'.
+--
+-- Only 'Front.Lower.defLike' calls this, and only on the main chain, which is
+-- why it does not need to be told.
 runTCLearn :: Env -> [Name] -> TC a -> Either String (a, Licences)
-runTCLearn env lps (TC f) = unsafePerformIO $ do
+runTCLearn = runTCOn True
+
+runTCOn :: Bool -> Env -> [Name] -> TC a -> Either String (a, Licences)
+runTCOn onMain env lps (TC f) = unsafePerformIO $ do
   inferV  <- newCache
   inferA  <- newCache
   whnfM   <- newCache
@@ -570,9 +598,10 @@ runTCLearn env lps (TC f) = unsafePerformIO $ do
   natOps  <- newIORef M.empty
   canonOk <- newIORef M.empty
   sortRes <- newIORef M.empty
+  onM     <- newIORef onMain
   let s = TCState genv locals nextId lvlPs budget credit starve
                   inferV inferA whnfM defEq closeM lvlM locId consts scope
-                  natOk strOk natOps canonOk sortRes
+                  natOk strOk natOps canonOk sortRes onM
   seedLicences env s
   r <- f s
   case r of
@@ -818,12 +847,19 @@ localInfo i = TC $ \s -> do
 --
 -- Put back on the failing path too, as 'lend' is and for the same reason: an
 -- error no longer carries the caller's state back with it.
+-- The reduct table is off for the duration, whatever the caller was: the
+-- environment being swapped in is by definition not the one this state was
+-- started on, and nothing here knows whether it is further up the same chain or
+-- off to one side.  Restored with the environment, on both paths.
 withEnv :: Env -> TC a -> TC a
 withEnv env (TC act) = TC $ \s -> do
-  old <- readIORef (tcEnv s)
+  old   <- readIORef (tcEnv s)
+  onOld <- readIORef (tcMain s)
   swapEnv env s
+  writeIORef (tcMain s) False
   r <- act s
   swapEnv old s
+  writeIORef (tcMain s) onOld
   pure r
 
 -- | Install an environment, throwing away everything that was an answer about
@@ -1007,12 +1043,17 @@ whnf e
   | not (reducible e) = whnfRaw e
   | otherwise         = lookupWhnf e >>= \case
       Just v  -> pure v
-      Nothing -> do
-        before <- starving
-        v      <- whnfRaw e
-        after  <- starving
-        when (before == after) (insertWhnf e v)
-        pure v
+      Nothing -> keptWhnf e >>= \case
+        Just v  -> do insertWhnf e v
+                      pure v
+        Nothing -> do
+          before <- starving
+          v      <- whnfRaw e
+          after  <- starving
+          when (before == after) $ do
+            insertWhnf e v
+            keepWhnf e v
+          pure v
   where
     -- A head that no rule applies to is its own normal form, and looking that
     -- up costs more than rediscovering it.
@@ -1046,6 +1087,27 @@ lookupWhnf e = TC $ \s -> do
 insertWhnf :: Expr -> Expr -> TC ()
 insertWhnf k v = TC $ \s -> do
   memoInsert (tcWhnf s) whnfKey k v
+  pure (Right ())
+
+-- | Ask the table that outlives the declaration.  See "Kernel.GMemo" for the
+-- three conditions, of which 'tcMain' is one and 'groundE' the other two.
+--
+-- A hit is copied into the episode's own memo by the caller, so the second ask
+-- for the same node costs a pointer test again rather than a hash and a
+-- structural comparison.
+keptWhnf :: Expr -> TC (Maybe Expr)
+keptWhnf e = TC $ \s -> do
+  onMain <- readIORef (tcMain s)
+  if not (onMain && groundE e) then pure (Right Nothing)
+                               else Right <$> gmemoLookup e
+
+-- | Offer it to that table.  The value has to be ground as well as the key: it
+-- is what a later episode would be handed, and a reduct that named this
+-- episode's locals would be a wrong answer there rather than a missing one.
+keepWhnf :: Expr -> Expr -> TC ()
+keepWhnf k v = TC $ \s -> do
+  onMain <- readIORef (tcMain s)
+  when (onMain && groundE k && groundE v) (gmemoInsert k v)
   pure (Right ())
 
 -- | 'whnf' takes no 'LEnv' -- it is only ever called on closed terms, since the

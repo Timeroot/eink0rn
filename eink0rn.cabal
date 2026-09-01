@@ -22,6 +22,7 @@ library
                       Kernel.Expr
                       Kernel.Env
                       Kernel.Cache
+                      Kernel.GMemo
                       Kernel.Canon
                       Kernel.Check
                       Kernel.Inductive
