@@ -2182,10 +2182,20 @@ than on its tree unfolding:
 Both are maintained by pattern synonyms, so nothing outside `Kernel.Expr` can set
 a cache to a lie.
 
+A third flag rides with them: whether the node is **ground**, meaning it contains
+neither a local constant nor a universe parameter. Nothing in the theory turns on
+it; it is the O(1) test that decides whether a reduct may be remembered past the
+declaration that found it, and §11.4 is where that matters. It is maintained the
+same way and by the same synonyms — a node is ground when its children are, and a
+`Sort` or `Const` when its levels have no parameter — so asking costs one field
+read rather than a traversal.
+
 They share a word. On the five constructors that can contain a bound variable —
-the only ones where both caches are wanted — the range lives in the low 24 bits
-and the hash above it, which makes an application node four machine words rather
-than five and a `let` six rather than seven. That is not a bookkeeping detail on
+the only ones where both caches are wanted — the range lives in the low 24 bits,
+the ground flag in the next, and the hash above them, which makes an application
+node four machine words rather than five and a `let` six rather than seven. A
+`Sort` or a `Const` has no range to store, so the flag takes the low bit instead
+and the hash sits above it. That is not a bookkeeping detail on
 a corpus where application nodes are 38% of the live heap at `std`'s peak and
 70% of it at `mathlib`'s; §11.8 has what it was worth. Neither cache
 loses anything it was using: the bits the hash gives up are its low ones, which
@@ -2353,6 +2363,61 @@ Without these memos, inference and reduction run over the term's tree unfolding,
 which for a shared term is exponentially larger than the term. In practice the
 `whnf` memo is what makes arithmetic proofs finish at all: the same dictionary —
 `instHMul`, `instOfNat` — is reached from every operation in the expression.
+
+#### Reducts that outlive the declaration
+
+Every table above is made, used and dropped inside one call, and measurement says
+that is where nearly all of the reduction work goes: on `init` and `std`, 83–86%
+of the misses the `whnf` memo takes are on a term some earlier call already
+reduced. Capping and environment changes cost almost nothing by comparison — 37
+and 80 recomputations across whole files — so the declaration boundary is very
+nearly the only place a reduct is ever lost.
+
+So one table is kept across it, holding what a **ground** term reduces to. Three
+things could make a remembered reduct wrong somewhere else, and each is excluded
+rather than argued away.
+
+- **The environment.** A constant could unfold one way here and another there. It
+  cannot, along the chain of environments a file builds: a declaration is only
+  ever added to the environment, never changed, and a term is only well-formed in
+  an environment that already declares every constant it mentions. So a reduct
+  computed in `E` is the reduct in every `E' ⊇ E`. The environments that are *not*
+  on that chain are the scratch ones of §9.1 and §9.3, in which a block's members
+  unfold to the single container that replaced them; those are excluded by the
+  caller, which turns the table off for the whole of such a check.
+- **Local constants.** The counter that hands out locals restarts with each call,
+  so the same identifier names a different local in the next one and structural
+  matching on it would be unsound. Excluded by groundness.
+- **Universe parameters.** `u` names a different parameter in each declaration,
+  and reduction reaches inference — the iota rule infers the major premise's type
+  — which is where an undeclared one would be caught. Excluded by groundness too,
+  which is why the flag is about levels as well as locals. Asking for both rather
+  than only the locals costs 1,863 hits out of 4,259,606 on `init`, so the
+  cheaper predicate is also very nearly the free one.
+
+One thing does travel that is not excluded, and it costs nothing: the arithmetic
+licences of §6.5 are granted as the file goes by, so a term reduced early may have
+been unfolded where a later call would have computed it on bignums, and the
+answer handed back is `Nat.succ (Nat.add 2 2)` where the caller might have got
+`5`. Both are weak head normal forms of the same term reached by the rules of
+§6, which is the whole of what `whnf` promises, so a caller cannot be misled by
+the difference — only made to take another step. Licences are never withdrawn, so
+there is no traffic in the other direction.
+
+It is a fixed-size table, never resized and never rehashed, which is what makes
+it safe to share between the threads of §11.6 without a lock: the only races left
+are two threads writing one slot, which loses an entry, and a reader seeing the
+old chain or the new one, which are both chains. Neither can hand back a wrong
+reduct, and a lost entry costs a recomputation. Being fixed also bounds what it
+can hold, which matters because it is the one structure in the checker whose
+memory is not returned at the end of a declaration; and at half the live-set
+budget of §11.8 — long before any thread is taken away, since it is the only
+thing the checker holds that it does not need again — it is emptied outright.
+`init`, `std` and `cslib` never reach that line and keep their reducts for the
+whole run. `mathlib` crosses it in the stretch where its live set is what the
+memory ceiling has to fit, and gives them up there, which is where they were
+worth least anyway: a hard proof reduces terms full of local constants, and
+those are exactly the terms this table may not keep.
 
 ### 11.5 One local per binder occurrence
 

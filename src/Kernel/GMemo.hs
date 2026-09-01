@@ -114,37 +114,28 @@ gmemoInsert k v = do
   old <- unsafeRead table i
   unsafeWrite table i (GCons k v (capG (slotCap - 1) old))
 
--- | Forget everything, and say whether that was worth doing.
+-- | Forget everything.
 --
 -- Every other structure the run holds is something it will need again; this one
--- is the only pure luxury in it, so when the collector reports more alive than
--- the run is allowed it is the first thing to go.  @--mem@'s controller calls
--- this before it takes a thread away, because a thread is worth far more than
--- the reducts are: see 'Main.sample'.
---
--- The answer is whether the table gave up enough to be worth waiting a
--- collection to see the effect of.  Saying 'False' is what stops a table that
--- refills between two collections from sheltering the run from the controller
--- for ever: once the reducts are no longer where the memory went, the threads
--- go instead.
+-- is the only pure luxury in it, so it is the first thing to go when the run is
+-- using memory it may not have.  @--mem@'s controller calls this at half its
+-- budget, well below the point at which it starts taking threads away, because
+-- a thread is worth a share of the run and these reducts are worth a few per
+-- cent of its allocation: see @Main.sample@.
 --
 -- Racing with a reader is a miss and racing with a writer loses an entry, which
 -- is what the module header says about every other write here.
-gmemoRelease :: IO Bool
-gmemoRelease = go 0 0
+gmemoRelease :: IO ()
+gmemoRelease = go 0
   where
-    go :: Int -> Int -> IO Bool
-    go !i !n
-      | i >= slots = pure (n >= slots `div` 8)
+    go :: Int -> IO ()
+    go !i
+      | i >= slots = pure ()
       | otherwise  = do
           b <- unsafeRead table i
           case b of
-            GNil -> go (i + 1) n
-            _    -> do unsafeWrite table i GNil
-                       go (i + 1) (n + lenG b)
-    lenG b = case b of
-      GNil         -> 0 :: Int
-      GCons _ _ tl -> 1 + lenG tl
+            GNil -> go (i + 1)
+            _    -> unsafeWrite table i GNil >> go (i + 1)
 
 -- | At most @n@ more entries.  Hands back the chain it was given when that is
 -- already so, which is the common case and the one worth not copying.

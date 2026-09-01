@@ -284,6 +284,7 @@ src/Kernel/Level     universe levels, and the decision procedure for <=
 src/Kernel/Expr      terms: de Bruijn bound variables, named free variables
 src/Kernel/Env       the environment: five kinds of constant
 src/Kernel/Cache     the mutable hash table the memo tables are made of
+src/Kernel/GMemo     the one memo that outlives a declaration: ground reducts
 src/Kernel/Canon     stored canonical forms, for the arithmetic licence and --pin-std
 src/Kernel/Check     inference, reduction, and definitional equality
 src/Kernel/Inductive admitting one inductive family, and deriving its recursor

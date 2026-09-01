@@ -118,10 +118,12 @@ usage prog = unlines
   , "                     gigabytes, so N at once can cost N times that, and"
   , "                     this is what keeps a large file from wanting more"
   , "                     memory than the machine has: a major collection that"
-  , "                     finds more than this alive throws away the remembered"
-  , "                     reducts, and if that was not where the memory went it"
-  , "                     halves the number of threads allowed to work; one that"
-  , "                     finds comfortably less gives a thread back.  It costs time"
+  , "                     finds more than this alive halves the number of"
+  , "                     threads allowed to work, and one that finds"
+  , "                     comfortably less gives a thread back.  Half the figure"
+  , "                     is where the remembered reducts are thrown away, since"
+  , "                     they are the one thing here worth less than a thread."
+  , "                     It costs time"
   , "                     and never a verdict, and a file that never reaches"
   , "                     the figure is never throttled at all.  It is a bound"
   , "                     on how many run at once and so cannot bound a single"
@@ -592,12 +594,15 @@ withPipeline n cap budget body = do
 -- present, while a collection under it may be the pause before the next hard
 -- declaration.  The floor is one thread and the ceiling is the @-jN@ asked for.
 --
--- Over budget, the reduct table goes before a thread does.  A thread is the
--- run's throughput and the table is a convenience that pays for itself in
--- allocation; dropping the cheaper of the two first is the whole of the
--- ordering.  'Kernel.GMemo.gmemoRelease' answers whether it gave up enough to
--- be worth a collection, which is what keeps a table that refills quickly from
--- standing in front of the threads for ever.
+-- The reduct table goes at half the budget, long before any thread does.  The
+-- two are not comparable in what they cost to give up: a thread is a share of
+-- the run's throughput and "Kernel.GMemo" is worth a few per cent of its
+-- allocation, so there is no reason to wait for the threads' threshold before
+-- dropping it.  Half is where the corpora divide -- @std@ and @cslib@ never
+-- reach it and keep their reducts for the whole run, while @mathlib@ crosses it
+-- in the stretch where its live set is what the ceiling has to fit, and there
+-- the table is worth least anyway: what a hard proof reduces is full of local
+-- constants, which are the terms this table may not keep.
 sample :: Int -> Word64 -> IORef Int -> IORef (Word64, Word64) -> IO ()
 sample n budget allow seen = do
   s <- getRTSStats
@@ -609,10 +614,9 @@ sample n budget allow seen = do
     -- The mean over the collections since the last look, which for the usual
     -- case of one collection is that collection.
     let live = (total - total0) `div` (majors - majors0)
-    relief <- if live > budget then gmemoRelease else pure False
+    when (live > budget `div` 2) gmemoRelease
     modifyIORef' allow $ \a ->
-      if live > budget           then if relief then a
-                                                else max 1 (a - max 1 (a `div` 2))
+      if live > budget           then max 1 (a - max 1 (a `div` 2))
       else if live < easy budget then min n (a + 1)
       else a
   where
