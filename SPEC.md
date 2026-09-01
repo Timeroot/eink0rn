@@ -2414,10 +2414,14 @@ memory is not returned at the end of a declaration; and at half the live-set
 budget of §11.8 — long before any thread is taken away, since it is the only
 thing the checker holds that it does not need again — it is emptied outright.
 `init`, `std` and `cslib` never reach that line and keep their reducts for the
-whole run. `mathlib` crosses it in the stretch where its live set is what the
-memory ceiling has to fit, and gives them up there, which is where they were
-worth least anyway: a hard proof reduces terms full of local constants, and
-those are exactly the terms this table may not keep.
+whole run, which is where the table earns what it costs: 11.9%, 8.4% and 4.0% of
+allocation for 0.14, 0.17 and 0.24 GB of live set. `mathlib` crosses it early and
+repeatedly, so it spends the run filling a table between one collection and the
+next and losing it — which is worth 0.97% of its allocation, and is very nearly
+all this table can do for a file that size. Retiring it there instead of
+refilling it, so the run continues as it would have without one, was tried and is
+worse on both counts: 0.2% *more* allocation than no table at all, and a peak that
+measurement cannot separate from either of the other two.
 
 ### 11.5 One local per binder occurrence
 
