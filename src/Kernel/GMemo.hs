@@ -52,6 +52,7 @@
 module Kernel.GMemo
   ( gmemoLookup
   , gmemoInsert
+  , gmemoRelease
   ) where
 
 import           Data.Array.Base  (unsafeRead, unsafeWrite)
@@ -112,6 +113,38 @@ gmemoInsert k v = do
   let i = exprHash k .&. mask
   old <- unsafeRead table i
   unsafeWrite table i (GCons k v (capG (slotCap - 1) old))
+
+-- | Forget everything, and say whether that was worth doing.
+--
+-- Every other structure the run holds is something it will need again; this one
+-- is the only pure luxury in it, so when the collector reports more alive than
+-- the run is allowed it is the first thing to go.  @--mem@'s controller calls
+-- this before it takes a thread away, because a thread is worth far more than
+-- the reducts are: see 'Main.sample'.
+--
+-- The answer is whether the table gave up enough to be worth waiting a
+-- collection to see the effect of.  Saying 'False' is what stops a table that
+-- refills between two collections from sheltering the run from the controller
+-- for ever: once the reducts are no longer where the memory went, the threads
+-- go instead.
+--
+-- Racing with a reader is a miss and racing with a writer loses an entry, which
+-- is what the module header says about every other write here.
+gmemoRelease :: IO Bool
+gmemoRelease = go 0 0
+  where
+    go :: Int -> Int -> IO Bool
+    go !i !n
+      | i >= slots = pure (n >= slots `div` 8)
+      | otherwise  = do
+          b <- unsafeRead table i
+          case b of
+            GNil -> go (i + 1) n
+            _    -> do unsafeWrite table i GNil
+                       go (i + 1) (n + lenG b)
+    lenG b = case b of
+      GNil         -> 0 :: Int
+      GCons _ _ tl -> 1 + lenG tl
 
 -- | At most @n@ more entries.  Hands back the chain it was given when that is
 -- already so, which is the common case and the one worth not copying.
