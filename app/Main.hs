@@ -47,7 +47,7 @@ data PinMode = PinOff | PinWarn | PinError
 data Options = Options
   { optAccel    :: AccelMode
   , optSeal     :: Bool
-    -- ^ discard a theorem's value once it has been checked, where sound
+    -- ^ discard every theorem's value once it has been checked
   , optPin      :: PinMode
   , optMutUniv  :: Bool
     -- ^ reject a mutual inductive block whose types land in different universes
@@ -81,9 +81,8 @@ usage prog = unlines
   , "                       provided for comparison with kernels that do this"
   , ""
   , "  --keep-proofs      keep the value of every theorem after checking it."
-  , "                     By default a theorem whose statement no reduction"
-  , "                     rule could ever look inside becomes an axiom, and"
-  , "                     is never unfolded again"
+  , "                     By default a checked theorem becomes an axiom of its"
+  , "                     own statement and is never unfolded again"
   , ""
   , "  --pin-std=LEVEL    audit False, Eq, Iff, Nonempty, the quotient package"
   , "                     and the three axioms against their standard forms"

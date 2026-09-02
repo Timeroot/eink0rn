@@ -16,7 +16,6 @@ module Kernel.Check
   , inferSortOf
   , assumedSortOf
   , isDefEq
-  , proofErasable
   , whnf
   , whnfCore
   , ensurePi
@@ -2005,58 +2004,6 @@ tryProofIrrel t s = notAProof t >>= \no -> if no then pure False else
   if not (isDefinitelyZero l) then pure False else do
     ts <- inferOnly s
     isDefEq tt ts
-
--- | Given a proposition, may a proof of it be sealed once it has been checked?
---
--- A proof is used in exactly three ways.  It can be compared with another term,
--- it can be the major premise of a recursor, or it can be the target of a
--- projection.  The first never needs the proof's value: 'tryProofIrrel' settles
--- any comparison between two proofs from their /types/ alone, and a proof can
--- only ever be convertible with another proof.  So the question is whether iota
--- or a projection could get stuck on it, and that is a question about the
--- proposition, which is what this answers.
---
--- Three shapes of proposition are safe, and it is @Prop@ being what it is that
--- makes them so.  Write @C@ for the head of the conclusion, an inductive type.
---
--- [@C@ has no constructors] There is no iota rule to fire and no field to
---   project, so nothing can be waiting on the value.  (@False@, @Empty@.)
---
--- [@C@ does not admit large elimination] Then @C.rec@'s motive lands in @Prop@,
---   so every term a stuck @C.rec@ blocks is itself a proof, and proof
---   irrelevance answers for it.  A projection out of @C@ is in the same
---   position: 'inferProj' only admits one whose field is a proof, and a type
---   with a data field is exactly a type that does not eliminate largely.
---   (@Or@, @Exists@, @Nonempty@, @Nat.le@.)
---
--- [@C@ gets K-like reduction] 'toCtorWhenK' rebuilds the constructor
---   application from the major premise's /type/, so iota fires with the value
---   untouched.  (@Eq@, @HEq@, @True@.)
---
--- Everything else is kept, and one case in particular has to be: a @Prop@ that
--- eliminates largely /and/ has fields is one whose recursor needs to see a real
--- constructor before it can produce the data it promises.  @Acc@ is the
--- important one -- sealing a proof of @Acc r a@ would stop well-founded
--- recursion from unfolding -- and @And@, @Iff@ and @WellFounded@ are the same
--- shape.  Structure eta does not rescue them: it replaces the major premise
--- with @C.mk h.0 .. h.n@, whose fields are projections that are themselves
--- stuck on the value we would have thrown away.
---
--- Anything unrecognised -- a conclusion that is a variable, a quotient, a sort,
--- or a constant that whnf could not resolve -- is kept.
-proofErasable :: Expr -> TC Bool
-proofErasable = go (0 :: Int)
-  where
-    -- A telescope long enough to hit this is not one we need to be clever about.
-    go k _ | k > 256 = pure False
-    go k ty = whnf ty >>= \ty' -> case ty' of
-      Pi n dom body -> withLocal n dom $ \x -> go (k + 1) (instantiateBody x body)
-      _ -> case headOf ty' of
-        Const n _ -> lookupConstC n >>= \case
-          Just (CInd i) ->
-            pure (null (indCtors i) || not (indLargeElim i) || indK i)
-          _ -> pure False
-        _ -> pure False
 
 -- | Congruence for a spine whose head cannot be unfolded -- a local constant, a
 -- projection, an axiom, a constructor, an inductive type, a stuck recursor.

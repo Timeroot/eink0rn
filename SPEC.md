@@ -36,7 +36,7 @@ design; the whole point is that the core has fewer cases to get wrong.
 | --- | --- | --- |
 | binder annotations (`implicit`, `strictImplicit`, `instImplicit`) | erased | elaboration hints; no logical content |
 | `mdata` | erased | ditto |
-| `thm` | statement checked to be in `Prop`, proof checked, then **sealed as an axiom** where §12.10 says nothing can ever look inside it | the core has no theorems; the `Prop` requirement is the only thing lost, so it is checked here |
+| `thm` | statement checked to be in `Prop`, proof checked, then **sealed as an axiom** (§12.10) | the core has no theorems; the `Prop` requirement is the only thing lost, so it is checked here |
 | `opaque` | checked like a definition, then admitted as an **axiom** | it must not delta-unfold; an axiom is exactly a constant that does not |
 | reducibility hints | **kept**, as the delta-unfolding order of §7 step 6 (§12.11) | scheduling advice, and advice is all it can be: no ordering changes which terms are convertible |
 | safety flags (`isUnsafe`, `safety`) | **kept**: they select a quarantined fragment (§12.7) | an unsafe declaration skipped the termination check, so its type is not a claim the kernel can use |
@@ -71,7 +71,7 @@ change a verdict at all.
 | --- | --- | --- |
 | `--nat-accel=off\|canonical\|verified\|always` | `canonical` | how much evidence the arithmetic shortcuts of §6.5 demand before firing. `always` is unsound and exists only to reproduce other kernels' behaviour. |
 | `--pin-std=off\|warn\|error` | `off` | audit the standard constants against their stored forms (§12.5). Never affects soundness; `error` can reject files that are perfectly consistent. |
-| `--keep-proofs` | off | retain every proof term instead of sealing it (§12.10). A pure performance switch: the sealed and unsealed kernels accept exactly the same files. |
+| `--keep-proofs` | off | retain every proof term instead of sealing it (§12.10). Can only make the kernel accept more, never less; the corpora it changes the verdict on are named there. |
 | `--progress[=SECS]` | off | report on stderr as the file is checked, naming each declaration that took at least `SECS` seconds. |
 
 ---
@@ -2415,8 +2415,9 @@ premise does not enter the result.
 *One pass accepts ⟹ two do.* Write `Γ₀ ⊂ Γ₁ ⊂ …` for the constants the one-pass
 run enters. Suppose `Γₖ` is what pass one has entered too. The one-pass run
 checked `τₖ` in `Γₖ` and it passed, so pass one's assumed sort for `τₖ` is the
-real one, so the sealing decision and the `Sort 0` test on a theorem come out the
-same way, so pass one enters the same constant and `Γₖ₊₁` agrees. Pass one
+real one, so the `Sort 0` test on a theorem — which is also what licenses sealing
+its proof (§12.10) — comes out the same way, so pass one enters the same constant
+and `Γₖ₊₁` agrees. Pass one
 therefore reaches the end of the file, and every obligation it filed is a
 judgement the one-pass run made in the environment it made it in — and which
 held. So both accept.
@@ -2434,8 +2435,8 @@ does not describe. What that costs is bounded: reading a statement in `Assume`
 mode inspects a spine of the term it is given, reduction to expose a `Π` or a
 `Sort` is the same terminating reduction as anywhere else (delta unfolds
 constants that were declared strictly earlier, §7.1), and the answer it produces
-is used for exactly two things — the sealing decision and the `Sort 0` test on a
-theorem — both of which a failing obligation overrides.
+is used for exactly one thing — the `Sort 0` test on a theorem, which is also what
+licenses sealing its proof — and a failing obligation overrides it.
 
 Two further things do not carry over, and neither can change a verdict:
 
@@ -2634,7 +2635,27 @@ The `-j8` census is the same graph — flat under 3 GB, then 3.07 → 4.08 → 5
 6.30 → 7.43 → 8.50 → 9.61 GB, 70.2% of it `XApp`. The two runs peak within six
 per cent of each other, so the spike is **one declaration**, not eight at once,
 and no amount of throttling gets under it.
-That also disposes of the first version of `--mem`, which was a gate on
+
+**And the memo table was full of proofs.** The paragraphs above are what the
+census said before §12.10 sealed theorem values unconditionally; the conclusion
+they draw is right and the lever it implies was the wrong one. What that
+declaration was memoising was the reduced forms of the *proofs* its statement
+mentions, and against an axiom there is nothing to reduce. Sealing therefore does
+what bounding the tables was supposed to do, without a cache policy and without
+the risk that the obligation whose table gets dropped is most of a pass. Two
+interleaved rounds on `mathlib`, `-hT -i10` under the arena's flags:
+
+| | keeping proofs | sealing them |
+| --- | --- | --- |
+| peak live | 9827, 9683 MB | 3445, 3064 MB |
+| of which `XApp` | 70.3% | 50.1% |
+| max residency (`-s`) | 10.10, 9.96 GB | 3.57, 3.33 GB |
+| bytes allocated | 1708.20, 1708.14 GB | 1571.09, 1571.07 GB |
+| total CPU | 4479, 4563 s | 3202, 3196 s |
+
+The spike is still one declaration and still at the end; it is a third the height.
+
+The census also disposes of the first version of `--mem`, which was a gate on
 *starting*: a thread that waits while the live set is over the budget stops the
 ninth obligation and not the eight already running, and the memory belongs to
 the ones already running. Measured, it moved `mathlib`'s peak by three per cent
@@ -2772,9 +2793,10 @@ applies exactly as much squeeze as the ceiling needs and none below: on the code
 of the table above, the same run with `-M30g` takes 21.07 GB and 799s and with
 `-M13g` takes 12.85 GB and 864s. Eight per cent of `mathlib`, nothing at all of
 the other three, and no number in the run line that has to be re-tuned per
-corpus. On the code as it now stands the squeeze is smaller and free, for the
-reason just given, and the flag stays because what it bounds is the worst run
-and not the average one.
+corpus. Since §12.10 the squeeze is not merely smaller but absent — interleaved,
+`-M13g` peaks at 8.53 and 8.06 GB and `-M30g` at 8.44 and 8.61, in the same time
+— and the flag stays for the run that goes wrong rather than the average one:
+over the limit the checker declines and says so, instead of being killed.
 
 The same policy can be written from below instead, and it was tried: `-O` sets a
 minimum size for the oldest generation, which is collected at whichever of `-O`
@@ -2895,7 +2917,7 @@ Recorded so that a disagreement with official Lean can be diagnosed rather than
 patched. §12.1 is the part of the kernel that is *not* name-blind, and how each
 name is earned; §12.2 onwards are places where `eink0rn` knowingly answers
 differently from official Lean, in both directions: §12.2, §12.14 and half of
-§12.6 accept more, §12.3, §12.4 and §12.7–§12.9 accept less.
+§12.6 accept more, §12.3, §12.4, §12.7–§12.9 and §12.10 accept less.
 
 ### 12.1 Names with meaning
 
@@ -3335,50 +3357,54 @@ rejected here.
 
 A checked theorem normally enters the environment as a definition, and a
 definition delta-unfolds. This kernel instead **discards the proof and admits an
-axiom** whenever it can show that no reduction rule could ever look inside it.
-`--keep-proofs` turns this off; it changes nothing but the timings.
+axiom of the statement**. `--keep-proofs` turns that off and keeps every value.
 
-The argument is that a proof is used in exactly three ways, and each one can be
-ruled out from the *statement* alone.
+Nothing about the value is consulted. The only test is the one a `thm` has to
+pass anyway (§4): its statement is a proposition. A `def` is never sealed, whatever
+sort it lives in.
+
+A proof is used in exactly three ways:
 
 - **Compared with another term.** Never needs the value. A proof can only be
   convertible with another proof, and §7 step 5 settles any comparison between
-  two proofs from their types. Sealing a proof does not even weaken step 4: an
-  axiom is a rigid head, so `thm ā ≡ thm b̄` still goes through congruence.
-- **Major premise of a recursor.** This is the case that can need the value, so
-  it is the one the test is about.
-- **Target of a projection.** Same, and it reduces to the same test.
+  two proofs from their types. Sealing does not even weaken step 4: an axiom is a
+  rigid head, so `thm ā ≡ thm b̄` still goes through congruence.
+- **Major premise of a recursor.** This one can need the value.
+- **Target of a projection.** Same.
 
-Write `C` for the head of the statement's conclusion, after stripping its
-`forall`s and head-normalising. The proof is sealed when `C` is an inductive type
-and any of:
+So the class this costs is nameable: a `Prop` that eliminates largely **and** has
+fields is one whose recursor needs to see a real constructor before it can
+produce the data it promised. `Acc` is the important one — a `def` by
+well-founded recursion reduces by taking apart a proof of `Acc r a` — and `And`,
+`Iff` and `WellFounded` have the same shape. Structure eta (§7.2) does not rescue
+them: it replaces the major premise with `C.mk h.[C,0] .. h.[C,n]`, whose fields
+are projections that are themselves stuck on the value that was thrown away.
+Everything else is already answered above: a `Prop` with no constructors has no
+iota rule to fire, one that does not eliminate largely blocks only terms that are
+themselves proofs, and one with the `k` flag (§8.6) rebuilds its constructor
+application out of the major premise's *type*.
 
-| condition | why nothing can be waiting on the value | examples |
-| --- | --- | --- |
-| `C` has no constructors | there is no iota rule to fire and no field to project | `False`, `Empty` |
-| `C` does not admit large elimination (§8.5) | `C.rec`'s motive lands in `Prop`, so every term a stuck `C.rec` blocks is *itself* a proof, and step 5 answers for it. A projection is in the same position: §5.3 only admits one whose field is a proof, and a type with a data field is exactly a type that does not eliminate largely | `Or`, `Exists`, `Nonempty`, `Nat.le` |
-| `C` has the `k` flag (§8.6) | K-like reduction rebuilds the constructor application from the major premise's *type*, so iota fires with the value untouched | `Eq`, `HEq`, `True` |
-
-Anything else is kept — including a conclusion that is a variable, a sort, a
-quotient, or a constant that head normalisation could not resolve.
-
-One class *must* be kept, and it is worth naming: a `Prop` that eliminates
-largely **and** has fields is one whose recursor needs to see a real constructor
-before it can produce the data it promised. `Acc` is the important one — sealing
-a proof of `Acc r a` would stop well-founded recursion from unfolding — and
-`And`, `Iff` and `WellFounded` have the same shape. Structure eta (§7.2) does not
-rescue them: it replaces the major premise with `C.mk h.[C,0] .. h.[C,n]`, whose
-fields are projections that are themselves stuck on the value we would have
-thrown away.
+Earlier versions therefore sealed only that safe part, testing the head of the
+statement's conclusion for those three conditions and keeping `Acc` and friends.
+The default is now to seal unconditionally, on the strength of a fact about the
+producer rather than about the type theory: as of Lean v4.33 a `theorem`'s value
+is discardable — including a proof of `Acc` — and only a `def` needs its body
+kept. An export in which a later declaration cannot be typechecked without
+unfolding a proof is thus not something the surface language sets out to produce.
+When one arrives anyway, `--keep-proofs` checks it.
 
 This is a completeness claim, not a soundness one, and it is one-sided in the
-safe direction either way: a proof that should have been kept can only cause a
-reduction to get stuck, and a stuck reduction can only cause a rejection (§7.3).
+safe direction: sealing a proof that should have been kept can only make a
+reduction stick, and a stuck reduction can only cause a rejection (§7.3). Every
+file accepted with the seal on is accepted with it off.
 
-**Divergence.** None observed. Official Lean keeps theorem values, so a file that
-this kernel rejects for want of an unfolding it sealed away would be a
-divergence; none of the arena corpus, the pathological corpus, or `init`
-contains one.
+**Divergence.** One, and the corpus contains it.
+`refs/tests/either/undecidability/subject-reduction-redex.ndjson` defines a `def`
+whose reduction takes apart two accessibility proofs that are `thm`s, and needs
+them unfolded to see that the two `Acc.rec` applications agree; official Lean
+accepts it, `--keep-proofs` accepts it, the default rejects it. The arena scores
+that test `outcome: either`. The other 192 arena cases, `init`, `std`, `cslib` and
+`mathlib` are unaffected.
 
 ### 12.11 Reducibility hints are believed
 
@@ -3399,8 +3425,8 @@ The order, greatest first:
 | `regular n` | by `n` | `n` exceeds the height of everything the value mentions, so unfolding the taller of two constants is what lets the shorter be reached from both sides |
 | `opaque` | lowest | leave this one alone |
 
-A `thm` carries no `hints` field, and one that survives §12.10 is given `opaque`:
-a proof is the last thing worth looking inside.
+A `thm` carries no `hints` field, and one kept under `--keep-proofs` is given
+`opaque`: a proof is the last thing worth looking inside.
 
 Earlier versions computed the height themselves, as `1 + max` over the
 definitions a value mentions. That agrees with `regular n` on every export
