@@ -2607,6 +2607,30 @@ Eviction pays once the backlog is bounded, and then it pays twice over. With the
 queue held to 2N and the reader to 2048 declarations ahead of the walk, `std`'s
 peak went 1,159 → 954 MB without eviction and → 650 MB with it.
 
+What eviction cost to *run* was, for a while, most of what it saved. A pool is
+reaped after every line, on all three pools, and the question it asks each time
+is "is anything due yet" — which `IntMap.minViewWithKey` answers by deleting the
+smallest key and rebuilding the spine above it, then throwing that away. Against
+a binary with the death table computed and then discarded, the bookkeeping was
+7.5% of everything `std` allocated and 9.1% of `cslib`, to learn an `Int` that
+had not changed since the line before. Keeping that `Int` in the pool costs one
+word and makes the common case a comparison: `init` 55.0 → 50.8 GB, `std` 99.8 →
+92.3 GB, `cslib` 381.0 → 346.3 GB allocated, with the same peak. Eviction now
+allocates *less* than not evicting (`std` 92.3 against 92.7 GB), so the working
+set it buys is free.
+
+Being cleverer about *which* entries to keep is not worth the same look. The
+scan is deliberately format-blind and over-keeps, and the question is what that
+costs in retained nodes rather than in pool entries — an entry pinned by
+accident is usually a low-numbered one whose subterm graph something else holds
+anyway. Simulated against a scan that reads only the fields that really are
+references, `std`'s peak retained expression nodes go 1,000,542 → 614,886, which
+is about 12 MB of a 700 MB peak. The whole of the overshoot is one effect: the
+three pools share one table, so a *name* index keeps the *expression* of the
+same number alive, and there are 278,268 names against 5,726,477 expressions in
+`init`. Numeric literals, the thing the scan is most obviously naive about, cost
+0.2%. So the 2% is real and it is not worth reading the format to get.
+
 **What is left is the checking, and a heap census says what it is.** Every
 obligation builds its own memo tables — what reduces to what, what is convertible
 with what — and on a hard declaration they are most of what is alive. `+RTS -hT`

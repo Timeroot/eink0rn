@@ -68,14 +68,23 @@ instance Exception PoolEvicted
 
 -- | Entries numbered from zero.
 --
--- @Dense n lost old dm cur prv@ holds the entries @0 .. n-1@ that are still
+-- @Dense n due lost old dm cur prv@ holds the entries @0 .. n-1@ that are still
 -- wanted.  @cur@ is the chunk being filled and @prv@ the one before it, both
 -- newest first; @old@ is everything below them that survived; @dm@ says which
 -- line each of those dies on, so that reaping is a walk of the front of a map
 -- rather than a search.  @lost@ records whether anything has been dropped,
 -- which is the one thing the sparse fallback needs to know.
+--
+-- @due@ is the smallest key in @dm@, or 'maxBound' when nothing is waiting to
+-- die.  It is redundant, and it is here because without it every line of the
+-- export pays to find it again: 'poolReap' runs on all three pools after every
+-- line, almost always with nothing to do, and 'IM.minViewWithKey' answers "what
+-- is the smallest key" by /deleting/ that key and rebuilding the spine above it.
+-- On @std@ that was 7.5% of everything the run allocated, thrown away
+-- immediately, to learn an 'Int' that had not changed.
 data Pool a
-  = Dense {-# UNPACK #-} !Int !Bool !(IntMap a) !(IntMap [Int]) ![a] ![a]
+  = Dense {-# UNPACK #-} !Int {-# UNPACK #-} !Int !Bool
+          !(IntMap a) !(IntMap [Int]) ![a] ![a]
   | Sparse !(IntMap a)
 
 -- | How many entries one chunk holds.  Big enough to cover the references that
@@ -90,37 +99,42 @@ chunkMask :: Int
 chunkMask = chunkSize - 1
 
 emptyPool :: Pool a
-emptyPool = Dense 0 False IM.empty IM.empty [] []
+emptyPool = Dense 0 maxBound False IM.empty IM.empty [] []
 
 -- | File an entry at an index, on this line.  Strict in the entry.
 --
 -- The table and the line are wanted not for the entry going in but for the one
 -- coming out of the back of @prv@, which is the moment its fate is decided.
 poolPush :: Deaths -> Int -> Int -> a -> Pool a -> Pool a
-poolPush ds line k !x (Dense n lost old dm cur prv)
+poolPush ds line k !x (Dense n due lost old dm cur prv)
   | k == n =
       let n'   = n + 1
           cur' = x : cur
       in if n' .&. chunkMask == 0
-           then case retire ds line (n' - 2 * chunkSize) prv old dm of
-                  (l, old', dm') -> Dense n' (lost || l) old' dm' [] cur'
-           else Dense n' lost old dm cur' prv
+           then case retire ds line (n' - 2 * chunkSize) prv old dm due of
+                  (l, old', dm', due') -> Dense n' due' (lost || l) old' dm' [] cur'
+           else Dense n' due lost old dm cur' prv
 poolPush _ _ k x p = Sparse (IM.insert k x (toMap p))
 
 -- | Decide the chunk that has just fallen out of the back.  @base@ is the index
 -- of its oldest entry; the list is newest first.
-retire :: Deaths -> Int -> Int -> [a] -> IntMap a -> IntMap [Int]
-       -> (Bool, IntMap a, IntMap [Int])
-retire ds line base prv old dm = go (base + length prv - 1) prv False old dm
+--
+-- Every death line filed here is past the line doing the filing, so the
+-- smallest one still waiting is the smallest of what was waiting and what goes
+-- in -- no need to ask the map.
+retire :: Deaths -> Int -> Int -> [a] -> IntMap a -> IntMap [Int] -> Int
+       -> (Bool, IntMap a, IntMap [Int], Int)
+retire ds line base prv old dm due0 = go (base + length prv - 1) prv False old dm due0
   where
-    go _ []         !l !o !d = (l, o, d)
-    go !i (v : vs)  !l !o !d
-      | dth <= line     = go (i - 1) vs True o d
+    go _ []         !l !o !d !u = (l, o, d, u)
+    go !i (v : vs)  !l !o !d !u
+      | dth <= line     = go (i - 1) vs True o d u
       -- Never spoken of again by anything the scan could see, so there is no
       -- line to reap it on and no reason to take up room in the death index.
-      | dth == maxBound = go (i - 1) vs l (IM.insert i v o) d
+      | dth == maxBound = go (i - 1) vs l (IM.insert i v o) d u
       | otherwise       = go (i - 1) vs l (IM.insert i v o)
                                           (IM.insertWith (++) dth [i] d)
+                                          (min u dth)
       where dth = deathOf ds i
 
 -- | The entry at an index, if the format ever gave it one.
@@ -131,7 +145,7 @@ retire ds line base prv old dm = go (base + length prv - 1) prv False old dm
 -- can be blamed for.
 poolAt :: Pool a -> Int -> Maybe a
 poolAt (Sparse m) i = IM.lookup i m
-poolAt (Dense n _ old _ cur prv) i
+poolAt (Dense n _ _ old _ cur prv) i
   | i < 0 || i >= n       = Nothing
   | i >= base             = Just $! (cur !! (n - 1 - i))
   | i >= base - chunkSize = Just $! (prv !! (base - 1 - i))
@@ -144,17 +158,21 @@ poolAt (Dense n _ old _ cur prv) i
 --
 -- Called once a line has been read, so an entry this line was the last to
 -- mention has already been read out of the pool by the time it goes.  The
--- common case is that nothing is due, and that case returns the pool it was
--- given rather than a copy of it.
+-- common case is that nothing is due, and that case is one comparison against
+-- @due@ and the pool it was given, rather than a copy of anything.
 poolReap :: Int -> Pool a -> Pool a
-poolReap line p@(Dense n _ old0 dm0 cur prv) = case IM.minViewWithKey dm0 of
-  Just ((k, _), _) | k <= line -> go old0 dm0
-  _                            -> p
+poolReap line p@(Dense n due _ old0 dm0 cur prv)
+  -- @due@ is the smallest line anything is waiting to die on, so this is the
+  -- whole of the common case.  Getting here the other way means @dm0@ has a key
+  -- at or behind @line@, and so that at least one entry is about to go.
+  | line < due = p
+  | otherwise  = go old0 dm0
   where
     go !o !d = case IM.minViewWithKey d of
       Just ((k, is), d')
-        | k <= line -> go (foldl' (flip IM.delete) o is) d'
-      _             -> Dense n True o d cur prv
+        | k <= line   -> go (foldl' (flip IM.delete) o is) d'
+      Just ((k, _), _) -> Dense n k        True o d cur prv
+      Nothing          -> Dense n maxBound True o d cur prv
 poolReap _ p = p
 
 -- | Everything in the pool as the map it would have been.
@@ -164,7 +182,7 @@ poolReap _ p = p
 -- pass that never drops anything instead.
 toMap :: Pool a -> IntMap a
 toMap (Sparse m) = m
-toMap (Dense n lost old _ cur prv)
+toMap (Dense n _ lost old _ cur prv)
   | lost      = throw (PoolEvicted (-1))
   | otherwise = IM.union old (IM.fromList (down (n - 1) cur ++ down (base - 1) prv))
   where
