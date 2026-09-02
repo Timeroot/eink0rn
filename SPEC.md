@@ -2615,9 +2615,23 @@ a binary with the death table computed and then discarded, the bookkeeping was
 7.5% of everything `std` allocated and 9.1% of `cslib`, to learn an `Int` that
 had not changed since the line before. Keeping that `Int` in the pool costs one
 word and makes the common case a comparison: `init` 55.0 → 50.8 GB, `std` 99.8 →
-92.3 GB, `cslib` 381.0 → 346.3 GB allocated, with the same peak. Eviction now
-allocates *less* than not evicting (`std` 92.3 against 92.7 GB), so the working
-set it buys is free.
+92.3 GB, `cslib` 381.0 → 346.3 GB, `mathlib` 1571.1 → 1472.3 GB allocated, and
+`mathlib` 3238 → 2835s of processor time. Eviction now allocates *less* than not
+evicting (`std` 92.3 against 92.7 GB), so the working set it buys is free.
+
+The peak does not move, and saying so took more care than it should have.
+`mathlib` at its natural rate reports the arm with less allocation as *worse* —
+2.99–3.19 GB of maximum residency against 3.35–3.58, and 7877 MiB of heap in use
+against 8652 — reproduced two and three runs an arm. It is undersampling. The
+peak here is a spike, one declaration's proof reductions, and maximum residency
+is only ever sampled at a major collection: at 28 of them a few seconds either
+way is half a gigabyte, and allocating less moves them. Under `-hT -i5`, which
+forces a collection every five seconds of mutator time and gives 84 and 97
+samples, the two arms are 3,506,935,328 and 3,545,271,184 bytes with 7201 and
+7204 MiB in use — 1.1% and 0.04% apart, with a census that agrees constructor
+for constructor. Neither `--mem` nor the read-ahead window moves the difference,
+which is the other way to tell there was not one. **Two arms of `mathlib`
+residency are not comparable unless they were sampled at the same rate.**
 
 Being cleverer about *which* entries to keep is not worth the same look. The
 scan is deliberately format-blind and over-keeps, and the question is what that
