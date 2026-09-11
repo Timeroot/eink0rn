@@ -6,7 +6,7 @@
 # contains it.  The submitted copy carries the commit `ref` points at, which is
 # what the arena will clone --
 #
-#   sed "s/REPLACE_WITH_COMMIT_SHA/$(git rev-parse v1.1.2^{commit})/" \
+#   sed "s/REPLACE_WITH_COMMIT_SHA/$(git rev-parse v1.1.5^{commit})/" \
 #     tools/arena-checker.yaml > ../lean-kernel-arena/checkers/eink0rn.yaml
 description: |
   **eink0rn** — a Lean 4 kernel in Haskell, written clean-room, that normalises
@@ -28,11 +28,10 @@ description: |
   and every place it knowingly departs from official Lean is argued in §12 —
   including the one `--enforce-mutual-univ` turns off below, so that the
   language scored here is the language every other checker is scored on.
-  Nothing is declined; `mathlib` fits by naming a heap ceiling rather than a
-  ratio.
-version: "1.1.2"
+  Nothing is declined; the largest export peaks around eight gigabytes.
+version: "1.1.5"
 url: https://github.com/Timeroot/eink0rn
-ref: v1.1.2
+ref: v1.1.5
 rev: REPLACE_WITH_COMMIT_SHA
 threads: 8
 build: bash tools/arena-build.sh
@@ -64,17 +63,17 @@ build: bash tools/arena-build.sh
 #               explicitly rather than left to the adaptive default, so that
 #               the verdict does not depend on what /proc/meminfo says inside
 #               the runner.
-#   -M13g       the ceiling, and the one flag that decides whether mathlib
-#               fits.  It is a real limit -- over it the checker declines
-#               rather than taking the runner's 16 GB down with it -- but it
-#               also shapes the run well below the limit, because the RTS
-#               collects the oldest generation in place above 30% of -M and
-#               reins in how far the heap may run ahead of the live set as it
-#               approaches -M.  That is the whole point of stating a ceiling
-#               rather than a ratio: mathlib peaks at 12.8 GB under it and at
-#               21.1 GB with it raised out of reach, while the three smaller
-#               exports never come near it and are collected at the fast
-#               default, paying nothing for a flag they do not need.
+#   -M13g       the ceiling.  It is a real limit -- over it the checker
+#               declines and says so, rather than taking the runner's 16 GB
+#               down with it -- and it is also a shape, since the RTS collects
+#               the oldest generation in place above 30% of -M and reins in how
+#               far the heap may run ahead of the live set as it approaches -M.
+#               It used to be the flag that decided whether mathlib fit at all
+#               (12.8 GB under it against 21.1 with it out of reach); since
+#               theorem values are sealed it is idle on every export here --
+#               mathlib peaks at 7.4 to 8.6 GB and con-leche at 5.1 -- and it
+#               stays for the export that goes wrong rather than the average
+#               one.
 #   -A32m       small nursery: eight of them, and the survivors of a big one
 #               are what the old generation has to absorb.
 #
