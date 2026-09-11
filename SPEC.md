@@ -766,7 +766,7 @@ because the answer is remembered (§11.4), whereas what a reduction costs is
 bounded by nothing at all — one `Nat` numeral can ask for two billion steps.
 
 The allowance is **credited**, not fixed. A declaration opens with 50000 steps
-and earns one more for every eight reduction steps the checker performs outside a
+and earns one more for every reduction step the checker performs outside a
 speculation, to a ceiling of the same 50000. A fixed per-declaration allowance is
 the wrong shape for this: it is generous on a one-line lemma and is gone in the
 first instant of a machine-generated arithmetic certificate, and what happens when
@@ -774,9 +774,25 @@ it runs out is not that the checker goes a little slower — it stops speculatin
 all, and every congruence that would have closed in a hundred steps is replaced by
 unfolding both heads. The cap meant to stop a proof running away is then exactly
 what makes it run away. Crediting says the affordable thing instead: dead ends may
-consume a bounded fraction of the reduction the checker was going to do anyway,
-whatever the size of the declaration, and the opening balance doubles as the most
-that may be spent on any one speculation.
+consume the reduction the checker was going to do anyway, whatever the size of the
+declaration, and the opening balance doubles as the most that may be spent on any
+one speculation.
+
+The rate was one in eight until 2026-09-11, on the reasoning that a *fraction*
+was all a dead end should be allowed. That reasoning is wrong, for the same
+reason a fixed allowance is wrong and one step further along: the allowance and
+the work are not independent. Refusing a congruence is what sends the loop off to
+unfold, the unfolding is reduction, and a fraction of it comes back as allowance
+— a feedback loop, whose fixed point on a hard conversion is a steady state where
+a constant fraction of congruences are refused and the two terms are pulled apart
+faster than they can be matched. It does not converge and it does not fail; it
+runs until the heap does. One declaration of the arena's `con-leche` export
+(`ConLeche.Cached.coreKnotI_congr`, 1051 nodes) is such a conversion: at a rate
+of 1, 2 or 4 it checks in thirteen seconds in 63 MB, and at 8 it had not finished
+in fifteen minutes or twenty gigabytes. Loosening the *ceiling* instead is not a
+substitute and is actively harmful — the ceiling is what bounds a single dead
+end, and raising it to a hundred million makes a different declaration spend ten
+million steps in one. So the ceiling stays and the rate is one.
 
 This is sound because **every rule that answers `True` is sound no matter how much
 reduction preceded it**. A starved comparison can therefore only ever answer
@@ -2247,18 +2263,36 @@ ever called on closed terms — so its half of the key is constant.
 
 All three tables are invalidated when the global environment or the declaration's
 universe parameters change, since both the inferred type and what a constant
-unfolds to depend on them. Buckets are capped so a hash collision cannot turn the
-table into a leak. Missing a hit only wastes time.
+unfolds to depend on them. Missing a hit only wastes time.
+
+Which is why the tables are **bounded**: 4096 buckets of at most 8 entries each,
+after which a table stops growing and a bucket forgets its oldest entry rather
+than making more buckets. The cost of a remembered answer is not the answer. It
+is that a table is a root, so the answer keeps the term it is *about* alive for
+as long as the declaration runs, and those terms are intermediate results that
+nothing else refers to. An unbounded table therefore accumulates every
+intermediate term of the hardest declaration in the file and hands the collector
+all of it on every major collection. On one declaration of `con-leche` the sweep
+is not close: unbounded, 11.17 GB and 446s of collection against 211s of real
+work; at 512 buckets, 0.88 GB and 89s of collection against 251s.
+
+That is the pathological case, and it is only half the measurement — on a file
+that is merely *large* there is no runaway to contain, and the recomputation a
+bound forces is the only thing it does. Against an unbounded table, mathlib
+allocates +10.5% at 512 buckets and +0.3% at 4096, so the ceiling sits at 4096:
+`con-leche` is checked in 6.6 GB rather than not at all, and buying its last
+0.7 GB would cost a tenth of mathlib. Bucket caps also mean a hash collision
+cannot turn a table into a leak.
 
 The tables are *mutable* — an array of buckets indexed by the low bits of the
-key, doubling when it fills. A balanced tree of ten million entries answers a
-lookup in some two dozen dependent pointer chases, essentially all of them cache
-misses, and pays for an insertion by copying the path it came down; a hard
-declaration asks and answers millions of these questions. Nothing else about the
-tables changes: the same keys, the same test, the same cap on how long a
-bucket may get. The mutation does not escape: the tables are made, used and
-dropped inside one call, so checking the same declaration twice against the same
-environment gives the same answer, and the checker's interface stays pure.
+key, growing eightfold when it fills until it reaches that ceiling. A balanced
+tree of ten million entries answers a lookup in some two dozen dependent pointer
+chases, essentially all of them cache misses, and pays for an insertion by
+copying the path it came down; a hard declaration asks and answers millions of
+these questions. Nothing else about the tables changes: the same keys, the same
+test. The mutation does not escape: the tables are made, used and dropped inside
+one call, so checking the same declaration twice against the same environment
+gives the same answer, and the checker's interface stays pure.
 
 One more table is kept, on a different key. Delta and iota both work by taking a
 body out of the environment and replacing that declaration's universe parameters
@@ -2268,7 +2302,11 @@ thousand times. Those are memoised on `(stored body, universe arguments)` — th
 body by pointer, since it comes from the environment and is stable for as long as
 the table lives, and the arguments properly, being short. Unlike the three above,
 this one survives the environment changing, because what it records is a fact
-about a body and some levels and not about an environment.
+about a body and some levels and not about an environment. It is also not
+bounded, and neither is the table that remembers what a name resolves to: a
+declaration mentions a handful of distinct universe arguments and some hundreds
+of distinct constants, so neither grows with the work done, and neither holds
+anything the environment is not holding already.
 
 The `whnf` memo has one extra condition. A starved reduction stops where it
 stands and returns a term that is correct to **use** — a speculation reads a
@@ -2366,6 +2404,13 @@ So locals are *interned*: the local for a binder is remembered against the pair
 `(the binder's type as stored, the enclosing scope)`, and opening the same binder
 again in the same scope hands back the same local. The enclosing scope is the
 local that the innermost enclosing binder was opened as — a token, not a list.
+
+This table is **not** bounded the way §11.4's are, and it is the one table that
+must not be. A miss in a memo costs a recomputation; a miss here hands a binder a
+second local constant, which is precisely the tree-instead-of-graph walk the
+interning exists to prevent, and the terms the extra local appears in are then
+alive for good. Its size is bounded by the declaration's distinct binders rather
+than by the work done, so there is nothing to bound.
 
 Interning locals is the one place in the kernel where a term's identity is reused
 across contexts, so the invariant that makes it safe is worth stating. What must

@@ -53,9 +53,9 @@ import qualified Data.Map.Strict        as M
 import           Kernel.Cache           (Budget, Cache, Chain (..), Counter,
                                          bucket, bumpCounter, clearCache,
                                          getFuel, getWaste, newBudget, newCache,
-                                         newCounter, nextCount, push,
-                                         readCounter, setFuel, setWaste, tick,
-                                         writeCounter)
+                                         newCacheBounded, newCounter, nextCount,
+                                         push, readCounter, setFuel, setWaste,
+                                         tick, writeCounter)
 import           Kernel.Canon
 import           Kernel.Env
 import           Kernel.Expr
@@ -549,11 +549,11 @@ runTC env lps act = fst <$> runTCLearn env lps act
 -- declaration.  See 'Licences' for why that is sound, and 'seedLicences'.
 runTCLearn :: Env -> [Name] -> TC a -> Either String (a, Licences)
 runTCLearn env lps (TC f) = unsafePerformIO $ do
-  inferV  <- newCache
-  inferA  <- newCache
-  whnfM   <- newCache
-  defEq   <- newCache
-  closeM  <- newCache
+  inferV  <- newCacheBounded memoSlots
+  inferA  <- newCacheBounded memoSlots
+  whnfM   <- newCacheBounded memoSlots
+  defEq   <- newCacheBounded memoSlots
+  closeM  <- newCacheBounded memoSlots
   lvlM    <- newCache
   locId   <- newCache
   consts  <- newCache
@@ -583,6 +583,32 @@ runTCLearn env lps (TC f) = unsafePerformIO $ do
 
 throwTC :: String -> TC a
 throwTC msg = TC $ \_ -> pure (Left msg)
+
+-- | How many slots the memo tables keyed on a /term/ may grow to.
+--
+-- 'Kernel.Cache.newCacheBounded' has the measurements and the reason; the short
+-- of it is that a remembered answer keeps its question alive, the questions are
+-- intermediate terms, and a table that never forgets is a declaration-long root
+-- for every one of them.
+--
+-- 4096 slots is 32768 entries, and it is where the two measurements meet.  The
+-- pathological declaration wants it far smaller -- at 512 it holds 0.88 GB and
+-- at 8192 1.45 -- but @mathlib@ is not pathological, it is merely large, and
+-- there the recomputation a small table forces is real work and not GC noise:
+-- against an unbounded table @mathlib@ allocates +0.3% at this ceiling and
+-- +10.5% at 512, and pays for the latter in mutator time.  At 4096 the export
+-- that could not be checked at all is checked in 6.6 GB, which is what the
+-- ceiling is for; buying its last 0.7 GB would cost a tenth of @mathlib@.
+--
+-- The three tables left unbounded are the three that are not this shape.
+-- 'tcLevelInst' is keyed on universe levels, of which a declaration has a
+-- handful.  'tcConsts' is keyed on a name and answers with something the
+-- environment is holding anyway, so its entries pin nothing.  And 'tcLocalId'
+-- is not a cache at all: a miss there does not cost a recomputation, it hands a
+-- binder a /second/ local constant, and two locals for one binder is the
+-- difference between reading a term's graph and reading its tree unfolding.
+memoSlots :: Int
+memoSlots = 4096
 
 -- Work budgets ------------------------------------------------------------------
 
@@ -614,13 +640,41 @@ wasteBudget = 50000
 -- conversion, and finishes the declaration by brute unfolding -- so the cap
 -- meant to stop a proof running away is exactly what makes it run away.
 --
--- So the allowance is earned rather than granted: dead ends may consume a fixed
+-- So the allowance is earned rather than granted: dead ends may consume some
 -- fraction of the reduction the checker was going to perform anyway, with
 -- 'wasteBudget' as both the opening balance and the ceiling.  Nothing about the
 -- calculus depends on the numbers; a starved speculation only ever answers
 -- @False@, which means "not this way" and never "not equal".
+--
+-- The fraction is all of it, and this is not the obvious setting: it was 8 and
+-- 8 was a mistake, of exactly the kind the paragraph above describes and did not
+-- go far enough about.  Earning slowly does not make a hard declaration slower,
+-- it makes it /diverge/, because the allowance and the work are not independent:
+-- refusing 'sameHeadCongr' is what sends 'defEqLoop' off to unfold both sides,
+-- the unfolding is real reduction, and one step in eight of it comes back as
+-- allowance -- which is a feedback loop that settles at a steady state where a
+-- fifth of all congruence attempts are refused and the two terms are pulled
+-- apart faster than they can be matched.  Measured on the one declaration of
+-- @con-leche@ that made the checker run out of a thirteen-gigabyte heap
+-- (@ConLeche.Cached.coreKnotI_congr@, all of 1051 nodes):
+--
+-- @
+--   rate 1   ACCEPT   63 MB   13.5s
+--   rate 2   ACCEPT   63 MB   12.7s
+--   rate 4   ACCEPT   63 MB   13.4s
+--   rate 8   does not finish, >20 GB, killed at 900s
+-- @
+--
+-- There is no gradual degradation to read off there and no reason to sit near
+-- the edge of it, so the rate is one: a speculation may waste up to as much as
+-- the declaration has genuinely spent, and never more than 'wasteBudget' at a
+-- go.  Loosening the /other/ number is not a substitute and was measured to be
+-- actively harmful -- at a burst of a hundred million a different declaration
+-- fails to finish, having spent ten million steps in a single dead end.  The
+-- burst is what bounds one bad guess; the rate only decided how often the
+-- checker was allowed to guess at all.
 wasteRate :: Int
-wasteRate = 8
+wasteRate = 1
 
 -- | Charge one reduction step.
 --

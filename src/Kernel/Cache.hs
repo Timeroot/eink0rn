@@ -19,6 +19,7 @@ module Kernel.Cache
   ( Chain (..)
   , Cache
   , newCache
+  , newCacheBounded
   , clearCache
   , bucket
   , push
@@ -75,8 +76,9 @@ class Chain b where
   -- the oldest.  Only 'grow' calls this.
   chainHang :: IOArray Int b -> Int -> b -> Int -> IO Int
 
--- | The mask and the number of live entries, then the slots.  The slot count is
--- a power of two, so the mask is one less than it and indexing is a bitwise and.
+-- | The mask, the number of live entries and the largest mask the table may
+-- reach, then the slots.  The slot count is a power of two, so the mask is one
+-- less than it and indexing is a bitwise and.
 --
 -- The two numbers are a pair of machine words rather than fields of a record
 -- beside the array, because an insertion changes nothing else: holding them in
@@ -98,10 +100,52 @@ initialSlots = 64
 slotCap :: Int
 slotCap = 8
 
+-- | A table that grows as far as it is asked to.
+--
+-- Right for a table whose entries are few, or bounded by something other than
+-- the work done -- and for 'Kernel.Check.tcLocalId', which is a 'Cache' but not
+-- a cache: see 'newCacheBounded'.
 newCache :: Chain b => IO (Cache b)
-newCache = do
-  hdr <- newArray (0, 1) 0
+newCache = newCacheWith 0
+
+-- | A table that stops growing at the given number of slots (rounded down to a
+-- power of two), and from then on forgets its oldest entry in a bucket rather
+-- than making more buckets.
+--
+-- Every /pure/ memo wants this.  What an entry costs is not the entry: it is
+-- that the table is a root, so a remembered answer keeps the term it is about
+-- alive for as long as the declaration runs, and the answers are about
+-- intermediate terms that nothing else refers to.  An unbounded table therefore
+-- retains every intermediate result of the hardest declaration in the file, and
+-- the collector walks all of it on every major GC.  Sweeping the ceiling on one
+-- hard declaration of @con-leche@ -- max residency, then mutator and collector
+-- time:
+--
+-- @
+--   unbounded   11.17 GB   211s MUT   446s GC
+--   65536        5.55 GB   303s MUT   403s GC
+--    8192        1.45 GB   294s MUT   238s GC
+--     512        0.88 GB   251s MUT    89s GC
+-- @
+--
+-- Which says the recomputation a small table costs is real -- it is the mutator
+-- column going up -- and is nowhere near what the collector charges for keeping
+-- the answers.  It also says nothing about a file that is merely large, where
+-- there is no runaway to contain and the recomputation is all there is; see
+-- 'Kernel.Check.memoSlots' for the other half of the measurement and where the
+-- two of them meet.
+--
+-- This is only sound for a table a miss costs nothing but time.  'newCache' is
+-- for the rest.
+newCacheBounded :: Chain b => Int -> IO (Cache b)
+newCacheBounded n = newCacheWith (if n > 0 then pow2Below n - 1 else 0)
+  where pow2Below k = let go m = if m * 2 <= k then go (m * 2) else m in go 1
+
+newCacheWith :: Chain b => Int -> IO (Cache b)
+newCacheWith ceil = do
+  hdr <- newArray (0, 2) 0
   unsafeWrite hdr 0 (initialSlots - 1)
+  unsafeWrite hdr 2 ceil
   arr <- newArray (0, initialSlots - 1) chainNil
   Cache hdr <$> newIORef arr
 
@@ -161,8 +205,16 @@ push c@(Cache hdr ref) k link = do
 -- cache-friendly thing the checker does.  Raising the load factor instead was
 -- measured and rejected: at two entries a slot @std@ allocates 0.5% less and
 -- runs 3% slower, the buckets having got long enough to notice.
+--
+-- A table at its ceiling ('newCacheBounded') declines instead, and forgets the
+-- count of what it holds so as not to be asked again for another mask's worth
+-- of insertions.  The count is only there to decide when to grow, so losing it
+-- costs nothing; the entries stay where they are, and 'push' goes on capping
+-- the buckets it writes.
 grow :: forall b. Chain b => Cache b -> Int -> IOArray Int b -> IO ()
 grow (Cache hdr ref) mask arr = do
+ ceil <- unsafeRead hdr 2
+ if ceil /= 0 && mask >= ceil then unsafeWrite hdr 1 0 else do
   let mask' = mask `shiftL` 3 + 7
   arr' <- newArray (0, mask') chainNil
   let slot :: Int -> Int -> IO Int
