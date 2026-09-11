@@ -105,6 +105,10 @@ data TCState = TCState
                                --   'wasteRate'
   , tcStarve      :: !Counter  -- ^ how many times reduction has stopped for
                                --   want of budget; see 'starving'
+  , tcSpecFail    :: !(IORef (M.Map Int Bool))
+                               -- ^ speculative failures of the outermost
+                               --   comparison in flight; cleared when it ends
+  , tcSpecDepth   :: !(IORef Int)
   , tcInferV      :: !Memo     -- ^ memo for 'inferM' @Verify@; see 'Memo'
   , tcInferA      :: !Memo     -- ^ memo for 'inferM' @Assume@
   , tcWhnf        :: !Memo     -- ^ memo for 'whnf'
@@ -559,6 +563,8 @@ runTCLearn env lps (TC f) = unsafePerformIO $ do
   consts  <- newCache
   credit  <- newCounter wasteRate
   starve  <- newCounter 0
+  specFail <- newIORef M.empty
+  specDepth <- newIORef 0
   budget  <- newBudget unmetered wasteBudget
   locals  <- newIORef IM.empty
   nextId  <- newCounter 0
@@ -570,7 +576,7 @@ runTCLearn env lps (TC f) = unsafePerformIO $ do
   natOps  <- newIORef M.empty
   canonOk <- newIORef M.empty
   sortRes <- newIORef M.empty
-  let s = TCState genv locals nextId lvlPs budget credit starve
+  let s = TCState genv locals nextId lvlPs budget credit starve specFail specDepth
                   inferV inferA whnfM defEq closeM lvlM locId consts scope
                   natOk strOk natOps canonOk sortRes
   seedLicences env s
@@ -1777,7 +1783,16 @@ utf8Chars = go . map fromEnum . B.unpack
 -- /term/ behind, and remembering that really would cost a later caller the
 -- answer it was entitled to.
 isDefEq :: Expr -> Expr -> TC Bool
-isDefEq t0 s0
+isDefEq t0 s0 = TC $ \s -> do
+  d0 <- readIORef (tcSpecDepth s)
+  writeIORef (tcSpecDepth s) (d0 + 1)
+  r <- unTC (isDefEqBody t0 s0) s
+  writeIORef (tcSpecDepth s) d0
+  when (d0 == 0) $ writeIORef (tcSpecFail s) M.empty
+  pure r
+
+isDefEqBody :: Expr -> Expr -> TC Bool
+isDefEqBody t0 s0
   | t0 == s0            = pure True
   | not (eqWorthMemo t0 s0) = decide
   | otherwise = lookupEq t0 s0 >>= \case
@@ -2120,8 +2135,15 @@ sameHeadCongr :: Expr -> Expr -> TC Bool
 sameHeadCongr t s = case (unApps t, unApps s) of
   ((Const n1 l1, as1), (Const n2 l2, as2))
     | n1 == n2, length l1 == length l2, length as1 == length as2
-    , and (zipWith levelEquiv l1 l2) ->
-        speculate (allM (uncurry isDefEq) (zip as1 as2))
+    , and (zipWith levelEquiv l1 l2) -> do
+        let k = eqKey t s
+        known <- TC $ \st -> Right . M.lookup k <$> readIORef (tcSpecFail st)
+        case known of
+          Just False -> pure False
+          _ -> do
+            b <- speculate (allM (uncurry isDefEq) (zip as1 as2))
+            unless b $ TC $ \st -> Right <$> modifyIORef' (tcSpecFail st) (M.insert k False)
+            pure b
   _ -> pure False
 
 -- | Everything that only makes sense once no more unfolding is possible.
