@@ -1,12 +1,15 @@
 {-# LANGUAGE BangPatterns        #-}
 {-# LANGUAGE ScopedTypeVariables #-}
--- | A mutable hash table, for the checker's memo tables.
+-- | The checker's mutable containers: a hash table for the memo tables, a
+-- dense table for the local constants, and the two counters that are hot
+-- enough to be worth keeping out of the state record.
 --
--- Everything "Kernel.Check" remembers is remembered in one of these: what a
--- term reduces to, what its type is, whether two terms are convertible.  They
+-- Most of what "Kernel.Check" remembers is remembered in the hash table: what a
+-- term reduces to, what its type is, whether two terms are convertible.  Those
 -- are pure caches -- a missing entry costs a recomputation and nothing else --
 -- and they are enormous: a single hard declaration asks and answers millions of
--- these questions, and the tables grow to match.
+-- these questions, and the tables grow to match.  The one thing that is not a
+-- cache is what a local constant stands for, and 'Table' is where that lives.
 --
 -- Which is why they are not a 'Data.IntMap.IntMap'.  A balanced tree of ten
 -- million entries answers a lookup in some two dozen dependent pointer
@@ -23,6 +26,10 @@ module Kernel.Cache
   , clearCache
   , bucket
   , push
+  , Table
+  , newTable
+  , putTable
+  , getTable
   , Counter
   , newCounter
   , tick
@@ -38,7 +45,8 @@ module Kernel.Cache
   , setWaste
   ) where
 
-import           Data.Array.Base (unsafeRead, unsafeWrite)
+import           Control.Monad   (when)
+import           Data.Array.Base (getNumElements, unsafeRead, unsafeWrite)
 import           Data.Array.IO   (IOArray, IOUArray, newArray)
 import           Data.Bits       (shiftL, (.&.))
 import           Data.IORef      (IORef, newIORef, readIORef, writeIORef)
@@ -229,6 +237,88 @@ grow (Cache hdr ref) mask arr = do
   unsafeWrite hdr 1 n
   writeIORef ref arr'
 {-# NOINLINE grow #-}
+
+-- * The local-constant table
+
+-- | A table indexed by a dense range of small integers, written once per index
+-- and never emptied.
+--
+-- This is what "Kernel.Check" keeps its local constants in, and a local
+-- constant is not a cache entry: 'Kernel.Check.localInfo' /must/ answer, and it
+-- must answer with the very binder the local was introduced with.  So none of
+-- the machinery above applies -- no hashing, no buckets, no eviction, no
+-- ceiling -- and what is left is an array.
+--
+-- The indices come from a counter that only ever goes up by one, so the array
+-- can be addressed by the index itself and grown by doubling, and a lookup is
+-- two loads with no arithmetic at all.
+--
+-- Against the 'Data.IntMap.IntMap' this replaces: an entry was a tree node, a
+-- boxed key and a pair -- about 96 bytes -- and inserting one copied the path
+-- down to it, some two dozen nodes of it, which on the hardest declaration in
+-- the arena's @con-leche@ was tens of gigabytes of allocation for a table that
+-- nothing ever reads twice.  Here an entry is a word in an array that is
+-- already there, and the doubling copies about two words per entry over the
+-- whole life of the table.
+--
+-- A chunked table -- a directory of fixed-size blocks, never copied -- was
+-- written first and measured worse, because the interesting number here is not
+-- the twenty million entries of one pathological declaration but the /tens of
+-- thousands of tables/ a file makes, one per declaration, nearly all of them
+-- holding a few dozen locals.  Giving each of those a 32 KB block up front cost
+-- 6.7% of everything a 30 MB cone of @con-leche@ allocated, which is more than
+-- the whole change saves.  Doubling from sixteen charges a small table for what
+-- a small table holds, and the transient double-size array the large one pays
+-- for at the end is eight bytes an entry, not the ninety-six that were the
+-- point of the exercise.
+newtype Table a = Table (IORef (IOArray Int a))
+
+-- | Entries a new table has room for.  Small: most declarations introduce a
+-- handful of locals and are never heard from again.
+tableInit :: Int
+tableInit = 16
+
+-- | What an index that has never been written holds.  A lookup of one is a bug
+-- in the caller, and this is how it says so; see 'Kernel.Check.localInfo' for
+-- the bounds check that is supposed to make it unreachable.
+unwritten :: a
+unwritten = error "Kernel.Cache.getTable: index never written"
+
+newTable :: IO (Table a)
+newTable = Table <$> (newIORef =<< newArray (0, tableInit - 1) unwritten)
+
+-- | Record what index @i@ holds, growing the table to reach it if need be.
+--
+-- The value is forced, because the table is a root that outlives the reduction
+-- that made the entry: an unforced one would keep alive whatever the thunk
+-- closed over, which for a binder's type is the term it was read out of.
+putTable :: Table a -> Int -> a -> IO ()
+putTable (Table ref) !i x = do
+  arr <- readIORef ref
+  n   <- getNumElements arr
+  arr' <- if i < n then pure arr else regrow ref arr n i
+  x `seq` unsafeWrite arr' i x
+{-# INLINE putTable #-}
+
+-- | What index @i@ holds.  Unchecked: the caller knows the range its indices
+-- come from and is expected to have checked it -- reading past the end here is
+-- reading past the end of an array.
+getTable :: Table a -> Int -> IO a
+getTable (Table ref) !i = do
+  arr <- readIORef ref
+  unsafeRead arr i
+{-# INLINE getTable #-}
+
+-- | Double until @i@ fits.  Amortised constant, and off the fast path.
+regrow :: IORef (IOArray Int a) -> IOArray Int a -> Int -> Int
+       -> IO (IOArray Int a)
+regrow ref arr n i = do
+  arr' <- newArray (0, until (> i) (* 2) n - 1) unwritten
+  let copy !j = when (j < n) (unsafeRead arr j >>= unsafeWrite arr' j >> copy (j + 1))
+  copy 0
+  writeIORef ref arr'
+  pure arr'
+{-# NOINLINE regrow #-}
 
 -- | A countdown that lives outside the checker's state.
 --

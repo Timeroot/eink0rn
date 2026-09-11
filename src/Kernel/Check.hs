@@ -51,11 +51,12 @@ import           Data.List              (find, foldl')
 import           Data.Map.Strict        (Map)
 import qualified Data.Map.Strict        as M
 import           Kernel.Cache           (Budget, Cache, Chain (..), Counter,
-                                         bucket, bumpCounter, clearCache,
-                                         getFuel, getWaste, newBudget, newCache,
-                                         newCacheBounded, newCounter, nextCount,
-                                         push, readCounter, setFuel, setWaste,
-                                         tick, writeCounter)
+                                         Table, bucket, bumpCounter, clearCache,
+                                         getFuel, getTable, getWaste, newBudget,
+                                         newCache, newCacheBounded, newCounter,
+                                         newTable, nextCount, push, putTable,
+                                         readCounter, setFuel, setWaste, tick,
+                                         writeCounter)
 import           Kernel.Canon
 import           Kernel.Env
 import           Kernel.Expr
@@ -85,9 +86,12 @@ import           System.IO.Unsafe       (unsafePerformIO)
 -- most often caught.
 data TCState = TCState
   { tcEnv         :: !(IORef Env)
-  , tcLocals      :: !(IORef (IntMap (Binder, Expr)))
+  , tcLocalName   :: !(Table Binder)
+  , tcLocalTy     :: !(Table Expr)
                              -- ^ what every local constant made so far stands
-                             --   for.  Mutable, and so not undone by a failing
+                             --   for, in two tables indexed by its identifier:
+                             --   the binder it was read from, and its type.
+                             --   Mutable, and so not undone by a failing
                              --   speculation -- see 'freshFVar'
   , tcNextFVar    :: !Counter -- ^ the supply of local-constant identifiers; see
                               --   'freshFVar'
@@ -560,7 +564,8 @@ runTCLearn env lps (TC f) = unsafePerformIO $ do
   credit  <- newCounter wasteRate
   starve  <- newCounter 0
   budget  <- newBudget unmetered wasteBudget
-  locals  <- newIORef IM.empty
+  locNm   <- newTable
+  locTy   <- newTable
   nextId  <- newCounter 0
   genv    <- newIORef env
   lvlPs   <- newIORef lps
@@ -570,7 +575,7 @@ runTCLearn env lps (TC f) = unsafePerformIO $ do
   natOps  <- newIORef M.empty
   canonOk <- newIORef M.empty
   sortRes <- newIORef M.empty
-  let s = TCState genv locals nextId lvlPs budget credit starve
+  let s = TCState genv locNm locTy nextId lvlPs budget credit starve
                   inferV inferA whnfM defEq closeM lvlM locId consts scope
                   natOk strOk natOps canonOk sortRes
   seedLicences env s
@@ -847,24 +852,41 @@ setLevelParams lps = TC $ \s -> do
 -- binder an identifier that a local made during the speculation already has.
 -- Nothing that outlives the speculation should be able to name that local, but
 -- 'tcLocalId' can: it is a table, and a table is not unwound either.  So the
--- supply only ever goes up, and 'tcLocals' only ever grows; an entry for a local
--- nothing can reach again is so much dead weight, and dead weight is all it is.
+-- supply only ever goes up, and the local tables only ever grow; an entry for a
+-- local nothing can reach again is so much dead weight, and dead weight is all
+-- it is.
+--
+-- Which is why those tables are 'Table's and not maps: the identifiers are
+-- consecutive, so the entry for one can be a slot in an array rather than a
+-- node in a tree, and the millions of them a hard declaration makes then cost
+-- two words each rather than the two dozen a tree charges for the path it
+-- copies on the way down.
 freshFVar :: Binder -> Expr -> TC Int
 freshFVar n t = TC $ \s -> do
   i <- nextCount (tcNextFVar s)
-  modifyIORef' (tcLocals s) (IM.insert i (n, t))
+  putTable (tcLocalName s) i n
+  putTable (tcLocalTy s) i t
   pure (Right i)
 
+-- | The type a local constant was introduced with.
 localType :: Int -> TC Expr
-localType i = snd <$> localInfo i
+localType i = TC $ \s -> readLocal s i (getTable (tcLocalTy s) i)
 
 -- | The binder name and type a local constant was introduced with.
 localInfo :: Int -> TC (Binder, Expr)
-localInfo i = TC $ \s -> do
-  m <- readIORef (tcLocals s)
-  pure $ case IM.lookup i m of
-    Just nt -> Right nt
-    Nothing -> Left ("unbound local constant x!" ++ show i)
+localInfo i = TC $ \s -> readLocal s i $
+  (,) <$> getTable (tcLocalName s) i <*> getTable (tcLocalTy s) i
+
+-- | Read something about local constant @i@, having first made sure there is
+-- one.  The tables are unchecked, so this bounds check is the whole of what
+-- stands between a malformed term and a read past the end of an array; the
+-- supply says exactly how many locals have been made.
+readLocal :: TCState -> Int -> IO a -> IO (Either String a)
+readLocal s i act = do
+  n <- readCounter (tcNextFVar s)
+  if i >= 0 && i < n then Right <$> act
+                     else pure (Left ("unbound local constant x!" ++ show i))
+{-# INLINE readLocal #-}
 
 -- | Run an action against a temporarily different environment.  Local
 -- constants are unaffected: they are indexed by a counter that only ever grows,
@@ -915,7 +937,7 @@ forgetMemos s = do
 
 -- | Run an action with @x@ recorded as the innermost local in scope.
 --
--- 'tcScope' is not a context -- 'tcLocals' is -- but a token for one: what it
+-- 'tcScope' is not a context -- 'tcLocalTy' is -- but a token for one: what it
 -- identifies is the whole chain of locals a term may mention free.  See
 -- 'sharedLocal', which is the only thing that reads it.
 --

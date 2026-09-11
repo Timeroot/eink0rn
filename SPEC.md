@@ -2412,6 +2412,35 @@ interning exists to prevent, and the terms the extra local appears in are then
 alive for good. Its size is bounded by the declaration's distinct binders rather
 than by the work done, so there is nothing to bound.
 
+Interning is not the only thing that grows with the locals: something has to
+remember what each one *stands for*, and that table cannot be bounded either —
+`x!n`'s type has to be there when a rule asks, and there is no recomputing it.
+Nor can it forget: a local made inside a speculation that failed may still occur
+in a term the caller kept, since only the state is unwound and terms are not
+(§11.5's own argument for why the supply only goes up). So it grows, and on the
+hardest declaration of `con-leche` it grows to twenty million entries.
+
+What it must *not* be is a map. Identifiers come from a counter that goes up by
+one, so they are dense, and a dense index wants an array: 8 bytes an entry and
+two loads to read one, against about 96 bytes and two dozen dependent cache
+misses for a balanced tree whose every insertion copies the path it came down.
+Two arrays, in fact — the binder and the type in parallel — because a pair would
+cost more than the two words it holds and almost every reader wants only the
+type. They are grown by doubling from sixteen, which charges the ten thousand
+tables a corpus makes for what a small table holds, and charges the big one two
+words an entry over its whole life. A chunked table with a directory of
+never-copied 32 KB blocks was written first and measured *worse* for exactly
+that reason: the eager block cost 6.7% of everything the checker allocated, to
+save a copy that costs 8 bytes an entry. On the two hardest cones of
+`con-leche`, one pass, interleaved, doubling arrays against the map:
+peak anon 6.37 → 4.60 GB and 2.68 → 1.27 GB, maximum residency 3.32 → 2.31 GB
+and 1.01 → 0.53 GB, allocation −3.7% on both, and about 1.5% off the clock. The
+whole of `con-leche` at the arena's run line is 6.58 → 5.12 GB of peak anon and
+−3.2% allocated. On the four corpora, where no declaration comes near that many
+locals, what is left is the map's per-insertion path copy, which is about one
+per cent of everything the checker allocates: `init` −1.1%, `std` −1.3%,
+`cslib` −1.2%, `mathlib` −0.8%, with no peak moved outside its own spread.
+
 Interning locals is the one place in the kernel where a term's identity is reused
 across contexts, so the invariant that makes it safe is worth stating. What must
 never happen is one local occurring twice in the same telescope: abstracting over
