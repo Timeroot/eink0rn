@@ -1,13 +1,12 @@
-# The Lean Kernel Arena entry for eink0rn, to be copied to
-# checkers/eink0rn.yaml in leanprover/lean-kernel-arena.  Kept here so that the
-# recipe travels with the thing it builds.
+# Source of truth: https://github.com/Timeroot/eink0rn (tools/arena-checker.yaml),
+# so that the recipe travels with the thing it builds.  `rev` cannot be filled
+# in there -- a file cannot name the commit that contains it -- so the copy in
+# checkers/eink0rn.yaml carries the commit `ref` points at, put in on the way:
 #
-# `rev` is left unfilled on purpose: a file cannot name the commit that
-# contains it.  The submitted copy carries the commit `ref` points at, which is
-# what the arena will clone --
-#
-#   sed "s/REPLACE_WITH_COMMIT_SHA/$(git rev-parse v1.1.5^{commit})/" \
+#   sed "s|^rev: .*|rev: $(git rev-parse v1.1.5^{commit})|" \
 #     tools/arena-checker.yaml > ../lean-kernel-arena/checkers/eink0rn.yaml
+#
+# The pattern is anchored so that this line is not itself rewritten.
 description: |
   **eink0rn** — a Lean 4 kernel in Haskell, written clean-room, that normalises
   the surface language away before checking anything.
@@ -71,7 +70,7 @@ build: bash tools/arena-build.sh
 #               It used to be the flag that decided whether mathlib fit at all
 #               (12.8 GB under it against 21.1 with it out of reach); since
 #               theorem values are sealed it is idle on every export here --
-#               mathlib peaks at 7.4 to 8.6 GB and con-leche at 5.1 -- and it
+#               mathlib peaks at 7.4 to 8.6 GB and con-leche at 5.2 -- and it
 #               stays for the export that goes wrong rather than the average
 #               one.
 #   -A32m       small nursery: eight of them, and the survivors of a big one
