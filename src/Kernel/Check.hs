@@ -54,9 +54,9 @@ import           Kernel.Cache           (Budget, Cache, Chain (..), Counter,
                                          Table, bucket, bumpCounter, clearCache,
                                          getFuel, getTable, getWaste, newBudget,
                                          newCache, newCacheBounded, newCounter,
-                                         newTable, nextCount, push, putTable,
-                                         readCounter, setFuel, setWaste, tick,
-                                         writeCounter)
+                                         newTable, nextCount, poke, push,
+                                         putTable, readCounter, setFuel,
+                                         setWaste, tick, writeCounter)
 import           Kernel.Canon
 import           Kernel.Env
 import           Kernel.Expr
@@ -114,6 +114,14 @@ data TCState = TCState
   , tcWhnf        :: !Memo     -- ^ memo for 'whnf'
   , tcDefEq       :: !EqMemo   -- ^ memo for 'isDefEq'; see 'EqMemo'
   , tcCloseIn     :: !Memo     -- ^ memo for 'closeIn'
+  , tcInferVC     :: !Memo     -- ^ 'tcInferV' for closed terms; see 'closedMemos'
+  , tcInferAC     :: !Memo     -- ^ 'tcInferA' for closed terms
+  , tcWhnfC       :: !Memo     -- ^ 'tcWhnf' for closed terms
+  , tcDefEqC      :: !EqMemo   -- ^ 'tcDefEq' for closed pairs
+  , tcMemoClosed  :: !Bool     -- ^ 'mtClosed': are those four tables of their
+                               --   own?  If not they are the four above, and
+                               --   'memoClosed' is never asked
+  , tcMemoLru     :: !Bool     -- ^ 'mtLru'; see 'memoLookupLru'
   , tcLevelInst   :: !LevelMemo -- ^ memo for 'instLevels'
   , tcLocalId     :: !LocalMemo -- ^ which local stands for which binder; see
                                 --   'sharedLocal'
@@ -262,6 +270,28 @@ memoLookup m ek e = go <$> bucket m (memoEntryKey e ek)
                             | otherwise         = go rest
     go MNil                                     = Nothing
 
+-- | 'memoLookup', moving the entry it hits to the front of its bucket.
+--
+-- What a full bucket forgets is its /last/ link, so the order the links are in
+-- is the eviction policy, and 'memoInsert' alone leaves it in insertion order.
+-- Under that order an entry the whole declaration shares is evicted by the
+-- stream of one-off entries that came after it, which is exactly backwards.
+-- Hitting the front link -- which most hits do -- writes nothing.
+memoLookupLru :: Memo -> Int -> Expr -> IO (Maybe Expr)
+memoLookupLru m ek e = bucket m k >>= \case
+  MNil                                     -> pure Nothing
+  MCons k0 ek0 v _  | ek0 == ek, k0 == e   -> pure (Just v)
+  MCons k0 ek0 v tl                        -> go (MCons k0 ek0 v MNil) tl
+  where
+    k = memoEntryKey e ek
+    go _   MNil = pure Nothing
+    go pre (MCons k' ek' v tl)
+      | ek' == ek, k' == e = do poke m k (MCons k' ek' v (unwind pre tl))
+                                pure (Just v)
+      | otherwise          = go (MCons k' ek' v pre) tl
+    unwind MNil                rest = rest
+    unwind (MCons k' ek' v tl) rest = unwind tl (MCons k' ek' v rest)
+
 memoInsert :: Memo -> Int -> Expr -> Expr -> IO ()
 memoInsert m ek k v = push m (memoEntryKey k ek) (MCons k ek v)
 
@@ -359,6 +389,22 @@ eqLookup m a b = go <$> bucket m (eqKey a b)
       | x == b && y == a = Just v
       | otherwise        = go rest
     go ENil              = Nothing
+
+-- | 'eqLookup' with 'memoLookupLru'\'s eviction order.
+eqLookupLru :: EqMemo -> Expr -> Expr -> IO (Maybe Bool)
+eqLookupLru m a b = bucket m k >>= \case
+  ENil                          -> pure Nothing
+  ECons x y v _  | match x y    -> pure (Just v)
+  ECons x y v tl                -> go (ECons x y v ENil) tl
+  where
+    k = eqKey a b
+    match x y = (x == a && y == b) || (x == b && y == a)
+    go _   ENil = pure Nothing
+    go pre (ECons x y v tl)
+      | match x y = do poke m k (ECons x y v (unwind pre tl)); pure (Just v)
+      | otherwise = go (ECons x y v pre) tl
+    unwind ENil             rest = rest
+    unwind (ECons x y v tl) rest = unwind tl (ECons x y v rest)
 
 eqInsert :: EqMemo -> Expr -> Expr -> Bool -> IO ()
 eqInsert m a b v = push m (eqKey a b) (ECons a b v)
@@ -553,11 +599,12 @@ runTC env lps act = fst <$> runTCLearn env lps act
 -- declaration.  See 'Licences' for why that is sound, and 'seedLicences'.
 runTCLearn :: Env -> [Name] -> TC a -> Either String (a, Licences)
 runTCLearn env lps (TC f) = unsafePerformIO $ do
-  inferV  <- newCacheBounded memoSlots
-  inferA  <- newCacheBounded memoSlots
-  whnfM   <- newCacheBounded memoSlots
-  defEq   <- newCacheBounded memoSlots
-  closeM  <- newCacheBounded memoSlots
+  inferV  <- newCacheBounded (mtSlots mt)
+  inferA  <- newCacheBounded (mtSlots mt)
+  whnfM   <- newCacheBounded (mtSlots mt)
+  defEq   <- newCacheBounded (mtSlots mt)
+  closeM  <- newCacheBounded (mtSlots mt)
+  (inferVC, inferAC, whnfC, defEqC) <- closedMemos mt inferV inferA whnfM defEq
   lvlM    <- newCache
   locId   <- newCache
   consts  <- newCache
@@ -576,7 +623,9 @@ runTCLearn env lps (TC f) = unsafePerformIO $ do
   canonOk <- newIORef M.empty
   sortRes <- newIORef M.empty
   let s = TCState genv locNm locTy nextId lvlPs budget credit starve
-                  inferV inferA whnfM defEq closeM lvlM locId consts scope
+                  inferV inferA whnfM defEq closeM
+                  inferVC inferAC whnfC defEqC (mtClosed mt) (mtLru mt)
+                  lvlM locId consts scope
                   natOk strOk natOps canonOk sortRes
   seedLicences env s
   r <- f s
@@ -584,36 +633,74 @@ runTCLearn env lps (TC f) = unsafePerformIO $ do
     Left e  -> pure (Left e)
     Right a -> do lic <- readLicences s
                   pure (Right (a, lic))
+  where mt = envMemo env
 {-# NOINLINE runTCLearn #-}
 
 throwTC :: String -> TC a
 throwTC msg = TC $ \_ -> pure (Left msg)
 
--- | How many slots the memo tables keyed on a /term/ may grow to.
+-- | The four term-keyed memos, over again and unbounded, for closed terms.
 --
--- 'Kernel.Cache.newCacheBounded' has the measurements and the reason; the short
--- of it is that a remembered answer keeps its question alive, the questions are
--- intermediate terms, and a table that never forgets is a declaration-long root
--- for every one of them.
+-- The five of them are bounded ('Kernel.Cache.newCacheBounded') because a
+-- remembered answer keeps its question alive, the questions are intermediate
+-- terms, and a table that never forgets is a declaration-long root for every one
+-- of them.  That is a statement about the /search/, though, and not about the
+-- terms worth keeping: those are the ones the declaration reduces over and over,
+-- and they are closed, because mentioning a local constant is what reducing
+-- under a binder does to a term.  So splitting the tables on 'memoClosed' bounds
+-- the half that runs away and lets the half that is shared be bounded by the
+-- file instead.
 --
--- 4096 slots is 32768 entries, and it is where the two measurements meet.  The
--- pathological declaration wants it far smaller -- at 512 it holds 0.88 GB and
--- at 8192 1.45 -- but @mathlib@ is not pathological, it is merely large, and
--- there the recomputation a small table forces is real work and not GC noise:
--- against an unbounded table @mathlib@ allocates +0.3% at this ceiling and
--- +10.5% at 512, and pays for the latter in mutator time.  At 4096 the export
--- that could not be checked at all is checked in 6.6 GB, which is what the
--- ceiling is for; buying its last 0.7 GB would cost a tenth of @mathlib@.
+-- With 'mtClosed' off both halves are the same four tables and 'memoClosed' is
+-- never asked.  'tcCloseIn' is not split: it is keyed on terms with loose bound
+-- variables, none of which are closed.
 --
--- The three tables left unbounded are the three that are not this shape.
--- 'tcLevelInst' is keyed on universe levels, of which a declaration has a
--- handful.  'tcConsts' is keyed on a name and answers with something the
+-- The three tables left unbounded either way are the three that are not this
+-- shape.  'tcLevelInst' is keyed on universe levels, of which a declaration has
+-- a handful.  'tcConsts' is keyed on a name and answers with something the
 -- environment is holding anyway, so its entries pin nothing.  And 'tcLocalId'
 -- is not a cache at all: a miss there does not cost a recomputation, it hands a
 -- binder a /second/ local constant, and two locals for one binder is the
 -- difference between reading a term's graph and reading its tree unfolding.
-memoSlots :: Int
-memoSlots = 4096
+closedMemos :: MemoTuning -> Memo -> Memo -> Memo -> EqMemo
+            -> IO (Memo, Memo, Memo, EqMemo)
+closedMemos mt iv ia wh eq
+  | mtClosed mt = (,,,) <$> newCache <*> newCache <*> newCache <*> newCache
+  | otherwise   = pure (iv, ia, wh, eq)
+
+-- | Is an answer about this term one for the closed tables?  See 'closedMemos'.
+memoClosed :: Expr -> Bool
+memoClosed e = not (hasFVars e) && not (hasLooseBVars e)
+{-# INLINE memoClosed #-}
+
+-- | Which table a question about this term belongs in, and how to read it.
+whnfMemo :: TCState -> Expr -> Memo
+whnfMemo s e | tcMemoClosed s, memoClosed e = tcWhnfC s
+             | otherwise                    = tcWhnf s
+{-# INLINE whnfMemo #-}
+
+inferMemo :: InferMode -> TCState -> Expr -> Memo
+inferMemo m s e
+  | tcMemoClosed s, memoClosed e = case m of Verify -> tcInferVC s
+                                             Assume -> tcInferAC s
+  | otherwise                    = case m of Verify -> tcInferV s
+                                             Assume -> tcInferA s
+{-# INLINE inferMemo #-}
+
+eqMemo :: TCState -> Expr -> Expr -> EqMemo
+eqMemo s a b | tcMemoClosed s, memoClosed a, memoClosed b = tcDefEqC s
+             | otherwise                                  = tcDefEq s
+{-# INLINE eqMemo #-}
+
+memoGet :: TCState -> Memo -> Int -> Expr -> IO (Maybe Expr)
+memoGet s | tcMemoLru s = memoLookupLru
+          | otherwise   = memoLookup
+{-# INLINE memoGet #-}
+
+eqGet :: TCState -> EqMemo -> Expr -> Expr -> IO (Maybe Bool)
+eqGet s | tcMemoLru s = eqLookupLru
+        | otherwise   = eqLookup
+{-# INLINE eqGet #-}
 
 -- Work budgets ------------------------------------------------------------------
 
@@ -934,6 +1021,11 @@ forgetMemos s = do
   clearCache (tcInferA s)
   clearCache (tcWhnf s)
   clearCache (tcDefEq s)
+  when (tcMemoClosed s) $ do
+    clearCache (tcInferVC s)
+    clearCache (tcInferAC s)
+    clearCache (tcWhnfC s)
+    clearCache (tcDefEqC s)
 
 -- | Run an action with @x@ recorded as the innermost local in scope.
 --
@@ -1116,12 +1208,12 @@ whnfRaw e = do
 
 lookupWhnf :: Expr -> TC (Maybe Expr)
 lookupWhnf e = TC $ \s -> do
-  v <- memoLookup (tcWhnf s) whnfKey e
+  v <- memoGet s (whnfMemo s e) whnfKey e
   pure (Right v)
 
 insertWhnf :: Expr -> Expr -> TC ()
 insertWhnf k v = TC $ \s -> do
-  memoInsert (tcWhnf s) whnfKey k v
+  memoInsert (whnfMemo s k) whnfKey k v
   pure (Right ())
 
 -- | 'whnf' takes no 'LEnv' -- it is only ever called on closed terms, since the
@@ -1881,12 +1973,12 @@ isDefEq t0 s0
 
 lookupEq :: Expr -> Expr -> TC (Maybe Bool)
 lookupEq a b = TC $ \s -> do
-  v <- eqLookup (tcDefEq s) a b
+  v <- eqGet s (eqMemo s a b) a b
   pure (Right v)
 
 insertEq :: Expr -> Expr -> Bool -> TC ()
 insertEq a b v = TC $ \s -> do
-  eqInsert (tcDefEq s) a b v
+  eqInsert (eqMemo s a b) a b v
   pure (Right ())
 
 defEqLoop :: Expr -> Expr -> TC Bool
@@ -2488,7 +2580,7 @@ closeIn env e
   where ek = envKey env
 
 lookupClose :: Int -> Expr -> TC (Maybe Expr)
-lookupClose ek e = TC $ \s -> Right <$> memoLookup (tcCloseIn s) ek e
+lookupClose ek e = TC $ \s -> Right <$> memoGet s (tcCloseIn s) ek e
 
 insertClose :: Int -> Expr -> Expr -> TC ()
 insertClose ek k v = TC $ \s -> do
@@ -2528,17 +2620,13 @@ inferM m env e
 
 lookupInfer :: InferMode -> Int -> Expr -> TC (Maybe Expr)
 lookupInfer m ek e = TC $ \s -> do
-  v <- memoLookup (inferMemo m s) ek e
+  v <- memoGet s (inferMemo m s e) ek e
   pure (Right v)
 
 insertInfer :: InferMode -> Int -> Expr -> Expr -> TC ()
 insertInfer m ek k v = TC $ \s -> do
-  memoInsert (inferMemo m s) ek k v
+  memoInsert (inferMemo m s k) ek k v
   pure (Right ())
-
-inferMemo :: InferMode -> TCState -> Memo
-inferMemo Verify = tcInferV
-inferMemo Assume = tcInferA
 
 inferCore :: InferMode -> LEnv -> Expr -> TC Expr
 inferCore m env e = case e of

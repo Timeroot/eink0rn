@@ -65,10 +65,13 @@ data Config = Config
   , cfgDefer :: !Bool
     -- ^ Hand back each definition's checks as an 'Obligation' instead of
     -- running them where they stand.  Off by default; see 'Obligation'.
+  , cfgMemo :: !MemoTuning
+    -- ^ How to size and evict the checker's memo tables.  Tuning only; see
+    -- 'defaultMemoTuning'.
   }
 
 defaultConfig :: Config
-defaultConfig = Config AccelCanonical True False False
+defaultConfig = Config AccelCanonical True False False defaultMemoTuning
 
 -- | Check a whole export, returning the resulting environment.
 checkExport :: Config -> [ExDecl] -> Either String Env
@@ -158,7 +161,8 @@ discharge = foldr (\o rest -> obCheck o >> rest) (Right ())
 -- it rather than two.
 checkExportTrace :: Config -> [Either String ExDecl] -> [Progress]
 checkExportTrace cfg =
-  go (LS emptyEnv { envAccel = cfgAccel cfg } (cfgSealProofs cfg)
+  go (LS emptyEnv { envAccel = cfgAccel cfg, envMemo = cfgMemo cfg }
+        (cfgSealProofs cfg)
         (cfgMutUniv cfg) (cfgDefer cfg) Nothing Nothing [] [] [] [] 0 0)
   where
     go st [] = [either Failed (\e -> Done e (reverse (lsObs st))) (finish st)]

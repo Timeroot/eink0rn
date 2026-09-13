@@ -15,6 +15,8 @@ module Kernel.Env
   , RecRule (..)
   , QuotKind (..)
   , AccelMode (..)
+  , MemoTuning (..)
+  , defaultMemoTuning
   , Licences (..)
   , noLicences
   , Env (..)
@@ -169,6 +171,44 @@ data AccelMode
   | AccelAlways     -- ^ on the strength of the name alone; /unsound/
   deriving (Eq, Show)
 
+-- | How the checker's memo tables are to be sized and evicted.
+--
+-- None of it can change a verdict: every field tunes a pure cache, where a
+-- forgotten entry costs the work of computing it again and nothing else.  It
+-- lives in the environment for the reason 'envAccel' does -- it is constant for
+-- the life of a run, and everything that reduces has the environment to hand.
+-- "Kernel.Cache" has the policies and 'Kernel.Check.closedMemos' the split.
+data MemoTuning = MemoTuning
+  { mtSlots  :: !Int
+    -- ^ slots the bounded term-keyed tables may grow to
+  , mtClosed :: !Bool
+    -- ^ keep answers about 'Kernel.Expr.hasFVars'-free terms in a separate
+    -- unbounded table
+  , mtLru    :: !Bool
+    -- ^ evict the least recently /used/ entry of a bucket rather than the
+    -- oldest inserted
+  }
+  deriving (Eq, Show)
+
+-- | 4096 slots, the closed split on, oldest-first eviction.
+--
+-- 'Kernel.Cache.newCacheBounded' says why the term-keyed memos are bounded at
+-- all; the ceiling is where two measurements meet.  The pathological
+-- declaration of the arena's @con-leche@ wants it far smaller -- at 512 slots it
+-- holds 0.88 GB and at 8192 1.45 -- but @mathlib@ is not pathological, it is
+-- merely large, and there the recomputation a small table forces is real work
+-- and not GC noise: against an unbounded table @mathlib@ allocates +0.3% at this
+-- ceiling and +10.5% at 512, and pays for the latter in mutator time.
+--
+-- 'mtClosed' is what keeps the ceiling from having to satisfy both at once, and
+-- is on because the ceiling has a far side: @magma-string-pair-n9@ is ground
+-- computation, its working set is closed, and bounded at 4096 it does not finish
+-- in half an hour.  Split, it is checked in ten seconds and @con-leche@ is
+-- unmoved.  'mtLru' is off: it is the other thing one would try and it fixes
+-- nothing, leaving @n9@ unfinished and costing @con-leche@ 7% of its allocation.
+defaultMemoTuning :: MemoTuning
+defaultMemoTuning = MemoTuning 4096 True False
+
 -- | Licence questions already answered /yes/ (SPEC.md §6.5).
 --
 -- Before the kernel computes @2^64 + 1@ on a machine integer it asks whether
@@ -222,10 +262,13 @@ data Env = Env
     -- the sense that clearing it changes only how long the answer takes.
   , envPriv     :: !Int
     -- ^ how many private namespaces have been handed out; see 'freshPriv'.
+  , envMemo     :: !MemoTuning
+    -- ^ how to size and evict the memo tables; constant for the life of a run,
+    -- and here for the reason 'envAccel' is.
   }
 
 emptyEnv :: Env
-emptyEnv = Env IM.empty False AccelCanonical S.empty noLicences 0
+emptyEnv = Env IM.empty False AccelCanonical S.empty noLicences 0 defaultMemoTuning
 
 -- | Hand out a private namespace: a name root no file can write, and that no
 -- earlier call returned.

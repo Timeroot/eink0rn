@@ -26,6 +26,7 @@ module Kernel.Cache
   , clearCache
   , bucket
   , push
+  , poke
   , Table
   , newTable
   , putTable
@@ -192,6 +193,19 @@ push c@(Cache hdr ref) k link = do
   if n' > mask then grow c mask arr
                else unsafeWrite hdr 1 n'
 {-# INLINE push #-}
+
+-- | Put a rebuilt bucket back where it came from.
+--
+-- For reordering a bucket the caller has just read, and for nothing else: the
+-- entry count is not touched, so what goes back must hold what came out.  See
+-- 'Kernel.Check.memoLookupLru', which is the only caller and uses it to move
+-- the entry it hit to the front.
+poke :: Cache b -> Int -> b -> IO ()
+poke (Cache hdr ref) k b = do
+  mask <- unsafeRead hdr 0
+  arr  <- readIORef ref
+  unsafeWrite arr (k .&. mask) b
+{-# INLINE poke #-}
 
 -- | Grow the table and reindex.  Amortised constant, and the entries are
 -- rehung in the order they were in, so the cap keeps evicting the oldest.

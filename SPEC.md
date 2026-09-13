@@ -2284,6 +2284,46 @@ allocates +10.5% at 512 buckets and +0.3% at 4096, so the ceiling sits at 4096:
 0.7 GB would cost a tenth of mathlib. Bucket caps also mean a hash collision
 cannot turn a table into a leak.
 
+The ceiling is **two-sided**, which is why what is bounded is only half of each
+table. The arena's `magma-string-pair-n9` — `decide` over 9⁴ tuples of a table
+written as a string literal — wants the opposite ceiling from `con-leche`: at
+4096 buckets it does not finish in half an hour, at 65536 it is checked in ten
+seconds, and `con-leche` at 65536 wants 29 GB. Neither figure serves both.
+
+So the four term-keyed tables are each **split in two** on whether the term
+mentions a local constant, and the closed half is left without a ceiling. The
+terms a declaration reduces over and over are closed — mentioning a local is
+what reducing *under a binder* does to a term — so the half that runs away is
+the half that is bounded, and the half that is shared is bounded by the file
+instead. `tcCloseIn` is not split: its keys all have loose bound variables, so
+none of them are closed. With the split, one ceiling serves both files, and
+`n9` is checked in 7 seconds at 128 buckets and 10 at 4096. Four cells of the
+thirty-six measured — three ceilings by four settings by three files — as peak
+RSS and bytes allocated:
+
+| setting | `n9` | `con-leche` | `cslib` |
+| --- | --- | --- | --- |
+| 4096, split | 10.1s | 6.3 GB, 609 GB | 5.42 GB, 347 GB |
+| 4096, `--no-closed-memo` | >1800s | 6.5 GB, 608 GB | 5.40 GB, 345 GB |
+| 128, split | 7.1s | 5.0 GB, 719 GB | 5.52 GB, 358 GB |
+| 65536, `--no-closed-memo` | 10.5s | 29.6 GB, 575 GB | 5.54 GB, 344 GB |
+
+The split is what lets one ceiling serve both; raising the ceiling is not. What
+it costs is retention on the files whose shared work *is* the whole run:
+`magma-list-deep-n36` goes from 222s and 0.39 GB to 86s and 4.01 GB, and
+`magma-list-pair-n21` from 67s and 0.94 GB to 97s and 4.66 GB — less allocation
+in both cases, and five times the collection in the second. Which says the
+closed half wants a ceiling of its own, a large one, and that is not yet
+measured. `--no-closed-memo` and `--memo-slots=N` are how the four cells above
+are reproduced.
+
+The other thing one would try does not work. `--memo-lru` moves the entry a
+lookup hits to the front of its bucket, so that a full bucket forgets what was
+least recently *used* and not what was inserted first — and `n9` still does not
+finish at 128 or at 4096 buckets, because the bucket is short of room and not of
+foresight. The reordering costs `con-leche` 7% of its allocation. It stays as a
+flag, off, because it is cheap to keep and the next such file may say otherwise.
+
 The tables are *mutable* — an array of buckets indexed by the low bits of the
 key, growing eightfold when it fills until it reaches that ceiling. A balanced
 tree of ten million entries answers a lookup in some two dozen dependent pointer
@@ -2942,12 +2982,12 @@ None of it is required: those are clean file-backed pages and the kernel takes
 them back when something wants the memory. What has to fit is the anon column,
 and the run above fits in sixteen gigabytes with about three to spare.
 
-What is left after that is a cache with no bound. The memo tables are pure — a
-missing entry costs a recomputation and nothing else — so a table that dropped
-its oldest entries at some size would bound the spike above by construction. It
-is not done here, and the reason to be careful about doing it is that the
-declaration whose tables would be dropped is the one declaration in `mathlib`
-that is already most of a pass.
+What was left after that was a cache with no bound, and §11.4 bounds it. The
+memo tables are pure — a missing entry costs a recomputation and nothing else —
+so a ceiling on the tables is a ceiling on that part of the spike, and what made
+the ceiling worth care rather than a constant is that the declaration whose
+entries are dropped is the one declaration in `mathlib` that is already most of
+a pass.
 
 On `std`, where the budget is never reached and none of this applies, the older
 measurement of the gate still shows what waiting costs when it does happen, with

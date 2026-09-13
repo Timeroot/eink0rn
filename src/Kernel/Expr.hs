@@ -24,7 +24,11 @@
 --   instead of rebuilding it;
 --
 -- * every node caches a structural hash, which decides most inequalities in
---   constant time and gives 'Kernel.Check' something to key a memo table on.
+--   constant time and gives 'Kernel.Check' something to key a memo table on;
+--
+-- * and the same nodes cache whether they contain an 'FVar', which is how
+--   'Kernel.Check' tells a subterm of the declaration being checked from one of
+--   the context it is being checked in.
 --
 -- Both caches are maintained by pattern synonyms: the constructors 'App',
 -- 'Lam', ... below compute them, and matching on them ignores them, so the rest
@@ -52,6 +56,7 @@ module Kernel.Expr
   , instantiateBody
   -- * Queries
   , hasLooseBVars
+  , hasFVars
   , looseBVarRange
   , occursConst
   , constsMeeting
@@ -95,7 +100,8 @@ instance Show Binder where show (Binder n) = showName n
 -- The leading @Int@ is the node's cached hash, except on the five constructors
 -- that can contain a bound variable, where it is a hash and a
 -- 'looseBVarRange' packed into the one word: the range in the low
--- 'rangeBits', the hash above it.  Both caches are wanted on every one of those
+-- 'rangeBits', the hash above it, and 'hasFVars' in the top bit.  All three
+-- caches are wanted on every one of those
 -- nodes and neither needs a full word, and an @Expr@ is what a run of this
 -- kernel is almost entirely made of -- @XApp@ alone is 38% of the live heap at
 -- @std@'s peak and 70% of it at @mathlib@'s -- so the word saved is worth the
@@ -143,6 +149,33 @@ satRange = rangeMask
 mkHR :: Int -> Int -> Int
 mkHR h r = (h .&. complement rangeMask) .|. (if r < satRange then r else satRange)
 {-# INLINE mkHR #-}
+
+-- | The bit of a packed word that says the node contains an 'FVar'.
+--
+-- The sign bit, so that the query is a comparison against zero.  It costs the
+-- hash its top bit, which is one bit of a filter in front of a structural test.
+fvarBit :: Int
+fvarBit = minBound
+
+-- | 'mkHR', with 'fvarBit' set as the node's children dictate.
+mkHRF :: Bool -> Int -> Int -> Int
+mkHRF v h r | v         = mkHR h r .|. fvarBit
+            | otherwise = mkHR h r .&. complement fvarBit
+{-# INLINE mkHRF #-}
+
+-- | Does an 'FVar' occur in the term?  Constant time.
+--
+-- Exact, and unlike 'looseBVarRange' it never saturates: one bit is all the
+-- question needs, and the pattern synonyms below or it up from the children.
+hasFVars :: Expr -> Bool
+hasFVars e = case e of
+  XFVar _         -> True
+  XApp hr _ _     -> hr < 0
+  XLam hr _ _ _   -> hr < 0
+  XPi  hr _ _ _   -> hr < 0
+  XLet hr _ _ _ _ -> hr < 0
+  XProj hr _ _ _  -> hr < 0
+  _               -> False
 
 -- | The range a packed node stores, saturation and all.  Used where the answer
 -- is about to be packed again, so that a saturated child keeps its parent
@@ -421,29 +454,34 @@ pattern StrLit s <- XStrLit _ s
 
 pattern App :: Expr -> Expr -> Expr
 pattern App f a <- XApp _ f a
-  where App f a = XApp (mkHR (h2 31 (exprHash f) (exprHash a))
-                             (max (rawRange f) (rawRange a))) f a
+  where App f a = XApp (mkHRF (hasFVars f || hasFVars a)
+                              (h2 31 (exprHash f) (exprHash a))
+                              (max (rawRange f) (rawRange a))) f a
 
 pattern Lam :: Binder -> Expr -> Expr -> Expr
 pattern Lam n t b <- XLam _ n t b
-  where Lam n t b = XLam (mkHR (h2 37 (exprHash t) (exprHash b))
-                               (max (rawRange t) (rawUnder b))) n t b
+  where Lam n t b = XLam (mkHRF (hasFVars t || hasFVars b)
+                                (h2 37 (exprHash t) (exprHash b))
+                                (max (rawRange t) (rawUnder b))) n t b
 
 pattern Pi :: Binder -> Expr -> Expr -> Expr
 pattern Pi n t b <- XPi _ n t b
-  where Pi n t b = XPi (mkHR (h2 41 (exprHash t) (exprHash b))
-                             (max (rawRange t) (rawUnder b))) n t b
+  where Pi n t b = XPi (mkHRF (hasFVars t || hasFVars b)
+                              (h2 41 (exprHash t) (exprHash b))
+                              (max (rawRange t) (rawUnder b))) n t b
 
 pattern Let :: Binder -> Expr -> Expr -> Expr -> Expr
 pattern Let n t v b <- XLet _ n t v b
   where Let n t v b =
-          XLet (mkHR (h3 43 (exprHash t) (exprHash v) (exprHash b))
-                     (max (rawRange t) (max (rawRange v) (rawUnder b)))) n t v b
+          XLet (mkHRF (hasFVars t || hasFVars v || hasFVars b)
+                      (h3 43 (exprHash t) (exprHash v) (exprHash b))
+                      (max (rawRange t) (max (rawRange v) (rawUnder b)))) n t v b
 
 pattern Proj :: Name -> Int -> Expr -> Expr
 pattern Proj s i b <- XProj _ s i b
-  where Proj s i b = XProj (mkHR (h3 47 (nameHash s) i (exprHash b))
-                                 (rawRange b)) s i b
+  where Proj s i b = XProj (mkHRF (hasFVars b)
+                                  (h3 47 (nameHash s) i (exprHash b))
+                                  (rawRange b)) s i b
 
 {-# COMPLETE BVar, FVar, Sort, Const, App, Lam, Pi, Let, Proj, NatLit, StrLit #-}
 

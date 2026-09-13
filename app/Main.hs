@@ -30,7 +30,8 @@ import           GHC.Clock             (getMonotonicTime)
 import           GHC.Conc              (getNumProcessors, setNumCapabilities)
 import           GHC.Stats             (RTSStats (..),
                                         getRTSStats, getRTSStatsEnabled)
-import           Kernel.Env            (AccelMode (..), Env)
+import           Kernel.Env            (AccelMode (..), Env, MemoTuning (..),
+                                        defaultMemoTuning)
 import           Kernel.Name           (showName)
 import           Numeric               (showFFloat)
 import           System.Environment    (getArgs, getProgName)
@@ -61,11 +62,15 @@ data Options = Options
     -- ^ mebibytes of live data the threads may hold between them before they
     -- start waiting for each other; 'Nothing' to work it out from the machine,
     -- @Just 0@ not to bound it at all
+  , optMemo     :: MemoTuning
+    -- ^ how to size and evict the memo tables; tuning only, and no flag here can
+    -- change a verdict
   , optFile     :: Maybe String
   }
 
 defaults :: Options
-defaults = Options AccelCanonical True PinOff False Nothing Nothing Nothing Nothing
+defaults = Options AccelCanonical True PinOff False Nothing Nothing Nothing
+                   defaultMemoTuning Nothing
 
 usage :: String -> String
 usage prog = unlines
@@ -131,6 +136,23 @@ usage prog = unlines
   , "                     not bound it, and neither does a build without the"
   , "                     RTS statistics (+RTS -T), which this one has"
   , ""
+  , "  --memo-slots=N     slots each bounded memo table may grow to, eight"
+  , "                     entries a slot (default 4096; 0 for no ceiling).  A"
+  , "                     forgotten entry costs the work of computing it again,"
+  , "                     and keeping one costs the intermediate term it is"
+  , "                     about, so the figure trades time against memory and"
+  , "                     nothing else"
+  , ""
+  , "  --no-closed-memo   stop keeping answers about terms that mention no"
+  , "                     local constant in tables of their own, without a"
+  , "                     ceiling.  Those are the terms a declaration reduces"
+  , "                     over and over, and the ones that run away mention"
+  , "                     locals, so the split is on by default and this is"
+  , "                     how to measure what it buys"
+  , ""
+  , "  --memo-lru         evict the least recently used entry of a bucket"
+  , "                     rather than the oldest inserted"
+  , ""
   , "To bound the whole process rather than the threads, give the RTS a ceiling"
   , "-- +RTS -M13g -RTS -- which it treats as one and not merely as a limit: it"
   , "collects the oldest generation in place above 30% of the figure and holds"
@@ -156,6 +178,10 @@ parseArgs = foldl step (Right defaults)
         | arg == "-j" -> Right o { optJobs = Just 0 }
         | Just v <- stripFlag "-j" arg -> (\k -> o { optJobs = Just k }) <$> jobs v
         | Just v <- stripFlag "--mem=" arg -> (\m -> o { optMem = Just m }) <$> mem v
+        | Just v <- stripFlag "--memo-slots=" arg ->
+            (\k -> o { optMemo = (optMemo o) { mtSlots = k } }) <$> slots v
+        | arg == "--no-closed-memo" -> Right o { optMemo = (optMemo o) { mtClosed = False } }
+        | arg == "--memo-lru"       -> Right o { optMemo = (optMemo o) { mtLru = True } }
         | "-" `isPrefixOf` arg -> Left ("unknown option: " ++ arg)
         | Just f <- optFile o  -> Left ("more than one input file: " ++ f ++ ", " ++ arg)
         | otherwise            -> Right o { optFile = Just arg }
@@ -188,6 +214,11 @@ parseArgs = foldl step (Right defaults)
     mem v = case reads v of
       [(m, "")] | m >= 0 -> Right m
       _                  -> Left ("not a number of mebibytes: " ++ v)
+
+    -- Zero means "no ceiling"; see 'Kernel.Cache.newCacheBounded'.
+    slots v = case reads v of
+      [(k, "")] | k >= 0 -> Right k
+      _                  -> Left ("not a number of slots: " ++ v)
 
 -- | The exit status says what happened, and the four possibilities are kept
 -- apart on purpose.
@@ -265,7 +296,8 @@ run o path = do
     Nothing -> memShare
   input <- readExport path
   let cfg = defaultConfig { cfgAccel = optAccel o, cfgSealProofs = optSeal o
-                          , cfgMutUniv = optMutUniv o, cfgDefer = jobs > 0 }
+                          , cfgMutUniv = optMutUniv o, cfgDefer = jobs > 0
+                          , cfgMemo = optMemo o }
       attempt deaths = do
         -- Forced here, rather than left as a @let@, so that there is exactly
         -- one of it.  Two threads read this list below, and they have to be
