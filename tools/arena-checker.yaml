@@ -3,7 +3,7 @@
 # in there -- a file cannot name the commit that contains it -- so the copy in
 # checkers/eink0rn.yaml carries the commit `ref` points at, put in on the way:
 #
-#   sed "s|^rev: .*|rev: $(git rev-parse v1.1.5^{commit})|" \
+#   sed "s|^rev: .*|rev: $(git rev-parse v1.1.6^{commit})|" \
 #     tools/arena-checker.yaml > ../lean-kernel-arena/checkers/eink0rn.yaml
 #
 # The pattern is anchored so that this line is not itself rewritten.
@@ -28,9 +28,9 @@ description: |
   including the one `--enforce-mutual-univ` turns off below, so that the
   language scored here is the language every other checker is scored on.
   Nothing is declined; the largest export peaks around eight gigabytes.
-version: "1.1.5"
+version: "1.1.6"
 url: https://github.com/Timeroot/eink0rn
-ref: v1.1.5
+ref: v1.1.6
 rev: REPLACE_WITH_COMMIT_SHA
 threads: 8
 build: bash tools/arena-build.sh
@@ -77,8 +77,10 @@ build: bash tools/arena-build.sh
 #               are what the old generation has to absorb.
 #
 # The timeout is the same idea for the clock: a decline, not a wrong answer,
-# and not a job that runs the matrix out of its 360 minutes.  mathlib took 15
-# minutes of it on a box under other load; every other export is minutes.
+# and not a job that runs the matrix out of its 360 minutes.  Ten minutes is
+# about twice the slowest export on this runner -- in the round of 2026-09-13,
+# mathlib 4.3 minutes and con-leche 4.0 -- so reaching it means a file that was
+# not going to finish.
 #
 # The two rewritten statuses are both resource limits reported as such.  124 is
 # the timeout above.  251 is the RTS's own heap-limit exit, taken when the live
@@ -86,7 +88,7 @@ build: bash tools/arena-build.sh
 # than the grace the handler needs to print DECLINE itself; either way -M did
 # its job, and neither is a judgement about the file.
 run: |
-  timeout 5400 ./arena/eink0rn --enforce-mutual-univ --mem=4000 -j8 "$IN" \
+  timeout 600 ./arena/eink0rn --enforce-mutual-univ --mem=4000 -j8 "$IN" \
     +RTS -A32m -M13g -RTS
   rc=$?
   case $rc in
